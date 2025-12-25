@@ -146,9 +146,27 @@ steps:
 | `repository` | Yes | - | Repository name |
 | `pullRequestId` | No | `$(System.PullRequest.PullRequestId)` | PR ID (auto-detected in PR builds) |
 | `timeout` | No | `15` | Timeout in minutes |
-| `model` | No | - | Preferred Copilot model to use (e.g., `gpt-5`, `claude-opus-4.5`) |
+| `model` | No | - | Preferred Copilot model to use (see valid options below) |
 | `promptFile` | No | - | Path to custom prompt file |
 | `prompt` | No | - | Inline custom prompt (overrides `promptFile`) |
+
+### Copilot Models
+
+As of December 2025, here are the model options supported by the GitHub Copilot CLI:
+
+- `claude-sonnet-4.5`
+- `claude-haiku-4.5`
+- `claude-opus-4.5`
+- `claude-sonnet-4`
+- `gpt-5.2`
+- `gpt-5.1-codex-max`
+- `gpt-5.1-codex`
+- `gpt-5.1-codex-mini`
+- `gpt-5.1`
+- `gpt-5`
+- `gpt-5-mini`
+- `gpt-4.1`
+- `gemini-3-pro-preview`
 
 ## Setting Up Tokens
 

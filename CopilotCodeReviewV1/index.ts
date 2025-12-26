@@ -100,17 +100,18 @@ async function run(): Promise<void> {
         let copilotPrompt: string;
         let customPromptText: string | null = null;
         
+        // Helper to check if promptFile is actually set (filePath inputs return working dir when empty)
+        const isPromptFileSet = promptFile && 
+            fs.existsSync(promptFile) && 
+            fs.statSync(promptFile).isFile();
+        
         if (prompt) {
             // Direct prompt input takes precedence
             console.log('Using custom prompt from input.');
             customPromptText = prompt;
-        } else if (promptFile) {
+        } else if (isPromptFileSet) {
             // Read from prompt file
             console.log(`Using custom prompt from file: ${promptFile}`);
-            if (!fs.existsSync(promptFile)) {
-                tl.setResult(tl.TaskResult.Failed, `Prompt file not found: ${promptFile}`);
-                return;
-            }
             const fileContent = fs.readFileSync(promptFile, 'utf8').trim();
             if (!fileContent) {
                 tl.setResult(tl.TaskResult.Failed, `Prompt file is empty: ${promptFile}`);
@@ -184,7 +185,7 @@ async function installCopilotCli(): Promise<void> {
             }
         );
 
-        installProcess.on('close', (code) => {
+        installProcess.on('close', (code: number | null) => {
             if (code === 0) {
                 console.log('GitHub Copilot CLI installed successfully.');
                 resolve();
@@ -193,7 +194,7 @@ async function installCopilotCli(): Promise<void> {
             }
         });
 
-        installProcess.on('error', (err) => {
+        installProcess.on('error', (err: Error) => {
             reject(new Error(`Failed to install GitHub Copilot CLI: ${err.message}`));
         });
     });

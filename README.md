@@ -40,13 +40,9 @@ Before using this extension, ensure you have:
 Add the task to your pipeline YAML:
 
 ```yaml
-trigger: none
-
 pr:
-  branches:
-    include:
-    - main
-    - develop
+- main
+- develop
 
 pool:
   vmImage: 'windows-latest'

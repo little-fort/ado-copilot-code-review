@@ -145,13 +145,17 @@ async function run(): Promise<void> {
             console.log('Using default prompt.');
         }
 
-        // Copy the Add-AzureDevOpsPRComment.ps1 script to the working directory
-        // so Copilot can find and use it for posting PR comments
-        const commentScriptSource = path.join(scriptsDir, 'Add-AzureDevOpsPRComment.ps1');
-        const commentScriptDest = path.join(workingDirectory, 'Add-AzureDevOpsPRComment.ps1');
+        // Copy the Add-AzureDevOpsPRComment.ps1 and Add-AzureDevOpsPRComment.ps1 script to the working directory
+        // so Copilot can find and use them for posting PR comments
+        const addCommentScriptSource = path.join(scriptsDir, 'Add-AzureDevOpsPRComment.ps1');
+        const commentScriptSource = path.join(scriptsDir, 'Add-CopilotComment.ps1');
+        const addCommentScriptDest = path.join(workingDirectory, 'Add-AzureDevOpsPRComment.ps1');
+        const commentScriptDest = path.join(workingDirectory, 'Add-CopilotComment.ps1');
+        fs.copyFileSync(addCommentScriptSource, addCommentScriptDest);
+        console.log(`Copied Add-AzureDevOpsPRComment.ps1 to: ${addCommentScriptDest}`);
         fs.copyFileSync(commentScriptSource, commentScriptDest);
-        console.log(`Copied Add-AzureDevOpsPRComment.ps1 to: ${commentScriptDest}`);
-
+        console.log(`Copied Add-CopilotComment.ps1 to: ${commentScriptDest}`);
+        
         // Run Copilot CLI with timeout
         const timeoutMs = timeoutMinutes * 60 * 1000;
         await runCopilotCli(promptFilePath, model, workingDirectory, timeoutMs);

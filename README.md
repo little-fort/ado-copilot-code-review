@@ -86,8 +86,6 @@ If the included prompt is not to your liking, you can customize the review promp
       Post any findings as PR comments.
 ```
 
-### Using a Prompt File
-
 For longer prompts, create a .txt file in your repository and pass the file path as a task input:
 
 ```yaml
@@ -195,7 +193,7 @@ As of December 2025, here are the model options supported by the GitHub Copilot 
    - `AZURE_DEVOPS_PAT` (mark as secret)
 4. Link the variable group to your pipeline
 
-(Alternatively, create the pipeline first and then configure the pipeline-specific variables.)
+Alternatively, you can create the pipeline first and then configure the pipeline-specific variables.
 
 ## How It Works
 
@@ -243,7 +241,7 @@ For large PRs, increase the `timeout` input value. The default is 15 minutes.
 
 ### No comments posted
 
-Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating as such.
+Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating as such when using the default prompt.
 
 ## Contributing
 

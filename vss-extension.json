@@ -3,8 +3,9 @@
     "manifestVersion": 1,
     "id": "ado-copilot-code-review",
     "name": "Copilot Code Review",
-    "version": "1.1.7",
+    "version": "1.2.0",
     "publisher": "LittleFortSoftware",
+    "public": true,
     "targets": [
         {
             "id": "Microsoft.VisualStudio.Services"

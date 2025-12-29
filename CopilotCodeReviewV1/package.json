@@ -1,6 +1,6 @@
 {
     "name": "copilot-code-review-task",
-    "version": "1.1.7",
+    "version": "1.2.0",
     "description": "Azure DevOps pipeline task for automated code reviews using GitHub Copilot",
     "main": "index.js",
     "scripts": {

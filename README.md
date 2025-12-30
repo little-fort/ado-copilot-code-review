@@ -23,11 +23,9 @@ Before using this extension, ensure you have:
 
 - **GitHub Copilot Subscription**: An active GitHub Copilot subscription (Individual, Business, or Enterprise)
 - **GitHub Personal Access Token**: A PAT with Copilot access permissions
-- **Azure DevOps Personal Access Token**: A PAT with permissions to:
-  - Read pull requests
-  - Write pull request comments
-  - Read code
-  - **NOTE:** Since this PAT will be used by Copilot to post comments, all PR comments will be attributed to the account used to create the PAT. For large teams, consider using a PAT from a dedicated service account to avoid confusion. 
+- **Azure DevOps Authentication** (one of the following):
+  - **System Access Token (Recommended)**: Use the pipeline's built-in OAuth token for Azure DevOps Services. Must grant permissions to Build Service Identity (see below).
+  - **Personal Access Token**: Required for Azure DevOps Server (on-prem) or if you prefer explicit token management. Needs permissions to read pull requests, write comments, and read code.
 - **Windows Agent**: This extension currently only supports Windows-based Azure DevOps agents. Compatible with both MS-hosted and self-hosted agents.
 
 ## Installation
@@ -40,7 +38,30 @@ Before using this extension, ensure you have:
 
 ### Basic Usage
 
-Create a dedicated pipeline with the `CopilotCodeReview@1` task:
+The recommended approach for Azure DevOps Services uses the pipeline's built-in System Access Token and a personal access token for a GitHub account with Copilot access:
+
+```yaml
+trigger: none
+
+pool:
+  vmImage: 'windows-latest'
+
+steps:
+- checkout: self
+  fetchDepth: 0
+
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+```
+
+> **IMPORTANT**: When using `useSystemAccessToken`, ensure the Build Service identity has **"Contribute to pull requests"** permission on your repository. See [Granting Build Service Permissions](#granting-build-service-permissions) below.
+
+### Basic Usage (PAT-based)
+
+For Azure DevOps Server (on-prem) or if you prefer explicit token management:
 
 ```yaml
 trigger: none
@@ -59,6 +80,8 @@ steps:
     azureDevOpsPat: '$(AZURE_DEVOPS_PAT)'
 ```
 
+**NOTE**: When using a personal access token, all PR comments will be attributed to the account used to create the PAT. For large teams, consider using a PAT from a dedicated service account.
+
 Use branch policies on your protected branches to specify the pipeline as a build validation that must finish before the PR can be completed:
 
 ![Branch policy with code review trigger](https://github.com/user-attachments/assets/2b6bece2-f40d-4bba-8243-a8d01baa0df8)
@@ -72,7 +95,7 @@ You can customize the review prompt to focus on aspects tailored to your needs:
   displayName: 'Copilot Code Review'
   inputs:
     githubPat: '$(GITHUB_PAT)'
-    azureDevOpsPat: '$(AZURE_DEVOPS_PAT)'
+    useSystemAccessToken: true
     prompt: |
       Review this code focusing only on:
       - Security vulnerabilities
@@ -88,7 +111,7 @@ For longer custom prompts, create a .txt file in your repository and pass the fi
   displayName: 'Copilot Code Review'
   inputs:
     githubPat: '$(GITHUB_PAT)'
-    azureDevOpsPat: '$(AZURE_DEVOPS_PAT)'
+    useSystemAccessToken: true
     promptFile: '$(Build.SourcesDirectory)/.copilot/review-prompt.txt'
 ```
 
@@ -118,7 +141,7 @@ steps:
     displayName: 'Copilot Code Review'
     inputs:
       githubPat: '$(GITHUB_PAT)'
-      azureDevOpsPat: '$(AZURE_DEVOPS_PAT)'
+      useSystemAccessToken: true
       pullRequestId: '${{ parameters.pullRequestId }}'
 ```
 
@@ -127,7 +150,8 @@ steps:
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `githubPat` | Yes | - | GitHub Personal Access Token with Copilot access |
-| `azureDevOpsPat` | Yes | - | Azure DevOps PAT for API access |
+| `useSystemAccessToken` | No | `false` | Use pipeline's System.AccessToken instead of a PAT (recommended for Azure DevOps Services) |
+| `azureDevOpsPat` | Conditional | - | Azure DevOps PAT for API access. Required if `useSystemAccessToken` is `false`. |
 | `organization` | No | `$(System.CollectionUri)` (inferred) | Azure DevOps organization name |
 | `project` | No | `$(System.TeamProject)` | Azure DevOps project name |
 | `repository` | No | `$(Build.Repository.Name)` | Repository name |
@@ -169,7 +193,7 @@ Use the `authors` input to limit code reviews to PRs created by specific users. 
   displayName: 'Copilot Code Review'
   inputs:
     githubPat: '$(GITHUB_PAT)'
-    azureDevOpsPat: '$(AZURE_DEVOPS_PAT)'
+    useSystemAccessToken: true
     authors: 'alice@example.com, bob@example.com, charlie@example.com'
 ```
 
@@ -179,7 +203,37 @@ When configured:
 - If no match is found, the task completes successfully without running the code review
 - Email comparison is case-insensitive
 
-## Setting Up Tokens
+## Setting Up Authentication
+
+### Option 1: System Access Token (Recommended)
+
+The System Access Token is the Microsoft-recommended authentication method for Azure DevOps Services. It uses OAuth and requires no PAT management.
+
+#### Granting Build Service Permissions
+
+The Build Service identity needs permission to contribute to pull requests:
+
+1. Navigate to **Repos**
+2. From the repository dropdown, go to **Manage repositories**
+3. Go to the **Security** tab
+4. Find the **[Project Name] Build Service ([Org Name])** identity
+5. Set **Contribute to pull requests** to **Allow**
+
+> **TIP**: If you don't see the Build Service identity, run a pipeline first to ensure it's been created.
+
+### Option 2: Personal Access Token
+
+Create a personal access token:
+
+1. Navigate to **User settings > Personal access tokens**
+2. Click **New token**
+3. Click **Show all scopes**
+4. Create a new token with the following scopes:
+   - **Code**: Read
+   - **Pull Request Threads**: Read & Write
+5. Store the token as a secret variable in your Azure DevOps pipeline
+
+**NOTE**: When using a PAT, PR comments will be attributed to the account that created the PAT. For large teams, consider using a dedicated service account.
 
 ### GitHub Personal Access Token
 
@@ -188,16 +242,6 @@ When configured:
    - **Repository access:** Public
    - **Permission:** Copilot Requests
 3. Store the token as a secret variable in your Azure DevOps pipeline
-
-### Azure DevOps Personal Access Token
-
-1. Go to your Azure DevOps organization
-2. Click on **User Settings** > **Personal Access Tokens**
-3. Click on **New Token** and then **Show All Scopes**
-4. Create a new token with the following scopes:
-   - **Code**: Read
-   - **Pull Request Threads**: Read & Write
-5. Store the token as a secret variable in your Azure DevOps pipeline
 
 ### Storing Tokens in Azure DevOps
 
@@ -247,8 +291,22 @@ Ensure your agent can access `winget` and has internet connectivity to install t
 Verify that:
 - Your GitHub PAT has Copilot access
   - If your user account is part of a GitHub organization, ensure the organization admin goes to **GitHub Policies** > **Copilot** > **Copilot CLI** and sets the policy to **Enabled everywhere**
-- Your Azure DevOps PAT has Code (Read) and Pull Request Threads (Read & Write) permissions
-- Tokens are not expired
+- If using `azureDevOpsPat`:
+  - Your Azure DevOps PAT has Code (Read) and Pull Request Threads (Read & Write) permissions
+  - The token is not expired
+- If using `useSystemAccessToken`:
+  - The Build Service identity has **"Contribute to pull requests"** permission on the repository
+  - Try explicitly mapping the `SYSTEM_ACCESSTOKEN` environment variable:
+
+  ```yaml
+  - task: CopilotCodeReview@1
+    displayName: 'Copilot Code Review'
+    inputs:
+      githubPat: '$(GITHUB_PAT)'
+      useSystemAccessToken: true
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+  ```
 
 ### Timeout errors
 

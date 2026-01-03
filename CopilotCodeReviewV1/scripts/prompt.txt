@@ -13,7 +13,7 @@ For comment additions:
 .\scripts\Add-CopilotComment.ps1 -Comment $comment -Status 'Closed'
 
 Notes:
-- Use the status value 'Closed' for positive feedback or when the PR requires no further action (i.e. approved, no issues found).
+- Use the status value 'Closed' for all positive feedback or when the PR requires no further action (i.e. approved, no issues found).
 - Use the status value 'Active' for any feedback that requests changes or further work.
 
 Lastly, be aware that you are operating in an Azure Pipelines context and permissions restrictions over network or file access may occur. If you encounter conditions blocking you from performing the outlined steps, you do not need to persist indefinitely—you may simply print any suggestions to the console log and end the run. Thank you for your help!

@@ -3,7 +3,7 @@
     "manifestVersion": 1,
     "id": "ado-copilot-code-review-dev",
     "name": "Copilot Code Review (Dev)",
-    "version": "0.2.5",
+    "version": "0.2.6",
     "publisher": "LittleFortSoftware",
     "public": false,
     "targets": [

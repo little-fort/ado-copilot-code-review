@@ -16,4 +16,10 @@ Notes:
 - Use the status value 'Closed' for all positive feedback or when the PR requires no further action (i.e. approved, no issues found).
 - Use the status value 'Active' for any feedback that requests changes or further work.
 
+After completing your review and posting all comments, you must set the PR status check by running the Set-CopilotStatus.ps1 script:
+- If you found issues requiring changes (i.e., you posted any Active threads), set the status to 'failed' with an appropriate description:
+  .\Set-CopilotStatus.ps1 -State 'failed' -Description 'Issues found during code review'
+- If the PR looks good with no issues or only minor suggestions, set the status to 'succeeded':
+  .\Set-CopilotStatus.ps1 -State 'succeeded' -Description 'Code review completed - looks good!'
+
 Lastly, be aware that you are operating in an Azure Pipelines context and permissions restrictions over network or file access may occur. If you encounter conditions blocking you from performing the outlined steps, you do not need to persist indefinitely—you may simply print any suggestions to the console log and end the run. Thank you for your help!

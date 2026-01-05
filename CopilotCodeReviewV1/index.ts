@@ -278,12 +278,34 @@ async function run(): Promise<void> {
         // so Copilot can find and use them for posting PR comments
         const addCommentScriptSource = path.join(scriptsDir, 'Add-AzureDevOpsPRComment.ps1');
         const commentScriptSource = path.join(scriptsDir, 'Add-CopilotComment.ps1');
+        const setStatusScriptSource = path.join(scriptsDir, 'Set-AzureDevOpsPRStatus.ps1');
+        const setCopilotStatusScriptSource = path.join(scriptsDir, 'Set-CopilotStatus.ps1');
         const addCommentScriptDest = path.join(workingDirectory, 'Add-AzureDevOpsPRComment.ps1');
         const commentScriptDest = path.join(workingDirectory, 'Add-CopilotComment.ps1');
+        const setStatusScriptDest = path.join(workingDirectory, 'Set-AzureDevOpsPRStatus.ps1');
+        const setCopilotStatusScriptDest = path.join(workingDirectory, 'Set-CopilotStatus.ps1');
         fs.copyFileSync(addCommentScriptSource, addCommentScriptDest);
         console.log(`Copied Add-AzureDevOpsPRComment.ps1 to: ${addCommentScriptDest}`);
         fs.copyFileSync(commentScriptSource, commentScriptDest);
         console.log(`Copied Add-CopilotComment.ps1 to: ${commentScriptDest}`);
+        fs.copyFileSync(setStatusScriptSource, setStatusScriptDest);
+        console.log(`Copied Set-AzureDevOpsPRStatus.ps1 to: ${setStatusScriptDest}`);
+        fs.copyFileSync(setCopilotStatusScriptSource, setCopilotStatusScriptDest);
+        console.log(`Copied Set-CopilotStatus.ps1 to: ${setCopilotStatusScriptDest}`);
+        
+        // Set initial pending status
+        console.log('\nSetting PR status to pending...');
+        const setStatusScript = path.join(scriptsDir, 'Set-AzureDevOpsPRStatus.ps1');
+        await runPowerShellScript(setStatusScript, [
+            `-Token "${azureDevOpsToken}"`,
+            `-AuthType "${azureDevOpsAuthType}"`,
+            `-Organization "${organization}"`,
+            `-Project "${project}"`,
+            `-Repository "${repository}"`,
+            `-Id ${pullRequestId}`,
+            `-State "pending"`,
+            `-Description "Code review in progress..."`
+        ]);
         
         // Run Copilot CLI with timeout
         const timeoutMs = timeoutMinutes * 60 * 1000;
@@ -296,6 +318,35 @@ async function run(): Promise<void> {
         tl.setResult(tl.TaskResult.Succeeded, 'Copilot code review completed.');
     } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
+        
+        // Try to set failed status if we have the necessary variables
+        try {
+            const azureDevOpsToken = process.env['AZUREDEVOPS_TOKEN'];
+            const azureDevOpsAuthType = process.env['AZUREDEVOPS_AUTH_TYPE'];
+            const organization = process.env['ORGANIZATION'];
+            const project = process.env['PROJECT'];
+            const repository = process.env['REPOSITORY'];
+            const pullRequestId = process.env['PRID'];
+            
+            if (azureDevOpsToken && organization && project && repository && pullRequestId) {
+                console.log('\nSetting PR status to failed...');
+                const scriptsDir = path.join(__dirname, 'scripts');
+                const setStatusScript = path.join(scriptsDir, 'Set-AzureDevOpsPRStatus.ps1');
+                await runPowerShellScript(setStatusScript, [
+                    `-Token "${azureDevOpsToken}"`,
+                    `-AuthType "${azureDevOpsAuthType || 'Basic'}"`,
+                    `-Organization "${organization}"`,
+                    `-Project "${project}"`,
+                    `-Repository "${repository}"`,
+                    `-Id ${pullRequestId}`,
+                    `-State "failed"`,
+                    `-Description "Code review failed: ${errorMessage.replace(/"/g, "'")}"`
+                ]);
+            }
+        } catch (statusErr) {
+            console.warn('Failed to set PR status:', statusErr instanceof Error ? statusErr.message : String(statusErr));
+        }
+        
         tl.setResult(tl.TaskResult.Failed, `Task failed: ${errorMessage}`);
     }
 }

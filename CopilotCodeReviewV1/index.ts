@@ -222,6 +222,16 @@ async function run(): Promise<void> {
         ]);
         console.log(`Iteration details saved to: ${iterationDetailsOutput}`);
 
+        // Read the iteration ID from the file written by Get-AzureDevOpsPRChanges.ps1
+        const iterationIdFile = path.join(workingDirectory, 'Iteration_Id.txt');
+        if (fs.existsSync(iterationIdFile)) {
+            const iterationId = fs.readFileSync(iterationIdFile, 'utf8').trim();
+            if (iterationId) {
+                process.env['ITERATION_ID'] = iterationId;
+                console.log(`Iteration ID set to: ${iterationId}`);
+            }
+        }
+
         // Step 4: Run Copilot CLI for code review
         console.log('\n[Step 4/4] Running Copilot code review...');
         

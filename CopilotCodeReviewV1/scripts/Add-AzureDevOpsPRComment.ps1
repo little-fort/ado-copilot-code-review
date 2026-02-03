@@ -5,6 +5,7 @@
 .DESCRIPTION
     This script uses the Azure DevOps REST API to add a comment to a pull request.
     It can either create a new comment thread or reply to an existing thread.
+    Supports both general PR-level comments and file-specific inline comments.
 
 .PARAMETER Token
     Required. Authentication token for Azure DevOps. Can be a PAT or OAuth token.
@@ -35,6 +36,21 @@
     Optional. The status for a new thread. Valid values: Active, Fixed, WontFix, Closed, Pending.
     Default is 'Active'. Only applies when creating a new thread (not replying).
 
+.PARAMETER FilePath
+    Optional. File path for inline comment (e.g., '/src/MyProject/Program.cs').
+    When provided with StartLine, creates an inline comment on the specified file.
+    Path will be normalized to use forward slashes with a leading slash.
+
+.PARAMETER StartLine
+    Optional. Starting line number for inline comment (1-based, references the right/changed side of the diff).
+    Required when FilePath is provided for inline comments.
+
+.PARAMETER EndLine
+    Optional. Ending line number for inline comment. Defaults to StartLine if not provided.
+
+.PARAMETER IterationId
+    Optional. Pull request iteration ID for inline comments. Helps anchor the comment to the correct diff version.
+
 .EXAMPLE
     .\Add-AzureDevOpsPRComment.ps1 -Token "your-pat" -Organization "myorg" -Project "myproject" -Repository "myrepo" -Id 123 -Comment "This looks good!"
     Creates a new comment thread on pull request #123 using PAT authentication.
@@ -47,10 +63,22 @@
     .\Add-AzureDevOpsPRComment.ps1 -Token "your-pat" -Organization "myorg" -Project "myproject" -Repository "myrepo" -Id 123 -Comment "I agree" -ThreadId 456
     Replies to an existing thread #456 on pull request #123.
 
+.EXAMPLE
+    .\Add-AzureDevOpsPRComment.ps1 -Token "your-pat" -Organization "myorg" -Project "myproject" -Repository "myrepo" -Id 123 -Comment "Consider async" -FilePath "/src/Program.cs" -StartLine 42
+    Creates an inline comment on line 42 of Program.cs.
+
+.EXAMPLE
+    .\Add-AzureDevOpsPRComment.ps1 -Token "your-pat" -Organization "myorg" -Project "myproject" -Repository "myrepo" -Id 123 -Comment "Refactor this" -FilePath "/src/Program.cs" -StartLine 42 -EndLine 50 -IterationId 3
+    Creates an inline comment spanning lines 42-50, anchored to iteration 3 of the PR.
+
 .NOTES
     Author: Little Fort Software
     Date: December 2025
     Requires: PowerShell 5.1 or later
+    
+    If an inline comment fails (e.g., line no longer exists in the diff), the script will
+    automatically fall back to posting a generic PR comment with the file path and line
+    information appended to the comment text.
 #>
 
 [CmdletBinding()]
@@ -88,7 +116,19 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Status for new thread")]
     [ValidateSet("Active", "Fixed", "WontFix", "Closed", "Pending")]
-    [string]$Status = "Active"
+    [string]$Status = "Active",
+
+    [Parameter(Mandatory = $false, HelpMessage = "File path for inline comment (e.g., '/src/MyProject/Program.cs')")]
+    [string]$FilePath,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Starting line number for inline comment")]
+    [int]$StartLine,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Ending line number for inline comment")]
+    [int]$EndLine,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Pull request iteration ID for inline comments")]
+    [int]$IterationId
 )
 
 #region Helper Functions
@@ -170,6 +210,20 @@ function Get-ThreadStatusValue {
     }
 }
 
+function Format-AzureDevOpsFilePath {
+    param([string]$Path)
+    
+    # Normalize path separators to forward slashes
+    $normalized = $Path -replace '\\', '/'
+    
+    # Ensure path starts with a forward slash
+    if (-not $normalized.StartsWith('/')) {
+        $normalized = '/' + $normalized
+    }
+    
+    return $normalized
+}
+
 #endregion
 
 #region Main Logic
@@ -228,9 +282,10 @@ if ($ThreadId -gt 0) {
 }
 else {
     # Create new thread
-    Write-Host "`nCreating new comment thread..." -ForegroundColor Cyan
-    
     $threadsUrl = "$baseUrl/threads?$apiVersion"
+    $isInlineComment = -not [string]::IsNullOrEmpty($FilePath) -and $StartLine -gt 0
+    
+    # Build the base body
     $body = @{
         comments = @(
             @{
@@ -241,7 +296,84 @@ else {
         status   = Get-ThreadStatusValue -StatusName $Status
     }
     
-    $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body
+    # Add threadContext for inline comments
+    if ($isInlineComment) {
+        $normalizedPath = Format-AzureDevOpsFilePath -Path $FilePath
+        $effectiveEndLine = if ($EndLine -gt 0) { $EndLine } else { $StartLine }
+        
+        Write-Host "`nCreating inline comment thread on $normalizedPath (Lines $StartLine-$effectiveEndLine)..." -ForegroundColor Cyan
+        
+        $body.threadContext = @{
+            filePath       = $normalizedPath
+            rightFileStart = @{
+                line   = $StartLine
+                offset = 1
+            }
+            rightFileEnd   = @{
+                line   = $effectiveEndLine
+                offset = 1
+            }
+        }
+        
+        # Add iteration context if available
+        if ($IterationId -gt 0) {
+            $body.pullRequestThreadContext = @{
+                iterationContext = @{
+                    firstComparingIteration = $IterationId
+                    secondComparingIteration = $IterationId
+                }
+            }
+        }
+    } else {
+        Write-Host "`nCreating new comment thread..." -ForegroundColor Cyan
+    }
+    
+    $result = $null
+    $inlineCommentFailed = $false
+    
+    # Attempt to post the comment
+    try {
+        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body
+    }
+    catch {
+        if ($isInlineComment) {
+            $inlineCommentFailed = $true
+            Write-Warning "Failed to post inline comment: $($_.Exception.Message)"
+            Write-Warning "Falling back to generic PR comment with file/line information appended."
+        }
+        else {
+            throw
+        }
+    }
+    
+    # Check if inline comment failed (result is null but was inline)
+    if ($null -eq $result -and $isInlineComment -and -not $inlineCommentFailed) {
+        $inlineCommentFailed = $true
+        Write-Warning "Inline comment API returned no result. Falling back to generic PR comment."
+    }
+    
+    # Fallback to generic comment if inline failed
+    if ($inlineCommentFailed) {
+        $normalizedPath = Format-AzureDevOpsFilePath -Path $FilePath
+        $effectiveEndLine = if ($EndLine -gt 0) { $EndLine } else { $StartLine }
+        
+        # Append file/line info to the comment
+        $lineInfo = if ($StartLine -eq $effectiveEndLine) { "Line $StartLine" } else { "Lines $StartLine-$effectiveEndLine" }
+        $fallbackComment = $Comment + "`n`n**File:** ``$normalizedPath```n**$lineInfo**"
+        
+        $fallbackBody = @{
+            comments = @(
+                @{
+                    content     = $fallbackComment
+                    commentType = 1
+                }
+            )
+            status   = Get-ThreadStatusValue -StatusName $Status
+        }
+        
+        Write-Host "Posting generic comment with file/line information..." -ForegroundColor Yellow
+        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $fallbackBody
+    }
     
     if ($null -ne $result) {
         Write-Host "`n" + ("=" * 60) -ForegroundColor DarkGray
@@ -249,6 +381,14 @@ else {
         Write-Host ("=" * 60) -ForegroundColor DarkGray
         Write-Host "`n  Thread ID:    #$($result.id)"
         Write-Host "  Status:       $Status"
+        if ($isInlineComment -and -not $inlineCommentFailed) {
+            Write-Host "  Type:         Inline comment"
+            Write-Host "  File:         $(Format-AzureDevOpsFilePath -Path $FilePath)"
+            $effectiveEndLine = if ($EndLine -gt 0) { $EndLine } else { $StartLine }
+            Write-Host "  Lines:        $StartLine-$effectiveEndLine"
+        } else {
+            Write-Host "  Type:         General comment"
+        }
         Write-Host "  Comment ID:   #$($result.comments[0].id)"
         Write-Host "  Author:       $($result.comments[0].author.displayName)"
         Write-Host "  Posted:       $($result.comments[0].publishedDate)"

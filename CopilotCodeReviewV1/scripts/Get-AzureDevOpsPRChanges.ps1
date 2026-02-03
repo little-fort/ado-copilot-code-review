@@ -314,6 +314,11 @@ if ($script:OutputToFile) {
         }
         $script:OutputBuilder.ToString() | Out-File -FilePath $OutputFile -Encoding UTF8
         Write-Host "`nOutput written to: $OutputFile" -ForegroundColor Green
+        
+        # Also write the iteration ID to a separate file for use by other scripts
+        $iterationIdFile = Join-Path $outputDir "Iteration_Id.txt"
+        $iterationId.ToString() | Out-File -FilePath $iterationIdFile -Encoding UTF8 -NoNewline
+        Write-Host "Iteration ID written to: $iterationIdFile" -ForegroundColor Green
     }
     catch {
         Write-Error "Failed to write output file: $_"

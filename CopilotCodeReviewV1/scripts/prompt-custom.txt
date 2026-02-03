@@ -4,13 +4,22 @@ This information along with git commands and the local copy of the repository wi
 
 1. Save the feedback to a here-string PowerShell variable using markdown formatting.
 
-2. After saving the comment variable, run the Add-CopilotComment.ps1 script and pass in the comment as a parameter. You should also explicitly pass a `-Status` parameter indicating whether the comment should create an open thread (`Active`) or a resolved thread (`Closed`). Example:
+2. After saving the comment variable, run the Add-CopilotComment.ps1 script and pass in the comment as a parameter. You should also explicitly pass a `-Status` parameter indicating whether the comment should create an open thread (`Active`) or a resolved thread (`Closed`).
+
+For file-specific feedback, use inline comments by providing the `-FilePath` and `-StartLine` parameters. You may also provide `-EndLine` for multi-line comments (defaults to `-StartLine` if omitted). Line numbers should reference the current (changed) version of the file, not the original. Example:
+
+.\scripts\Add-CopilotComment.ps1 -Comment $comment -Status 'Active' -FilePath '/src/MyProject/Program.cs' -StartLine 42 -EndLine 45
+
+For general PR-level feedback that is not specific to a file or line, omit the file parameters:
 
 .\scripts\Add-CopilotComment.ps1 -Comment $comment -Status 'Closed'
 
 Notes:
 - Use the status value 'Closed' for all positive feedback or when the PR requires no further action (i.e. approved, no issues found).
 - Use the status value 'Active' for any feedback that requests changes or further work.
+- Prefer inline comments (`-FilePath` and `-StartLine`) when the feedback relates to specific code locations.
+- The file path should use forward slashes and start with a leading slash (e.g., '/src/App.cs').
+- When including multi-line code blocks in the comment markdown, ensure the code block starts and ends with triple backticks
 
 Be aware that you are operating in an Azure Pipelines context and so permissions restrictions over network or file access may occur. If you encounter conditions blocking you from performing the outlined steps, you do not need to persist indefinitely—you may simply print any suggestions to the console log and end the run.
 

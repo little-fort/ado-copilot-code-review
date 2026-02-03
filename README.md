@@ -164,12 +164,14 @@ steps:
 
 ### Copilot Models
 
-As of December 2025, here are the model options supported by the GitHub Copilot CLI:
+As of February 2026, here are the model options supported by the GitHub Copilot CLI:
 
 - `claude-sonnet-4.5` (default)
 - `claude-haiku-4.5`
 - `claude-opus-4.5`
 - `claude-sonnet-4`
+- `gpt-5.2-codex` 
+- `gpt-5.2`
 - `gpt-5.1-codex-max`
 - `gpt-5.1-codex`
 - `gpt-5.1-codex-mini`

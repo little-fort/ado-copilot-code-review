@@ -38,6 +38,14 @@
             "helpMarkDown": "When enabled, uses the pipeline's System.AccessToken (OAuth) instead of a PAT. This is the Microsoft-recommended authentication method for Azure DevOps Services. **Note**: The Build Service identity must have 'Contribute to pull requests' permission on the repository. Not supported for Azure DevOps Server (on-prem)."
         },
         {
+            "name": "onPremise",
+            "type": "boolean",
+            "label": "On-Premise (Azure DevOps Server)",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "Enable for Azure DevOps Server (on-prem). When enabled, the task uses $(System.CollectionUri) as the API base URL."
+        },
+        {
             "name": "organization",
             "type": "string",
             "label": "Organization",

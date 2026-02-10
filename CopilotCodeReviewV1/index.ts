@@ -73,6 +73,19 @@ async function run(): Promise<void> {
         // Get Azure DevOps authentication settings
         const useSystemAccessToken = tl.getBoolInput('useSystemAccessToken', false);
         const azureDevOpsPat = tl.getInput('azureDevOpsPat');
+        const onPremise = tl.getBoolInput('onPremise', false);
+        const systemCollectionUri = tl.getVariable('System.CollectionUri') ||
+            process.env['SYSTEM_COLLECTIONURI'] ||
+            '';
+
+        process.env['AZUREDEVOPS_ONPREMISE'] = onPremise ? 'true' : 'false';
+
+        if (onPremise && !systemCollectionUri) {
+            tl.setResult(tl.TaskResult.Failed,
+                'On-Premise mode is enabled, but System.CollectionUri is not available. ' +
+                'Ensure the pipeline provides $(System.CollectionUri) or disable On-Premise mode.');
+            return;
+        }
         
         // Determine which token and auth type to use
         let azureDevOpsToken: string;
@@ -106,19 +119,30 @@ async function run(): Promise<void> {
         let project = tl.getInput('project');
         let repository = tl.getInput('repository');
 
-        // Auto-detect organization from System.CollectionUri if not provided
-        // CollectionUri format: https://dev.azure.com/orgname/ or https://orgname.visualstudio.com/
-        if (!organization) {
-            const collectionUri = tl.getVariable('System.CollectionUri');
-            if (collectionUri) {
-                const devAzureMatch = collectionUri.match(/https:\/\/dev\.azure\.com\/([^\/]+)/);
-                const vstsMatch = collectionUri.match(/https:\/\/([^\.]+)\.visualstudio\.com/);
-                if (devAzureMatch) {
-                    organization = devAzureMatch[1];
-                    console.log(`Auto-detected organization from CollectionUri: ${organization}`);
-                } else if (vstsMatch) {
-                    organization = vstsMatch[1];
-                    console.log(`Auto-detected organization from CollectionUri: ${organization}`);
+        // Auto-detect organization/collection from System.CollectionUri if not provided
+        // CollectionUri format examples:
+        //   https://dev.azure.com/orgname/
+        //   https://orgname.visualstudio.com/
+        //   https://tfs.contoso.com/tfs/DefaultCollection/
+        if (!organization && systemCollectionUri) {
+            const devAzureMatch = systemCollectionUri.match(/https:\/\/dev\.azure\.com\/([^\/]+)/);
+            const vstsMatch = systemCollectionUri.match(/https:\/\/([^\.]+)\.visualstudio\.com/);
+            if (devAzureMatch) {
+                organization = devAzureMatch[1];
+                console.log(`Auto-detected organization from CollectionUri: ${organization}`);
+            } else if (vstsMatch) {
+                organization = vstsMatch[1];
+                console.log(`Auto-detected organization from CollectionUri: ${organization}`);
+            } else {
+                try {
+                    const url = new URL(systemCollectionUri);
+                    const segments = url.pathname.split('/').filter(Boolean);
+                    if (segments.length > 0) {
+                        organization = segments[segments.length - 1];
+                        console.log(`Auto-detected collection from CollectionUri: ${organization}`);
+                    }
+                } catch {
+                    // Ignore parse errors; organization may be provided explicitly
                 }
             }
         }

@@ -73,6 +73,9 @@ param(
     [string]$OutputFile
 )
 
+# Shared URL helpers
+. "$PSScriptRoot\AzureDevOpsUrl.ps1"
+
 #region Helper Functions
 
 function Write-Output-Line {
@@ -186,7 +189,11 @@ $script:OutputToFile = -not [string]::IsNullOrEmpty($OutputFile)
 $script:OutputBuilder = [System.Text.StringBuilder]::new()
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
-$baseUrl = "https://dev.azure.com/$Organization/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
+$baseUrls = Get-AzureDevOpsBaseUrls -Project $Project -Organization $Organization
+if ($null -eq $baseUrls) {
+    exit 1
+}
+$baseUrl = "$($baseUrls.ApiBaseUrl)/git/repositories/$Repository/pullrequests/$Id"
 $apiVersion = "api-version=7.1"
 
 # Verify the PR exists
@@ -299,7 +306,7 @@ else {
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
 
 # Provide link to the PR
-$webUrl = "https://dev.azure.com/$Organization/$Project/_git/$Repository/pullrequest/$Id"
+$webUrl = "$($baseUrls.WebBaseUrl)/_git/$Repository/pullrequest/$Id"
 Write-Host "`nView PR: $webUrl" -ForegroundColor Cyan
 if ($script:OutputToFile) {
     $script:OutputBuilder.AppendLine("`nView PR: $webUrl") | Out-Null

@@ -131,6 +131,9 @@ param(
     [int]$IterationId
 )
 
+# Shared URL helpers
+. "$PSScriptRoot\AzureDevOpsUrl.ps1"
+
 #region Helper Functions
 
 function Get-AuthorizationHeader {
@@ -229,7 +232,11 @@ function Format-AzureDevOpsFilePath {
 #region Main Logic
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
-$baseUrl = "https://dev.azure.com/$Organization/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
+$baseUrls = Get-AzureDevOpsBaseUrls -Project $Project -Organization $Organization
+if ($null -eq $baseUrls) {
+    exit 1
+}
+$baseUrl = "$($baseUrls.ApiBaseUrl)/git/repositories/$Repository/pullrequests/$Id"
 $apiVersion = "api-version=7.1"
 
 # First, verify the PR exists
@@ -401,7 +408,7 @@ else {
 }
 
 # Provide link to the PR
-$webUrl = "https://dev.azure.com/$Organization/$Project/_git/$Repository/pullrequest/$Id"
+$webUrl = "$($baseUrls.WebBaseUrl)/_git/$Repository/pullrequest/$Id"
 Write-Host "`nView PR: $webUrl" -ForegroundColor Cyan
 
 #endregion

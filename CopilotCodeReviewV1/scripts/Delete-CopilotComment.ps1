@@ -49,6 +49,9 @@ param(
     [int]$CommentId
 )
 
+# Shared URL helpers
+. "$PSScriptRoot\AzureDevOpsUrl.ps1"
+
 # Wrap entire script in try/catch for silent failure
 try {
     # Read credentials from environment variables
@@ -61,7 +64,6 @@ try {
 
     # Validate required environment variables
     if ([string]::IsNullOrEmpty($token) -or 
-        [string]::IsNullOrEmpty($organization) -or 
         [string]::IsNullOrEmpty($project) -or 
         [string]::IsNullOrEmpty($repository) -or 
         [string]::IsNullOrEmpty($prId)) {
@@ -90,7 +92,11 @@ try {
     }
 
     # Build the API URL for deleting a comment
-    $baseUrl = "https://dev.azure.com/$organization/$project/_apis"
+    $baseUrls = Get-AzureDevOpsBaseUrls -Project $project -Organization $organization -Silent
+    if ($null -eq $baseUrls) {
+        exit 0
+    }
+    $baseUrl = $baseUrls.ApiBaseUrl
     $uri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$ThreadId/comments/$CommentId`?api-version=7.1"
 
     # Send DELETE request

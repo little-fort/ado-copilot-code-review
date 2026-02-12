@@ -300,6 +300,7 @@ Verify that:
   - The token is not expired
 - If using `useSystemAccessToken`:
   - The Build Service identity has **"Contribute to pull requests"** permission on the repository
+  - Both `https://dev.azure.com/{org}` and legacy `https://{org}.visualstudio.com` organization URLs are supported automatically. The task uses `System.CollectionUri` to determine the correct API endpoint for OAuth token authentication.
   - Try explicitly mapping the `SYSTEM_ACCESSTOKEN` environment variable:
 
 ```yaml

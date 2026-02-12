@@ -86,6 +86,7 @@ try {
     # Read credentials from environment variables
     $token = ${env:AZUREDEVOPS_TOKEN}
     $authType = ${env:AZUREDEVOPS_AUTH_TYPE}
+    $collectionUri = ${env:AZUREDEVOPS_COLLECTION_URI}
     $organization = ${env:ORGANIZATION}
     $project = ${env:PROJECT}
     $repository = ${env:REPOSITORY}
@@ -121,7 +122,8 @@ try {
         }
     }
 
-    $baseUrl = "https://dev.azure.com/$organization/$project/_apis"
+    $orgBaseUrl = if ($collectionUri) { $collectionUri } else { "https://dev.azure.com/$organization" }
+    $baseUrl = "$orgBaseUrl/$project/_apis"
 
     # Update thread status if specified
     if (-not [string]::IsNullOrEmpty($Status)) {

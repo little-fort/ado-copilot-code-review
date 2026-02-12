@@ -95,6 +95,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Organization,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Azure DevOps collection URI (e.g., https://dev.azure.com/org or https://org.visualstudio.com)")]
+    [string]$CollectionUri,
+
     [Parameter(Mandatory = $true, HelpMessage = "Azure DevOps project name")]
     [ValidateNotNullOrEmpty()]
     [string]$Project,
@@ -229,7 +232,8 @@ function Format-AzureDevOpsFilePath {
 #region Main Logic
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
-$baseUrl = "https://dev.azure.com/$Organization/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
+$orgBaseUrl = if ($CollectionUri) { $CollectionUri } else { "https://dev.azure.com/$Organization" }
+$baseUrl = "$orgBaseUrl/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
 $apiVersion = "api-version=7.1"
 
 # First, verify the PR exists
@@ -401,7 +405,7 @@ else {
 }
 
 # Provide link to the PR
-$webUrl = "https://dev.azure.com/$Organization/$Project/_git/$Repository/pullrequest/$Id"
+$webUrl = "$orgBaseUrl/$Project/_git/$Repository/pullrequest/$Id"
 Write-Host "`nView PR: $webUrl" -ForegroundColor Cyan
 
 #endregion

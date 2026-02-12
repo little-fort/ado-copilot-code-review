@@ -108,8 +108,8 @@ async function run(): Promise<void> {
 
         // Auto-detect organization from System.CollectionUri if not provided
         // CollectionUri format: https://dev.azure.com/orgname/ or https://orgname.visualstudio.com/
+        const collectionUri = tl.getVariable('System.CollectionUri');
         if (!organization) {
-            const collectionUri = tl.getVariable('System.CollectionUri');
             if (collectionUri) {
                 const devAzureMatch = collectionUri.match(/https:\/\/dev\.azure\.com\/([^\/]+)/);
                 const vstsMatch = collectionUri.match(/https:\/\/([^\.]+)\.visualstudio\.com/);
@@ -122,6 +122,13 @@ async function run(): Promise<void> {
                 }
             }
         }
+
+        // Determine the collection URI base URL for API calls.
+        // This ensures OAuth tokens scoped to visualstudio.com work correctly
+        // instead of always using https://dev.azure.com (#22).
+        const orgBaseUrl = collectionUri
+            ? collectionUri.replace(/\/+$/, '')
+            : `https://dev.azure.com/${organization}`;
 
         if (!organization) {
             tl.setResult(tl.TaskResult.Failed, 'Organization is required. Either provide it as an input or ensure System.CollectionUri is available.');
@@ -159,6 +166,7 @@ async function run(): Promise<void> {
         console.log('Copilot Code Review Task');
         console.log('='.repeat(60));
         console.log(`Organization: ${organization}`);
+        console.log(`Collection URI: ${orgBaseUrl}`);
         console.log(`Project: ${project}`);
         console.log(`Repository: ${repository}`);
         console.log(`Pull Request ID: ${pullRequestId}`);
@@ -172,6 +180,7 @@ async function run(): Promise<void> {
         process.env['GH_TOKEN'] = githubPat;
         process.env['AZUREDEVOPS_TOKEN'] = azureDevOpsToken;
         process.env['AZUREDEVOPS_AUTH_TYPE'] = azureDevOpsAuthType;
+        process.env['AZUREDEVOPS_COLLECTION_URI'] = orgBaseUrl;
         process.env['ORGANIZATION'] = organization;
         process.env['PROJECT'] = project;
         process.env['REPOSITORY'] = repository;
@@ -199,6 +208,7 @@ async function run(): Promise<void> {
             `-Token "${azureDevOpsToken}"`,
             `-AuthType "${azureDevOpsAuthType}"`,
             `-Organization "${organization}"`,
+            `-CollectionUri "${orgBaseUrl}"`,
             `-Project "${project}"`,
             `-Repository "${repository}"`,
             `-Id ${pullRequestId}`,
@@ -215,6 +225,7 @@ async function run(): Promise<void> {
             `-Token "${azureDevOpsToken}"`,
             `-AuthType "${azureDevOpsAuthType}"`,
             `-Organization "${organization}"`,
+            `-CollectionUri "${orgBaseUrl}"`,
             `-Project "${project}"`,
             `-Repository "${repository}"`,
             `-Id ${pullRequestId}`,

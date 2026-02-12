@@ -88,6 +88,11 @@ $params = @{
     Status       = $Status
 }
 
+# Pass collection URI if available (supports both dev.azure.com and visualstudio.com)
+if (${env:AZUREDEVOPS_COLLECTION_URI}) {
+    $params.CollectionUri = ${env:AZUREDEVOPS_COLLECTION_URI}
+}
+
 # Add inline comment parameters if file path is provided
 if ($FilePath) {
     $params.FilePath = $FilePath

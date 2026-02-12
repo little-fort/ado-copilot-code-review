@@ -69,6 +69,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Organization,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Azure DevOps collection URI (e.g., https://dev.azure.com/org or https://org.visualstudio.com)")]
+    [string]$CollectionUri,
+
     [Parameter(Mandatory = $true, HelpMessage = "Azure DevOps project name")]
     [ValidateNotNullOrEmpty()]
     [string]$Project,
@@ -275,7 +278,8 @@ $script:OutputToFile = -not [string]::IsNullOrEmpty($OutputFile)
 $script:OutputBuilder = [System.Text.StringBuilder]::new()
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
-$baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+$orgBaseUrl = if ($CollectionUri) { $CollectionUri } else { "https://dev.azure.com/$Organization" }
+$baseUrl = "$orgBaseUrl/$Project/_apis"
 $apiVersion = "api-version=7.1"
 
 # If a specific PR ID is provided, get detailed information
@@ -487,7 +491,7 @@ if ($Id -gt 0) {
     }
     
     Write-Output-Line "`n[Links]" -ForegroundColor Yellow
-    $webUrl = "https://dev.azure.com/$Organization/$Project/_git/$($pr.repository.name)/pullrequest/$($pr.pullRequestId)"
+    $webUrl = "$orgBaseUrl/$Project/_git/$($pr.repository.name)/pullrequest/$($pr.pullRequestId)"
     Write-Output-Line "  Web URL: $webUrl"
     
     Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

@@ -54,6 +54,7 @@ try {
     # Read credentials from environment variables
     $token = ${env:AZUREDEVOPS_TOKEN}
     $authType = ${env:AZUREDEVOPS_AUTH_TYPE}
+    $collectionUri = ${env:AZUREDEVOPS_COLLECTION_URI}
     $organization = ${env:ORGANIZATION}
     $project = ${env:PROJECT}
     $repository = ${env:REPOSITORY}
@@ -90,7 +91,8 @@ try {
     }
 
     # Build the API URL for deleting a comment
-    $baseUrl = "https://dev.azure.com/$organization/$project/_apis"
+    $orgBaseUrl = if ($collectionUri) { $collectionUri } else { "https://dev.azure.com/$organization" }
+    $baseUrl = "$orgBaseUrl/$project/_apis"
     $uri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$ThreadId/comments/$CommentId`?api-version=7.1"
 
     # Send DELETE request

@@ -3,7 +3,7 @@
     Retrieves commits and changed files from the most recent iteration of a pull request.
 
 .DESCRIPTION
-    This script uses the Azure DevOps REST API to get the list of commits and 
+    This script uses the Azure DevOps REST API to get the list of commits and
     changed files from the most recent iteration (latest push) of a pull request.
 
 .PARAMETER Token
@@ -81,7 +81,7 @@ function Write-Output-Line {
         [string]$ForegroundColor = "White",
         [switch]$NoNewline
     )
-    
+
     if ($script:OutputToFile) {
         if ($NoNewline) {
             $script:OutputBuilder.Append($Message) | Out-Null
@@ -90,7 +90,7 @@ function Write-Output-Line {
             $script:OutputBuilder.AppendLine($Message) | Out-Null
         }
     }
-    
+
     if ($NoNewline) {
         Write-Host $Message -ForegroundColor $ForegroundColor -NoNewline
     }
@@ -104,7 +104,7 @@ function Get-AuthorizationHeader {
         [string]$Token,
         [string]$AuthType = "Basic"
     )
-    
+
     if ($AuthType -eq "Bearer") {
         return @{
             Authorization  = "Bearer $Token"
@@ -126,7 +126,7 @@ function Invoke-AzureDevOpsApi {
         [hashtable]$Headers,
         [string]$Method = "Get"
     )
-    
+
     try {
         $response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method $Method -ErrorAction Stop
         return $response
@@ -167,11 +167,11 @@ function Invoke-AzureDevOpsApi {
 
 function Format-DateForDisplay {
     param([string]$DateString)
-    
+
     if ([string]::IsNullOrEmpty($DateString)) {
         return "N/A"
     }
-    
+
     try {
         $date = [DateTime]::Parse($DateString)
         return $date.ToString("yyyy-MM-dd HH:mm:ss")
@@ -183,7 +183,7 @@ function Format-DateForDisplay {
 
 function Get-ChangeTypeDisplay {
     param([string]$ChangeType)
-    
+
     switch ($ChangeType) {
         "add"      { return @{ Text = "Added"; Color = "Green" } }
         "edit"     { return @{ Text = "Modified"; Color = "Yellow" } }
@@ -255,17 +255,17 @@ Write-Output-Line "  Iteration ID:     #$iterationId"
 Write-Output-Line "  Created:          $(Format-DateForDisplay $latestIteration.createdDate)"
 Write-Output-Line "  Updated:          $(Format-DateForDisplay $latestIteration.updatedDate)"
 if ($latestIteration.sourceRefCommit) {
-    Write-Output-Line "  Source Commit:    $($latestIteration.sourceRefCommit.commitId.Substring(0, 8))"
+    Write-Output-Line "  PR Branch Commit (new code):   $($latestIteration.sourceRefCommit.commitId)"
 }
 if ($latestIteration.targetRefCommit) {
-    Write-Output-Line "  Target Commit:    $($latestIteration.targetRefCommit.commitId.Substring(0, 8))"
+    Write-Output-Line "  Base Branch Commit (old code): $($latestIteration.targetRefCommit.commitId)"
 }
 
 # Commits
 Write-Output-Line "`n[Commits in this PR]" -ForegroundColor Yellow
 if ($commits -and $commits.value -and $commits.value.Count -gt 0) {
     Write-Output-Line "  Total commits: $($commits.value.Count)`n"
-    
+
     foreach ($commit in $commits.value) {
         $shortId = $commit.commitId.Substring(0, 8)
         $message = $commit.comment -split "`n" | Select-Object -First 1
@@ -288,7 +288,7 @@ if ($changes -and $changes.changeEntries -and $changes.changeEntries.Count -gt 0
     $modifiedCount = ($changes.changeEntries | Where-Object { $_.changeType -eq "edit" }).Count
     $deletedCount = ($changes.changeEntries | Where-Object { $_.changeType -eq "delete" }).Count
     $otherCount = $changes.changeEntries.Count - $addedCount - $modifiedCount - $deletedCount
-    
+
     Write-Output-Line "  Total files changed: $($changes.changeEntries.Count)"
     $summaryLine = "  +$addedCount added | ~$modifiedCount modified | -$deletedCount deleted"
     if ($otherCount -gt 0) {
@@ -296,14 +296,14 @@ if ($changes -and $changes.changeEntries -and $changes.changeEntries.Count -gt 0
     }
     Write-Output-Line $summaryLine
     Write-Output-Line ""
-    
+
     # List each file
     foreach ($change in $changes.changeEntries) {
         $changeDisplay = Get-ChangeTypeDisplay -ChangeType $change.changeType
         $filePath = $change.item.path
-        
+
         Write-Output-Line "  [$($changeDisplay.Text)] $filePath" -ForegroundColor $changeDisplay.Color
-        
+
         # Show original path for renames
         if ($change.changeType -eq "rename" -and $change.originalPath) {
             Write-Output-Line "         (from: $($change.originalPath))" -ForegroundColor DarkGray
@@ -332,7 +332,7 @@ if ($script:OutputToFile) {
         }
         $script:OutputBuilder.ToString() | Out-File -FilePath $OutputFile -Encoding UTF8
         Write-Host "`nOutput written to: $OutputFile" -ForegroundColor Green
-        
+
         # Also write the iteration ID to a separate file for use by other scripts
         $iterationIdFile = Join-Path $outputDir "Iteration_Id.txt"
         $iterationId.ToString() | Out-File -FilePath $iterationIdFile -Encoding UTF8 -NoNewline

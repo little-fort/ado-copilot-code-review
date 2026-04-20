@@ -69,10 +69,14 @@ async function run(): Promise<void> {
 
         // Get agent selection and auth inputs
         const useClaudeCode = tl.getBoolInput('useClaudeCode', false);
+        const useCustomModelProvider = tl.getBoolInput('useCustomModelProvider', false);
         const githubPat = tl.getInput('githubPat');
         const anthropicApiKey = tl.getInput('anthropicApiKey');
         const maxTurns = tl.getInput('maxTurns');
         const maxBudget = tl.getInput('maxBudget');
+        const copilotProviderBaseUrl = tl.getInput('copilotProviderBaseUrl');
+        const copilotProviderType = tl.getInput('copilotProviderType');
+        const copilotProviderApiKey = tl.getInput('copilotProviderApiKey');
 
         // Validate agent-specific auth
         if (useClaudeCode) {
@@ -81,7 +85,25 @@ async function run(): Promise<void> {
                     'Anthropic API Key is required when using Claude Code CLI. Please provide the anthropicApiKey input.');
                 return;
             }
+        } else if (useCustomModelProvider) {
+            // copilot CLI with custom model provider
+            if (!copilotProviderBaseUrl) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Base URL of model provider endpoint is required when using a custom model provider.');
+                return;
+            }
+            if (!copilotProviderType) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Type of model provider is required when using a custom model provider.');
+                return;
+            }
+            if (!copilotProviderApiKey) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'API key of model provider is required when using a custom model provider.');
+                return;
+            }
         } else {
+            // copilot CLI with GitHub-hosted models
             if (!githubPat) {
                 tl.setResult(tl.TaskResult.Failed,
                     'GitHub PAT is required when using GitHub Copilot CLI. Please provide the githubPat input.');
@@ -200,6 +222,10 @@ async function run(): Promise<void> {
         // Set environment variables for PowerShell scripts
         if (useClaudeCode) {
             process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
+        } else if (useCustomModelProvider) {
+            process.env['COPILOT_PROVIDER_BASE_URL'] = copilotProviderBaseUrl!;
+            process.env['COPILOT_PROVIDER_TYPE'] = copilotProviderType!;
+            process.env['COPILOT_PROVIDER_API_KEY'] = copilotProviderApiKey!;
         } else {
             process.env['GH_TOKEN'] = githubPat!;
         }

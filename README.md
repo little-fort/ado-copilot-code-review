@@ -197,6 +197,10 @@ steps:
 | `promptRaw` | No | - | _(Advanced)_ Inline custom prompt that will be passed as-is with no supportive direction. |
 | `authors` | No | - | Comma-separated list of email addresses to filter reviews (see below) |
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
+| `useCustomModelProvider` | No | `false` | Use Custom Model Provider for Copilot |
+| `copilotProviderBaseUrl` | No | - | Base URL of custom model provider's API endpoint. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
+| `copilotProviderType` | No | - | Custom model provider type. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
+| `copilotProviderApiKey` | No | - | Custom model provider API key. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
 
 ### Copilot Models
 

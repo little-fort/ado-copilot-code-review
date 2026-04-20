@@ -24,13 +24,21 @@
             "helpMarkDown": "When enabled, uses Claude Code CLI (Anthropic) instead of GitHub Copilot CLI for the code review. Requires an Anthropic API key."
         },
         {
+            "name": "useCustomModelProvider",
+            "type": "boolean",
+            "label": "Use Custom Model Provider for Copilot",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, uses a custom model provider for Copilot instead of the default GitHub-hosted models."
+        },
+        {
             "name": "githubPat",
             "type": "string",
             "label": "GitHub PAT",
             "required": false,
             "isSecret": true,
             "helpMarkDown": "Personal Access Token for GitHub with Copilot access. Required when using the GitHub Copilot CLI (default). Not needed when 'Use Claude Code CLI' is enabled.",
-            "visibleRule": "useClaudeCode != true"
+            "visibleRule": "useClaudeCode != true && useCustomModelProvider != true"
         },
         {
             "name": "anthropicApiKey",
@@ -185,6 +193,33 @@
             "required": false,
             "defaultValue": true,
             "helpMarkDown": "When enabled, fetches full details (title, description, acceptance criteria, repro steps) for work items linked to the pull request and includes them as context for the Copilot review. Disable to reduce API calls and context window usage."
+        },
+        {
+            "name": "copilotProviderBaseUrl",
+            "type": "string",
+            "label": "Base URL of the model provider's API endpoint",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Required when using custom model provider in Copilot. Specifies the base URL of the custom model provider's API endpoint.",
+            "visibleRule": "useCustomModelProvider == true"
+        },
+        {
+            "name": "copilotProviderType",
+            "type": "string",
+            "label": "Type of the model provider",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Required when using custom model provider in Copilot. Specifies the type of the custom model provider.",
+            "visibleRule": "useCustomModelProvider == true"
+        },
+        {
+            "name": "copilotProviderApiKey",
+            "type": "string",
+            "label": "API Key for the model provider",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Required when using custom model provider in Copilot. Specifies the API key for the custom model provider.",
+            "visibleRule": "useCustomModelProvider == true"
         }
     ],
     "execution": {

@@ -143,8 +143,6 @@ For longer custom prompts, create a .txt file in your repository and pass the fi
     promptFile: '$(Build.SourcesDirectory)/.copilot/review-prompt.txt'
 ```
 
-> **IMPORTANT:** If using a custom prompt, avoid including any double quotation marks (") as this will cause errors when passing the input to the Copilot CLI. Single quotes (') can be used instead and should not cause any issues.
-
 ### Manual Trigger for Specific PR
 
 If you don't want to setup an automatic trigger, you can instead set up a pipeline with a **Pull Request ID** parameter to run reviews on demand:
@@ -201,22 +199,22 @@ steps:
 | `copilotProviderBaseUrl` | No | - | Base URL of custom model provider's API endpoint. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
 | `copilotProviderType` | No | - | Custom model provider type. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
 | `copilotProviderApiKey` | No | - | Custom model provider API key. Required when using custom model provider in Copilot (see [details](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli#using-your-own-model-provider)) |
+| `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
+| `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
 ### Copilot Models
 
-As of April 2026, here are the model options supported by the GitHub Copilot CLI:
+As of May 2026, here are the model options supported by the GitHub Copilot CLI:
 
-- `claude-sonnet-4.5` (default)
+- `claude-sonnet-4.6` (default)
+- `claude-sonnet-4.5`
 - `claude-haiku-4.5`
 - `claude-opus-4.5`
-- `claude-sonnet-4`
+- `gpt-5.4`
+- `gpt-5.4-mini`
+- `gpt-5.3-codex`
 - `gpt-5.2-codex` 
 - `gpt-5.2`
-- `gpt-5.1-codex-max`
-- `gpt-5.1-codex`
-- `gpt-5.1-codex-mini`
-- `gpt-5.1`
-- `gpt-5`
 - `gpt-5-mini`
 - `gpt-4.1`
 - `gemini-3-pro-preview`
@@ -260,6 +258,52 @@ When configured:
 - If the PR author's email matches any in the list, the review proceeds normally
 - If no match is found, the task completes successfully without running the code review
 - Email comparison is case-insensitive
+
+### Diff-Only Review Mode
+
+By default, the CLI agent has full access to the repository and can explore files beyond the PR diff. This equips the agent with more contextual awareness, leading to more relevant feedback. However, for large codebases this can result in excessive token consumption as the agent reads unrelated files for context.
+
+Enable `diffOnlyReview` to restrict the review to **only** the code changes in the PR:
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    diffOnlyReview: true
+```
+
+When enabled:
+- The PR diff is pre-computed via `git diff` (using merge-base / three-dot syntax to match the ADO PR UI) and embedded directly in the prompt along with all PR context (details, iteration info, work items)
+- Built-in file-browsing tools (Read, Glob, Grep) are removed from the agent's tool set; the agent is restricted to PowerShell shell commands only
+- The prompt explicitly directs the agent to use only the embedded diff and to refrain from reading files or running git commands to explore the repository
+- Token usage becomes proportional to the size of the actual code changes, not the size of the repository
+
+**Limitations:** The agent retains shell access to `pwsh` because it needs to invoke the comment-posting scripts (`Add-CopilotComment.ps1`, `Update-CopilotComment.ps1`). Because `pwsh` is a general-purpose shell, this technically permits arbitrary command execution; the diff-only behavior is enforced by the combination of removed file-browsing tools, embedded context, and explicit prompt instructions rather than by hard tool-level constraints alone.
+
+**Requirements:**
+- The pipeline must use `fetchDepth: 0` (full clone) so that both source and target commits are available for diff computation
+- When using raw prompt modes (`promptRaw` or `promptFileRaw`), prompts should be constructed assuming that all diff context will be appended to the end
+
+**Trade-off:** The agent loses the ability to check broader codebase patterns and conventions. This is the intended trade-off for users prioritizing token efficiency over deep contextual review.
+
+If the diff cannot be computed (e.g., missing commits due to a shallow clone), the task will fail with a descriptive error rather than silently consuming excessive tokens.
+
+### Publishing Prompt Artifacts
+
+Enable `publishPromptArtifacts` to publish all generated context files and the final assembled prompt as pipeline artifacts. This is useful for debugging prompt construction, verifying what context the CLI agent received, or inspecting the diff content in diff-only mode.
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    publishPromptArtifacts: true
+```
+
+The published artifact (`CopilotCodeReview`) will contain files such as `PR_Details.txt`, `Iteration_Details.txt`, commit SHA files, work item details (if enabled), and the final prompt file sent to the CLI agent.
 
 ## Setting Up Authentication
 

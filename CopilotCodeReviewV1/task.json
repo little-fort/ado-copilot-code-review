@@ -10,7 +10,7 @@
     "version": {
         "Major": 1,
         "Minor": 5,
-        "Patch": 3
+        "Patch": 4
     },
     "instanceNameFormat": "Copilot Code Review",
     "minimumAgentVersion": "2.182.1",
@@ -220,6 +220,22 @@
             "defaultValue": "",
             "helpMarkDown": "Required when using custom model provider in Copilot. Specifies the API key for the custom model provider.",
             "visibleRule": "useCustomModelProvider == true"
+        },
+        {
+            "name": "diffOnlyReview",
+            "type": "boolean",
+            "label": "Diff-Only Review",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, the review is restricted to ONLY the PR diff. The diff is pre-computed and embedded in the prompt, and CLI tool access is limited to posting comments only. This dramatically reduces token usage for large repositories. Compatible with all prompt modes — when using raw prompts, the diff context is appended to the end of the prompt."
+        },
+        {
+            "name": "publishPromptArtifacts",
+            "type": "boolean",
+            "label": "Publish Prompt Artifacts",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, publishes all context files (PR details, iteration details, work items, commit SHAs) and the final assembled prompt as pipeline artifacts. Useful for debugging prompt construction and reviewing what context the CLI agent received."
         }
     ],
     "execution": {
@@ -232,7 +248,7 @@
     },
     "restrictions": {
         "commands": {
-            "mode": "restricted"
+            "mode": "any"
         },
         "settableVariables": {
             "allowed": []

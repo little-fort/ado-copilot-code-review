@@ -85,11 +85,14 @@ function Write-Output-Line {
         }
     }
 
+    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
+    $sanitized = $Message -replace '(?m)^##', ' ##'
+
     if ($NoNewline) {
-        Write-Host $Message -ForegroundColor $ForegroundColor -NoNewline
+        Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
     }
     else {
-        Write-Host $Message -ForegroundColor $ForegroundColor
+        Write-Host $sanitized -ForegroundColor $ForegroundColor
     }
 }
 

@@ -9,7 +9,13 @@
     comments and file-specific inline comments.
 
 .PARAMETER Comment
-    Required. The comment text to post. Supports markdown formatting.
+    Optional. The comment text to post. Supports markdown formatting.
+    Either -Comment or -CommentFile must be provided.
+
+.PARAMETER CommentFile
+    Optional. Path to a file containing the comment text. The file content is read
+    and used as the comment. This avoids shell escaping issues with complex markdown.
+    Either -Comment or -CommentFile must be provided.
 
 .PARAMETER Status
     Optional. Status for the new thread: 'Active' or 'Closed'. Default is 'Active'.
@@ -32,8 +38,8 @@
     Creates a new general comment thread with closed status.
 
 .EXAMPLE
-    .\Add-CopilotComment.ps1 -Comment "Consider using async here" -Status 'Active' -FilePath '/src/Program.cs' -StartLine 42
-    Creates an inline comment on line 42 of the specified file.
+    .\Add-CopilotComment.ps1 -CommentFile ./_comment.md -Status 'Active' -FilePath '/src/Program.cs' -StartLine 42
+    Creates an inline comment on line 42 using comment text read from a file.
 
 .EXAMPLE
     .\Add-CopilotComment.ps1 -Comment "This block needs refactoring" -Status 'Active' -FilePath '/src/Program.cs' -StartLine 42 -EndLine 50
@@ -56,9 +62,11 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Comment text to post")]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(Mandatory = $false, HelpMessage = "Comment text to post")]
     [string]$Comment,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path to a file containing the comment text")]
+    [string]$CommentFile,
 
     [Parameter(Mandatory = $false, HelpMessage = "Status for the new thread: Active or Closed")]
     [ValidateSet("Active", "Closed")]
@@ -78,6 +86,20 @@ param(
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Resolve comment text from either -Comment or -CommentFile
+if ($CommentFile) {
+    if (-not (Test-Path $CommentFile)) {
+        Write-Error "Comment file not found: $CommentFile"
+        exit 1
+    }
+    $Comment = Get-Content -Path $CommentFile -Raw
+}
+
+if (-not $Comment) {
+    Write-Error "Either -Comment or -CommentFile must be provided."
+    exit 1
+}
 
 # Use the provided Status parameter (default: Active). The prompt should pass -Status when possible.
 Write-Host "Posting comment with thread status: $Status" -ForegroundColor DarkGray

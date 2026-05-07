@@ -26,6 +26,15 @@ function isWindows(): boolean {
     return process.platform === 'win32';
 }
 
+/**
+ * Neutralize Azure Pipelines logging-command markers in untrusted text before logging.
+ * Prepends a space to any line starting with `##` so Azure Pipelines won't interpret
+ * `##vso[...]` or `##[...]` patterns as logging commands.
+ */
+function sanitizePipelineLog(text: string): string {
+    return text.replace(/^##/gm, ' ##');
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -193,6 +202,13 @@ async function run(): Promise<void> {
         const promptRaw = tl.getInput('promptRaw');
         const promptFileRaw = tl.getInput('promptFileRaw');
         const includeWorkItems = tl.getBoolInput('includeWorkItems', false);
+        const diffOnlyReview = tl.getBoolInput('diffOnlyReview', false);
+        const publishPromptArtifacts = tl.getBoolInput('publishPromptArtifacts', false);
+
+        // filePath inputs return the working directory path when not set, so check both
+        // the input value and that the path actually points to a real file.
+        const isPromptFileSet = !!(promptFile && fs.existsSync(promptFile) && fs.statSync(promptFile).isFile());
+        const isPromptFileRawSet = !!(promptFileRaw && fs.existsSync(promptFileRaw) && fs.statSync(promptFileRaw).isFile());
 
         // If PR ID not provided, try to get from pipeline variable
         if (!pullRequestId) {
@@ -331,6 +347,73 @@ async function run(): Promise<void> {
             }
         }
 
+        // Diff-only mode: pre-compute the git diff from commit SHAs
+        let diffContent: string | null = null;
+
+        if (diffOnlyReview) {
+            console.log('\n[Diff-Only Mode] Computing PR diff from commit SHAs...');
+            const sourceCommitFile = path.join(workingDirectory, 'Source_Commit.txt');
+            const targetCommitFile = path.join(workingDirectory, 'Target_Commit.txt');
+
+            if (!fs.existsSync(sourceCommitFile) || !fs.existsSync(targetCommitFile)) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Diff-only mode failed: Commit SHA files (Source_Commit.txt / Target_Commit.txt) not found. ' +
+                    'This may indicate the Azure DevOps API did not return commit references for the PR iteration.');
+                return;
+            }
+
+            const sourceCommit = fs.readFileSync(sourceCommitFile, 'utf8').trim();
+            const targetCommit = fs.readFileSync(targetCommitFile, 'utf8').trim();
+
+            if (!sourceCommit || !targetCommit) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Diff-only mode failed: Commit SHA files are empty. ' +
+                    'Source_Commit.txt and Target_Commit.txt must contain valid commit hashes.');
+                return;
+            }
+
+            console.log(`  Source commit: ${sourceCommit}`);
+            console.log(`  Target commit: ${targetCommit}`);
+
+            try {
+                // Three-dot syntax (target...source) diffs from the merge-base of the two
+                // commits to source. This matches the PR-style diff shown in the ADO UI
+                // and excludes unrelated target-branch changes when source is behind target.
+                const diffResult = child_process.spawnSync(
+                    'git',
+                    ['diff', `${targetCommit}...${sourceCommit}`],
+                    {
+                        encoding: 'utf8',
+                        cwd: workingDirectory,
+                        maxBuffer: 50 * 1024 * 1024
+                    }
+                );
+
+                if (diffResult.status === 0 && diffResult.stdout.trim()) {
+                    diffContent = diffResult.stdout;
+                    console.log(`  Diff computed successfully (${diffContent.length} characters).`);
+                } else if (diffResult.status === 0 && !diffResult.stdout.trim()) {
+                    tl.setResult(tl.TaskResult.Failed,
+                        'Diff-only mode failed: git diff returned empty output. ' +
+                        'The PR may have no code changes between the source and target commits.');
+                    return;
+                } else {
+                    const stderr = diffResult.stderr ? diffResult.stderr.trim() : '';
+                    tl.setResult(tl.TaskResult.Failed,
+                        `Diff-only mode failed: git diff exited with code ${diffResult.status}. ` +
+                        'This typically means the commit SHAs are not available in the local checkout. ' +
+                        'Ensure your pipeline uses "fetchDepth: 0" for a full clone. ' +
+                        (stderr ? `git stderr: ${stderr}` : ''));
+                    return;
+                }
+            } catch (err) {
+                tl.setResult(tl.TaskResult.Failed,
+                    `Diff-only mode failed: git diff threw an error: ${err instanceof Error ? err.message : String(err)}. ` +
+                    'Ensure git is available and the working directory is a valid repository.');
+                return;
+            }
+        }
+
         // Step 4: Fetch linked work item details (optional)
         if (includeWorkItems) {
             console.log('\n[Step 4/5] Fetching linked work item details...');
@@ -374,14 +457,6 @@ async function run(): Promise<void> {
         let promptFilePath: string = '';
         let customPromptText: string | null = null;
 
-        // Helper to check if filePath inputs are actually set (filePath inputs return working dir when empty)
-        const isPromptFileSet = promptFile &&
-            fs.existsSync(promptFile) &&
-            fs.statSync(promptFile).isFile();
-        const isPromptFileRawSet = promptFileRaw &&
-            fs.existsSync(promptFileRaw) &&
-            fs.statSync(promptFileRaw).isFile();
-
         // Validate that only one prompt input is provided
         const activePromptInputs: string[] = [];
         if (prompt) activePromptInputs.push('prompt');
@@ -401,7 +476,7 @@ async function run(): Promise<void> {
             console.log('Using raw prompt from input.');
             promptFilePath = path.join(workingDirectory, '_copilot_prompt.txt');
             fs.writeFileSync(promptFilePath, promptRaw, 'utf8');
-            console.log('\nRAW PROMPT:\n' + promptRaw + '\n\n');
+            console.log('\nRAW PROMPT:\n' + sanitizePipelineLog(promptRaw) + '\n\n');
         } else if (isPromptFileRawSet) {
             // Raw prompt file: use file contents as-is with no modification
             console.log(`Using raw prompt from file: ${promptFileRaw}`);
@@ -412,14 +487,10 @@ async function run(): Promise<void> {
             }
             promptFilePath = path.join(workingDirectory, '_copilot_prompt.txt');
             fs.writeFileSync(promptFilePath, fileContent, 'utf8');
-            console.log('\nRAW PROMPT:\n' + fileContent + '\n\n');
+            console.log('\nRAW PROMPT:\n' + sanitizePipelineLog(fileContent) + '\n\n');
         } else if (prompt) {
             // Direct prompt input: merge with template
             console.log('Using custom prompt from input.');
-            if (prompt.includes('"')) {
-                tl.setResult(tl.TaskResult.Failed, 'Custom prompts cannot include double quotes ("). Please remove any double quotes from your prompt input.');
-                return;
-            }
             customPromptText = prompt;
         } else if (isPromptFileSet) {
             // Read from prompt file: merge with template
@@ -427,10 +498,6 @@ async function run(): Promise<void> {
             const fileContent = fs.readFileSync(promptFile!, 'utf8').trim();
             if (!fileContent) {
                 tl.setResult(tl.TaskResult.Failed, `Prompt file is empty: ${promptFile}`);
-                return;
-            }
-            if (fileContent.includes('"')) {
-                tl.setResult(tl.TaskResult.Failed, `Custom prompts cannot include double quotes ("). Please remove any double quotes from the prompt file: ${promptFile}`);
                 return;
             }
             customPromptText = fileContent;
@@ -441,7 +508,7 @@ async function run(): Promise<void> {
             const customPromptTemplate = path.join(scriptsDir, 'prompt-custom.txt');
             const templateContent = fs.readFileSync(customPromptTemplate, 'utf8');
             const mergedPrompt = templateContent.replace('%CUSTOMPROMPT%', customPromptText);
-            console.log('\nCUSTOM PROMPT:\n' + mergedPrompt + '\n\n');
+            console.log('\nCUSTOM PROMPT:\n' + sanitizePipelineLog(mergedPrompt) + '\n\n');
 
             // Write merged prompt to a temp file in the working directory
             promptFilePath = path.join(workingDirectory, '_copilot_prompt.txt');
@@ -466,6 +533,76 @@ async function run(): Promise<void> {
             }
         }
 
+        // Diff-only mode: inject context + diff into the prompt and flag for tool restriction
+        let diffOnlyActive = false;
+
+        if (diffOnlyReview && diffContent && promptFilePath) {
+            let currentPrompt = fs.readFileSync(promptFilePath, 'utf8');
+            const isRawPrompt = !!(promptRaw || isPromptFileRawSet);
+
+            // For non-raw prompts (default/custom templates), attempt to rewrite instructions
+            // that tell the agent to use git/file access. These are best-effort — the override
+            // block appended at the end guarantees correct behavior regardless.
+            if (!isRawPrompt) {
+                const originalGuidelines = 'Using this information along with git commands and the local copy of the repository, please conduct a code review of this pull request and identify any suggested modifications that should be made.';
+                const replacedGuidelines = 'Using the PR details and code diff provided at the end of this prompt, please conduct a code review of this pull request and identify any suggested modifications that should be made.';
+                if (currentPrompt.includes(originalGuidelines)) {
+                    currentPrompt = currentPrompt.replace(originalGuidelines, replacedGuidelines);
+                }
+
+                const originalOverview = 'The details of a pull request for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for broad context on the pull request. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
+                const replacedOverview = 'The PR details, iteration information, and code diff are all provided inline at the end of this prompt. Use this information to understand the context and review the code changes. Do NOT attempt to read files from disk or run git commands to explore the repository—all relevant context is embedded below.';
+                if (currentPrompt.includes(originalOverview)) {
+                    currentPrompt = currentPrompt.replace(originalOverview, replacedOverview);
+                } else {
+                    tl.warning('Diff-only mode: expected Overview paragraph not found in the prompt template. The prompt template may have been edited; update the originalOverview string in index.ts to match.');
+                }
+            }
+
+            // Build the inline context sections (appended for all prompt types)
+            let contextSections = '\n\n# PR Details\n\n';
+            if (fs.existsSync(prDetailsOutput)) {
+                contextSections += fs.readFileSync(prDetailsOutput, 'utf8');
+            }
+
+            contextSections += '\n\n# Iteration Details\n\n';
+            if (fs.existsSync(iterationDetailsOutput)) {
+                contextSections += fs.readFileSync(iterationDetailsOutput, 'utf8');
+            }
+
+            const workItemDetailsFile = path.join(workingDirectory, 'Work_Item_Details.txt');
+            if (fs.existsSync(workItemDetailsFile)) {
+                contextSections += '\n\n# Work Item Details\n\n';
+                contextSections += fs.readFileSync(workItemDetailsFile, 'utf8');
+            }
+
+            contextSections += '\n\n# Code Changes (git diff)\n\nThe following unified diff shows all code changes in this pull request:\n\n```diff\n' + diffContent + '\n```\n';
+
+            // For non-raw prompts, append a strong override directive.
+            // Raw prompt users provide their own diff-only instructions.
+            if (!isRawPrompt) {
+                const overrideBlock = '\n\n# IMPORTANT: Diff-Only Review Mode\n\n' +
+                    'This is a diff-only review. All necessary context (PR details, iteration information, work items, and the full code diff) is provided in the sections above. You MUST:\n\n' +
+                    '- Use ONLY the embedded diff and PR details for your review\n' +
+                    '- DO NOT attempt to read files from disk or run git commands to explore the repository\n' +
+                    '- DO NOT use shell commands for browsing or inspecting source files\n' +
+                    '- Use only the pwsh-based comment scripts (Add-CopilotComment.ps1, Update-CopilotComment.ps1) to post your feedback\n\n' +
+                    'Any earlier instructions in this prompt that conflict with the above are superseded by this section.\n';
+                contextSections += overrideBlock;
+            }
+
+            // Append all context to the prompt
+            currentPrompt += contextSections;
+
+            // Write the assembled prompt
+            const diffPromptPath = path.join(workingDirectory, '_diff_prompt.txt');
+            fs.writeFileSync(diffPromptPath, currentPrompt, 'utf8');
+            promptFilePath = diffPromptPath;
+            diffOnlyActive = true;
+
+            console.log('[Diff-Only Mode] All context embedded in prompt. Tool access will be restricted.');
+        }
+
         // Copy the Add-AzureDevOpsPRComment.ps1 and Add-AzureDevOpsPRComment.ps1 script to the working directory
         // so Copilot can find and use them for posting PR comments
         const addCommentScriptSource = path.join(scriptsDir, 'Add-AzureDevOpsPRComment.ps1');
@@ -485,12 +622,38 @@ async function run(): Promise<void> {
         fs.copyFileSync(deleteCommentScriptSource, deleteCommentScriptDest);
         console.log(`Copied Delete-CopilotComment.ps1 to: ${deleteCommentScriptDest}`);
         
+        // Publish prompt artifacts for debugging if requested
+        if (publishPromptArtifacts) {
+            console.log('\n[Artifacts] Publishing prompt and context files...');
+            const artifactName = 'CopilotCodeReview';
+            const artifactFiles = [
+                prDetailsOutput,
+                iterationDetailsOutput,
+                path.join(workingDirectory, 'Iteration_Id.txt'),
+                path.join(workingDirectory, 'Source_Commit.txt'),
+                path.join(workingDirectory, 'Target_Commit.txt'),
+                path.join(workingDirectory, 'Work_Item_Ids.txt'),
+                path.join(workingDirectory, 'Work_Item_Details.txt'),
+                promptFilePath,
+            ];
+
+            for (const artifactFile of artifactFiles) {
+                if (artifactFile && fs.existsSync(artifactFile)) {
+                    tl.command('artifact.upload', {
+                        containerfolder: artifactName,
+                        artifactname: artifactName
+                    }, artifactFile);
+                    console.log(`  Uploaded: ${path.basename(artifactFile)}`);
+                }
+            }
+        }
+
         // Run CLI agent with timeout
         const timeoutMs = timeoutMinutes * 60 * 1000;
         if (useClaudeCode) {
-            await runClaudeCodeCli(promptFilePath, model, workingDirectory, timeoutMs, maxTurns, maxBudget);
+            await runClaudeCodeCli(promptFilePath, model, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
         } else {
-            await runCopilotCli(promptFilePath, model, workingDirectory, timeoutMs);
+            await runCopilotCli(promptFilePath, model, workingDirectory, timeoutMs, diffOnlyActive);
         }
 
         console.log('\n' + '='.repeat(60));
@@ -590,18 +753,25 @@ async function runPowerShellScript(scriptPath: string, args: string[]): Promise<
     });
 }
 
-async function runCopilotCli(promptFilePath: string, model: string | undefined, workingDirectory: string, timeoutMs: number): Promise<void> {
+async function runCopilotCli(promptFilePath: string, model: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
         // Build PowerShell command that reads prompt file and passes content to copilot CLI
-        // This mirrors the original implementation: $prompt = Get-Content -Path "prompt.txt" -Raw; copilot -p $prompt ...
-        let copilotCmd = `copilot -p "$prompt" --allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'`;
+        let copilotFlags = `--allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'`;
         if (model) {
-            copilotCmd += ` --model ${model}`;
+            copilotFlags += ` --model ${model}`;
         }
-        
-        const printPrompt = `Write-Host ========== START PROMPT ==========; Write-Host $prompt; Write-Host ========== END PROMPT ==========;`;
+
+        // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
+        // Users can inspect the full prompt via publishPromptArtifacts.
+        const printPrompt = diffOnlyActive
+            ? `Write-Host '[Diff-only mode] Prompt suppressed; enable publishPromptArtifacts to inspect the full prompt.';`
+            : `Write-Host ========== START PROMPT ==========; Write-Host ($prompt -replace '(?m)^##', ' ##'); Write-Host ========== END PROMPT ==========;`;
         const envRefresh = `$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User");`
-        const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${copilotCmd}`;
+        // Pipe the prompt via stdin — avoids Windows command-line length limits and
+        // eliminates double-quote escaping issues in prompt content.
+        const copilotInvocation = `$prompt | copilot ${copilotFlags}`;
+        const sanitizedCopilotCmd = `$ErrorActionPreference = 'Stop'; try { ${copilotInvocation} | ForEach-Object { Write-Host ($_ -replace '(?m)^##', ' ##') }; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host "Error running Copilot CLI: $_"; exit 1 }`;
+        const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${sanitizedCopilotCmd}`;
         console.log(`Running Powershell: ${psCommand}`);
         
         const envVars = { ...process.env };
@@ -696,39 +866,52 @@ async function runClaudeCodeCli(
     workingDirectory: string,
     timeoutMs: number,
     maxTurns: string | undefined,
-    maxBudget: string | undefined
+    maxBudget: string | undefined,
+    diffOnlyActive: boolean
 ): Promise<void> {
     return new Promise((resolve, reject) => {
-        // Build Claude Code CLI command for headless CI/CD operation
-        // Use stream-json output with PowerShell parsing for real-time log streaming
-        let claudeCmd = `claude -p "$prompt" --dangerously-skip-permissions`;
-        claudeCmd += ` --output-format stream-json --verbose --include-partial-messages`;
-        claudeCmd += ` --allowedTools "Bash" "Read" "Write" "Edit" "Glob" "Grep"`;
-        claudeCmd += ` --disallowedTools "Bash(git push *)"`;
+        // Build Claude Code CLI flags
+        let claudeFlags = `--dangerously-skip-permissions`;
+        claudeFlags += ` --output-format stream-json --verbose --include-partial-messages`;
+        if (diffOnlyActive) {
+            claudeFlags += ` --allowedTools "Bash(pwsh *)" "Write"`;
+        } else {
+            claudeFlags += ` --allowedTools "Bash" "Read" "Write" "Edit" "Glob" "Grep"`;
+        }
+        claudeFlags += ` --disallowedTools "Bash(git push *)"`;
 
         if (model) {
-            claudeCmd += ` --model ${model}`;
+            claudeFlags += ` --model ${model}`;
         }
         if (maxTurns) {
-            claudeCmd += ` --max-turns ${maxTurns}`;
+            claudeFlags += ` --max-turns ${maxTurns}`;
         }
         if (maxBudget) {
-            claudeCmd += ` --max-budget-usd ${maxBudget}`;
+            claudeFlags += ` --max-budget-usd ${maxBudget}`;
         }
+
+        // When diffOnlyActive, pipe the prompt via stdin to avoid Windows command-line
+        // length limits. Claude Code reads from stdin when content is piped to `claude -p`.
+        const claudeInvocation = diffOnlyActive
+            ? `$prompt | claude -p ${claudeFlags}`
+            : `claude -p "$prompt" ${claudeFlags}`;
 
         // PowerShell pipeline: stream JSON from Claude Code, extract text deltas and tool calls in real time.
         // Tool use events arrive as: content_block_start (tool name) → input_json_delta fragments → content_block_stop.
         // We accumulate input fragments with $script:-scoped state and print the tool name + input on block stop.
+        // $ErrorActionPreference = 'Stop' ensures process startup failures are catchable.
         const streamParser = [
+            `$ErrorActionPreference = 'Stop';`,
             `$script:toolNames = @{};`,
             `$script:toolInputs = @{};`,
-            `${claudeCmd} | ForEach-Object {`,
+            `try {`,
+            `${claudeInvocation} | ForEach-Object {`,
             `  try {`,
             `    $ev = ($_ | ConvertFrom-Json -ErrorAction Stop);`,
             `    if ($ev.type -ne 'stream_event') { return }`,
             `    $se = $ev.event;`,
             `    if ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'text_delta') {`,
-            `      Write-Host $se.delta.text`,
+            `      Write-Host ($se.delta.text -replace '(?m)^##', ' ##')`,
             `    }`,
             `    elseif ($se.type -eq 'content_block_start' -and $se.content_block.type -eq 'tool_use') {`,
             `      $idx = [string]$se.index;`,
@@ -745,17 +928,22 @@ async function runClaudeCodeCli(
             `      $raw = $script:toolInputs[$idx];`,
             `      try { $inp = ($raw | ConvertFrom-Json -ErrorAction Stop); $display = ($inp | ConvertTo-Json -Compress) } catch { $display = $raw };`,
             `      Write-Host '';`,
-            `      Write-Host "    [$name] $display";`,
+            `      Write-Host ("    [$name] $display" -replace '(?m)^##', ' ##');`,
             `      $script:toolNames.Remove($idx);`,
             `      $script:toolInputs.Remove($idx)`,
             `    }`,
             `  } catch { Write-Host $_ }`,
             `};`,
             `Write-Host '';`,
-            `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`
+            `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+            `} catch { Write-Host "Error running Claude Code CLI: $_"; exit 1 }`
         ].join(' ');
 
-        const printPrompt = `Write-Host ========== START PROMPT ==========; Write-Host $prompt; Write-Host ========== END PROMPT ==========;`;
+        // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
+        // Users can inspect the full prompt via publishPromptArtifacts.
+        const printPrompt = diffOnlyActive
+            ? `Write-Host '[Diff-only mode] Prompt suppressed; enable publishPromptArtifacts to inspect the full prompt.';`
+            : `Write-Host ========== START PROMPT ==========; Write-Host ($prompt -replace '(?m)^##', ' ##'); Write-Host ========== END PROMPT ==========;`;
         const envRefresh = isWindows()
             ? `$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User");`
             : '';

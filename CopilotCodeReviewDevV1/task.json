@@ -186,6 +186,14 @@
             "helpMarkDown": "Optional. The Copilot model to use for the review (e.g., 'gpt-4', 'claude-sonnet'). If not specified, uses the default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
         },
         {
+            "name": "reasoningEffort",
+            "type": "string",
+            "label": "Reasoning Effort",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Optional. Reasoning effort level to control review depth and token spend. GitHub Copilot CLI accepts: none, minimal, low, medium, high, xhigh, max. Claude Code CLI accepts: low, medium, high, xhigh, max. If the selected model does not support the requested level, the CLI fails with a clear error rather than ignoring it. Leave empty to use the model's default."
+        },
+        {
             "name": "promptFile",
             "type": "filePath",
             "label": "Custom Prompt File",

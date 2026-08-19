@@ -137,6 +137,7 @@ async function run(): Promise<void> {
         const copilotProviderType = tl.getInput('copilotProviderType');
         const copilotProviderApiKey = tl.getInput('copilotProviderApiKey');
         const model = tl.getInput('model');
+        const reasoningEffort = tl.getInput('reasoningEffort');
 
         // Validate agent-specific auth
         if (useClaudeCode && useCustomModelProvider) {
@@ -190,6 +191,25 @@ async function run(): Promise<void> {
                 tl.setResult(tl.TaskResult.Failed,
                     'GitHub PAT is required when using GitHub Copilot CLI. Please provide the githubPat input.');
                 return;
+            }
+        }
+
+        // Validate reasoning effort per agent — the two CLIs accept different
+        // level sets, and both hard-fail on unrecognized values; catching a typo
+        // here gives a clearer pipeline error than a mid-run CLI failure.
+        if (reasoningEffort) {
+            const copilotEffortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+            const claudeEffortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
+            const validLevels = useClaudeCode ? claudeEffortLevels : copilotEffortLevels;
+            if (!validLevels.includes(reasoningEffort)) {
+                tl.setResult(tl.TaskResult.Failed,
+                    `Invalid reasoningEffort value '${reasoningEffort}' for the ${useClaudeCode ? 'Claude Code' : 'GitHub Copilot'} CLI. ` +
+                    `Valid values: ${validLevels.join(', ')}.`);
+                return;
+            }
+            if (useCustomModelProvider) {
+                tl.warning('reasoningEffort may be rejected when using a custom model provider — the Copilot API is known to ' +
+                    'reject reasoning parameters for BYOK models. Remove the reasoningEffort input if the review fails.');
             }
         }
 
@@ -317,6 +337,9 @@ async function run(): Promise<void> {
         console.log(`Timeout: ${timeoutMinutes} minutes`);
         if (model) {
             console.log(`Model: ${model}`);
+        }
+        if (reasoningEffort) {
+            console.log(`Reasoning Effort: ${reasoningEffort}`);
         }
         console.log('='.repeat(60));
 
@@ -771,9 +794,9 @@ async function run(): Promise<void> {
         // Run CLI agent with timeout
         const timeoutMs = timeoutMinutes * 60 * 1000;
         if (useClaudeCode) {
-            await runClaudeCodeCli(promptFilePath, model, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
+            await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
         } else {
-            await runCopilotCli(promptFilePath, model, workingDirectory, timeoutMs, diffOnlyActive);
+            await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive);
         }
 
         console.log('\n' + '='.repeat(60));
@@ -909,12 +932,15 @@ async function runPowerShellScript(scriptPath: string, args: string[]): Promise<
     });
 }
 
-async function runCopilotCli(promptFilePath: string, model: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
+async function runCopilotCli(promptFilePath: string, model: string | undefined, reasoningEffort: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
         // Build PowerShell command that reads prompt file and passes content to copilot CLI
         let copilotFlags = `--allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'`;
         if (model) {
             copilotFlags += ` --model ${model}`;
+        }
+        if (reasoningEffort) {
+            copilotFlags += ` --reasoning-effort ${reasoningEffort}`;
         }
 
         // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
@@ -999,6 +1025,7 @@ async function installClaudeCodeCli(): Promise<void> {
 async function runClaudeCodeCli(
     promptFilePath: string,
     model: string | undefined,
+    reasoningEffort: string | undefined,
     workingDirectory: string,
     timeoutMs: number,
     maxTurns: string | undefined,
@@ -1018,6 +1045,10 @@ async function runClaudeCodeCli(
 
         if (model) {
             claudeFlags += ` --model ${model}`;
+        }
+        if (reasoningEffort) {
+            // Claude Code uses --effort (no --reasoning-effort alias)
+            claudeFlags += ` --effort ${reasoningEffort}`;
         }
         if (maxTurns) {
             claudeFlags += ` --max-turns ${maxTurns}`;

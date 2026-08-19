@@ -197,6 +197,7 @@ steps:
 | `pullRequestId` | No | `$(System.PullRequest.PullRequestId)` | PR ID (auto-detected in PR builds) |
 | `timeout` | No | `15` | Timeout in minutes |
 | `model` | Conditional | - | Preferred model to use (see valid options below). Required when `useCustomModelProvider` is `true`. |
+| `reasoningEffort` | No | model default | Reasoning effort level to balance review depth against token spend. Copilot: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Claude Code: `low`, `medium`, `high`, `xhigh`, `max`. If the selected model doesn't support the requested level, the CLI fails with a clear error rather than silently ignoring it. |
 | `promptFile` | No | - | Path to custom prompt file |
 | `prompt` | No | - | Inline custom prompt (overrides `promptFile`) |
 | `promptFileRaw` | No | - | _(Advanced)_ Path to custom prompt file that will be passed as-is with no supportive direction. |
@@ -246,6 +247,7 @@ Notes:
 - `model` is **required** in this mode and must be a model identifier your provider serves.
 - `copilotProviderApiKey` may be omitted for providers that do not require authentication (e.g., a local Ollama instance on a self-hosted agent).
 - `githubPat` is optional in this mode. No GitHub authentication is needed to run the review against your own provider, but supplying a PAT additionally enables GitHub-backed CLI features such as code search.
+- `reasoningEffort` may be rejected for custom-provider models — the Copilot API is known to refuse reasoning parameters for BYOK models. If the review fails with a reasoning-related error, remove the `reasoningEffort` input.
 - The provider's model must support tool calling and streaming; a context window of at least 128k tokens is recommended. See [GitHub's BYOK documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models) for details.
 
 ### Claude Code Models

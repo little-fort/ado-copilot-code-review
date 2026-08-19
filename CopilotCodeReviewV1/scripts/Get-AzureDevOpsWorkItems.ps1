@@ -171,8 +171,13 @@ function ConvertFrom-Html {
         return ""
     }
 
+    # Convert strikethrough tags to ~~text~~ BEFORE stripping tags, so retracted
+    # content (e.g. superseded acceptance criteria) stays marked as struck-through
+    # instead of reading as live requirements (issue #52). The \b prevents 's'
+    # from matching the start of unrelated tags like <span> or <strong>.
+    $text = $Html -replace '(?is)<(del|strike|s)\b[^>]*>(.*?)</\1\s*>', '~~$2~~'
     # Convert <br> tags to newlines
-    $text = $Html -replace '<br\s*/?>', "`n"
+    $text = $text -replace '<br\s*/?>', "`n"
     # Convert block-level tags to newlines
     $text = $text -replace '</(p|div|li|tr|h[1-6])>', "`n"
     $text = $text -replace '<(p|div|li|tr|h[1-6])[^>]*>', ""

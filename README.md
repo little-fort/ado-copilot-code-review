@@ -204,6 +204,10 @@ steps:
 | `promptRaw` | No | - | _(Advanced)_ Inline custom prompt that will be passed as-is with no supportive direction. |
 | `authors` | No | - | Comma-separated list of email addresses to filter reviews (see below) |
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
+| `jiraBaseUrl` | No | - | Jira Cloud site URL (e.g., `https://yourorg.atlassian.net`). With `jiraEmail` + `jiraApiToken`, work items are fetched from Jira instead of Azure Boards (see [Jira Work Items](#jira-work-items)) |
+| `jiraEmail` | Conditional | - | Atlassian account email for the API token. Required when `jiraBaseUrl` is set. |
+| `jiraApiToken` | Conditional | - | Jira Cloud API token. Required when `jiraBaseUrl` is set. |
+| `jiraProjectKeys` | No | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) to restrict issue key lookup |
 | `resolveThreads` | No | `agentOnly` | Which existing comment threads the agent may resolve: `agentOnly` or `all` (see [Review Behavior Options](#review-behavior-options)) |
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
@@ -313,6 +317,33 @@ Two inputs tune how the review agent behaves across iterations. Both apply to Co
     resolveThreads: 'all'
     suppressPositiveFeedback: true
 ```
+
+### Jira Work Items
+
+Teams that track work in Jira but host code in Azure DevOps can pull review context from Jira instead of Azure Boards. When the three Jira inputs are set (and `includeWorkItems` is enabled), the task:
+
+1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`) — the same convention Jira's own development panel uses. Lowercase keys in branch names are recognized.
+2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve (HTTP 404) are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
+3. Writes the issue summary, type, status, priority, and description into the same work-item context file the review prompt already consumes.
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    jiraBaseUrl: 'https://yourorg.atlassian.net'
+    jiraEmail: 'service-account@example.com'
+    jiraApiToken: '$(JIRA_API_TOKEN)'
+    jiraProjectKeys: 'PROJ,CORE'   # optional
+```
+
+Notes:
+
+- **Jira Cloud only.** Authentication uses an [API token](https://id.atlassian.com/manage-profile/security/api-tokens) with Basic auth (`email:token`), which Jira Server/Data Center does not support.
+- The Jira account needs browse access to the referenced projects. Store the token as a secret pipeline variable.
+- Custom fields (such as instance-specific acceptance-criteria fields) are not fetched in this version — the issue description is the primary context source.
+- A failed Jira fetch logs a warning and the review continues without work item context; it never fails the pipeline.
 
 ### Diff-Only Review Mode
 

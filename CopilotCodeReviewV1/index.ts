@@ -340,6 +340,36 @@ async function run(): Promise<void> {
             return;
         }
 
+        // Jira work item integration (issue #53): when configured, linked work
+        // items are fetched from Jira Cloud instead of Azure Boards. The three
+        // core inputs are all-or-nothing.
+        const jiraBaseUrl = tl.getInput('jiraBaseUrl');
+        const jiraEmail = tl.getInput('jiraEmail');
+        const jiraApiToken = tl.getInput('jiraApiToken');
+        const jiraProjectKeys = tl.getInput('jiraProjectKeys');
+
+        const missingJiraInputs = [
+            ['jiraBaseUrl', jiraBaseUrl],
+            ['jiraEmail', jiraEmail],
+            ['jiraApiToken', jiraApiToken]
+        ].filter(([, value]) => !value).map(([name]) => name);
+        const useJiraWorkItems = missingJiraInputs.length === 0;
+
+        if (missingJiraInputs.length > 0 && missingJiraInputs.length < 3) {
+            tl.setResult(tl.TaskResult.Failed,
+                `Jira integration requires jiraBaseUrl, jiraEmail, and jiraApiToken together. Missing: ${missingJiraInputs.join(', ')}.`);
+            return;
+        }
+
+        // Normalize the Jira base URL: default to https and strip trailing slashes
+        let normalizedJiraBaseUrl = '';
+        if (useJiraWorkItems) {
+            normalizedJiraBaseUrl = jiraBaseUrl!.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(normalizedJiraBaseUrl)) {
+                normalizedJiraBaseUrl = `https://${normalizedJiraBaseUrl}`;
+            }
+        }
+
         // filePath inputs return the working directory path when not set, so check both
         // the input value and that the path actually points to a real file.
         const isPromptFileSet = !!(promptFile && fs.existsSync(promptFile) && fs.statSync(promptFile).isFile());
@@ -373,6 +403,9 @@ async function run(): Promise<void> {
         }
         if (reasoningEffort) {
             console.log(`Reasoning Effort: ${reasoningEffort}`);
+        }
+        if (useJiraWorkItems) {
+            console.log(`Work Item Source: Jira (${normalizedJiraBaseUrl})`);
         }
         console.log('='.repeat(60));
 
@@ -579,7 +612,36 @@ async function run(): Promise<void> {
         }
 
         // Step 4: Fetch linked work item details (optional)
-        if (includeWorkItems) {
+        if (includeWorkItems && useJiraWorkItems) {
+            // Jira replaces Azure Boards as the work item source (issue #53)
+            console.log('\n[Step 4/5] Fetching linked Jira issue details...');
+            const prMetadataFile = path.join(workingDirectory, 'PR_Metadata.json');
+
+            if (fs.existsSync(prMetadataFile)) {
+                const jiraScript = path.join(scriptsDir, 'Get-JiraWorkItems.ps1');
+                const workItemDetailsOutput = path.join(workingDirectory, 'Work_Item_Details.txt');
+                const jiraArgs = [
+                    `-BaseUrl "${normalizedJiraBaseUrl}"`,
+                    `-Email "${jiraEmail}"`,
+                    `-ApiToken "${jiraApiToken}"`,
+                    `-PrMetadataFile "${prMetadataFile}"`,
+                    `-OutputFile "${workItemDetailsOutput}"`
+                ];
+                if (jiraProjectKeys) {
+                    jiraArgs.push(`-ProjectKeys "${jiraProjectKeys}"`);
+                }
+
+                try {
+                    await runPowerShellScript(jiraScript, jiraArgs);
+                    console.log(`Jira issue details saved to: ${workItemDetailsOutput}`);
+                } catch (err) {
+                    console.log('Warning: Failed to fetch Jira issue details. Continuing without work item context.');
+                    console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            } else {
+                console.log('PR metadata file not found. Skipping Jira issue detail fetch.');
+            }
+        } else if (includeWorkItems) {
             console.log('\n[Step 4/5] Fetching linked work item details...');
             const workItemIdsFile = path.join(workingDirectory, 'Work_Item_Ids.txt');
 
@@ -812,6 +874,7 @@ async function run(): Promise<void> {
                 path.join(workingDirectory, 'Target_Commit.txt'),
                 path.join(workingDirectory, 'Work_Item_Ids.txt'),
                 path.join(workingDirectory, 'Work_Item_Details.txt'),
+                path.join(workingDirectory, 'PR_Metadata.json'),
                 promptFilePath,
             ];
 

@@ -671,6 +671,20 @@ if ($script:OutputToFile) {
             $workItemIds | Out-File -FilePath $workItemIdsFile -Encoding UTF8 -NoNewline
             Write-Host "Work Item IDs written to: $workItemIdsFile" -ForegroundColor Green
         }
+
+        # Write raw PR metadata as JSON for downstream scripts that need the
+        # unformatted fields — e.g. Jira issue key extraction reads the branch
+        # name, title, and description (Get-JiraWorkItems.ps1)
+        if ($pr) {
+            $prMetadataFile = Join-Path $outputDir "PR_Metadata.json"
+            @{
+                title         = $pr.title
+                description   = $pr.description
+                sourceRefName = $pr.sourceRefName
+                isDraft       = [bool]$pr.isDraft
+            } | ConvertTo-Json -Depth 3 | Out-File -FilePath $prMetadataFile -Encoding UTF8
+            Write-Host "PR metadata written to: $prMetadataFile" -ForegroundColor Green
+        }
     }
     catch {
         Write-Error "Failed to write output file: $_"

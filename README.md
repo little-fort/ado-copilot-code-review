@@ -206,6 +206,7 @@ steps:
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
 | `resolveThreads` | No | `agentOnly` | Which existing comment threads the agent may resolve: `agentOnly` or `all` (see [Review Behavior Options](#review-behavior-options)) |
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
+| `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
@@ -300,6 +301,8 @@ Two inputs tune how the review agent behaves across iterations. Both apply to Co
 - `all` — the agent may also resolve human reviewers' threads when the current changes clearly address them, replying with an explanation before marking the thread fixed.
 
 **`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
+
+**`maxMinorIssues`** bounds low-severity noise. The review prompt instructs the agent to triage the full diff first, score every finding by severity (Critical/Major/Minor/Nit) and confidence, and then post: Critical and Major findings always get individual comments and are never capped, while high-confidence Minor findings are consolidated into a single compact "Minor suggestions" comment containing at most this many items (`0` drops Minor feedback entirely). Nits and low-confidence speculation are never posted.
 
 ```yaml
 - task: CopilotCodeReview@1
@@ -465,6 +468,8 @@ The default prompt instructs Copilot to focus on:
 - **Simplification**: Reducing complexity
 - **Security**: Potential vulnerabilities
 - **Code Consistency**: Style and pattern consistency
+
+Findings are triaged in two phases: the agent first enumerates every candidate issue across the full diff, then scores each by severity (Critical/Major/Minor/Nit) and confidence before posting. Critical and Major findings always post individually; high-confidence Minor findings are consolidated into a single capped comment (see `maxMinorIssues`); nits and speculation are dropped. On re-reviews, new comments are limited to newly pushed changes plus Critical findings, which keeps review rounds from surfacing endless new commentary on already-reviewed code.
 
 ## Limitations
 

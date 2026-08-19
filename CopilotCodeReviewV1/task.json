@@ -270,6 +270,14 @@
             "helpMarkDown": "When enabled, the review agent will not post praise or 'looks good' comments. If a review finds no impactful issues, no comment is posted at all. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
         },
         {
+            "name": "maxMinorIssues",
+            "type": "string",
+            "label": "Max Minor Issues Per Review",
+            "required": false,
+            "defaultValue": "5",
+            "helpMarkDown": "Maximum number of Minor-severity findings included in the consolidated minor-suggestions comment each review pass. Set to 0 to suppress Minor findings entirely. Critical and Major findings are never capped. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
+        },
+        {
             "name": "diffOnlyReview",
             "type": "boolean",
             "label": "Diff-Only Review",

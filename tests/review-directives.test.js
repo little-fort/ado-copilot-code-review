@@ -58,3 +58,44 @@ describe('buildReviewDirectives (issues #55, #28)', () => {
         }
     });
 });
+
+describe('applyMinorIssueLimit (issue #54)', () => {
+    let applyMinorIssueLimit;
+    let template;
+
+    before(() => {
+        ({ applyMinorIssueLimit } = require(compiledTask));
+        template = fs.readFileSync(
+            path.join(__dirname, '..', 'CopilotCodeReviewV1', 'scripts', 'prompt.txt'), 'utf8');
+    });
+
+    it('substitutes the limit into the Minor policy when 1 or more', () => {
+        const result = applyMinorIssueLimit(template, '7');
+        assert.match(result, /at most 7 Minor items/);
+        assert.doesNotMatch(result, /%MINORLIMIT%/);
+        // Roll-up formatting instructions remain when Minors are allowed
+        assert.match(result, /Minor roll-up format/);
+    });
+
+    it('replaces the whole Minor policy with a never-post rule when the limit is 0', () => {
+        const result = applyMinorIssueLimit(template, '0');
+        assert.match(result, /Minor findings, Nit findings, and low-confidence speculation: never post any of these/);
+        assert.match(result, /ONLY Critical and Major findings/);
+        // The cap wording and roll-up instructions must be gone entirely —
+        // no residue for the agent to misread as a cap of zero
+        assert.doesNotMatch(result, /%MINORLIMIT%/);
+        assert.doesNotMatch(result, /Minor roll-up format/);
+        assert.doesNotMatch(result, /at most/);
+    });
+
+    it('handles CRLF template content when replacing the section', () => {
+        const result = applyMinorIssueLimit(template.replace(/\r?\n/g, '\r\n'), '0');
+        assert.match(result, /never post any of these/);
+        assert.doesNotMatch(result, /Minor roll-up format/);
+    });
+
+    it('falls back to numeric substitution when the policy text has drifted', () => {
+        const result = applyMinorIssueLimit('Edited template with %MINORLIMIT% marker', '0');
+        assert.equal(result, 'Edited template with 0 marker');
+    });
+});

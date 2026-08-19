@@ -83,6 +83,30 @@ function buildReviewDirectives(resolveThreads: string, suppressPositiveFeedback:
         directives.map(d => '- ' + d).join('\n\n') + '\n';
 }
 
+// Minor-findings policy in the prompt templates. MUST match prompt.txt and
+// prompt-custom.txt verbatim — guarded by tests/invariants.test.js.
+const minorPolicySection = '- Minor findings: post ONLY high-confidence Minor findings, consolidated into a single roll-up comment in the format described below. Include at most %MINORLIMIT% Minor items, prioritized by impact, and silently drop the remainder.\n- Nit findings and low-confidence speculation: never post.\n\nMinor roll-up format: post ONE general PR-level comment (Status \'Active\') that starts with the heading \'**Minor suggestions**\', followed by exactly one bullet line per item in this form:\n\n- path/to/file.ext:123 — one-sentence description and suggested fix.\n\nKeep every bullet under thirty words. Do NOT include code blocks, multi-paragraph explanations, or per-item headings in the roll-up. If no Minor findings qualify, do not post a roll-up comment at all.';
+
+// Replacement used when maxMinorIssues is 0
+const minorPolicyDisabled = '- Minor findings, Nit findings, and low-confidence speculation: never post any of these. This review is configured to surface ONLY Critical and Major findings.';
+
+//Applies the maxMinorIssues setting to a template-based prompt
+function applyMinorIssueLimit(promptContent: string, maxMinorIssues: string): string {
+    // Normalize line endings so the multi-line section match is EOL-agnostic
+    const normalized = promptContent.replace(/\r\n/g, '\n');
+
+    if (maxMinorIssues === '0') {
+        if (normalized.includes(minorPolicySection)) {
+            return normalized.replace(minorPolicySection, minorPolicyDisabled);
+        }
+        tl.warning('maxMinorIssues is 0 but the expected Minor-findings policy text was not found in the prompt template. ' +
+            'The template may have been edited; update minorPolicySection in index.ts to match. Falling back to numeric substitution.');
+        return normalized.replace(/%MINORLIMIT%/g, '0');
+    }
+
+    return normalized.replace(/%MINORLIMIT%/g, maxMinorIssues);
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -298,12 +322,21 @@ async function run(): Promise<void> {
         const publishPromptArtifacts = tl.getBoolInput('publishPromptArtifacts', false);
         const resolveThreads = tl.getInput('resolveThreads') || 'agentOnly';
         const suppressPositiveFeedback = tl.getBoolInput('suppressPositiveFeedback', false);
+        const maxMinorIssues = tl.getInput('maxMinorIssues') || '5';
 
         // Fail fast on a typo'd value — falling back silently would change
         // which PR threads the agent is allowed to resolve
         if (resolveThreads !== 'agentOnly' && resolveThreads !== 'all') {
             tl.setResult(tl.TaskResult.Failed,
                 `Invalid resolveThreads value '${resolveThreads}'. Valid values: 'agentOnly', 'all'.`);
+            return;
+        }
+
+        // Must be a non-negative integer — it is substituted into the prompt's
+        // Minor-findings posting policy (0 means suppress Minor findings)
+        if (!/^\d+$/.test(maxMinorIssues)) {
+            tl.setResult(tl.TaskResult.Failed,
+                `Invalid maxMinorIssues value '${maxMinorIssues}'. Provide a non-negative integer (0 suppresses Minor findings).`);
             return;
         }
 
@@ -655,12 +688,14 @@ async function run(): Promise<void> {
         // scope, positive feedback suppression) to template-based prompts.
         // Raw prompts are contractually passed as-is, so they are never modified.
         if (!promptRaw && !isPromptFileRawSet && promptFilePath) {
-            const promptWithDirectives = fs.readFileSync(promptFilePath, 'utf8')
+            // Apply the Minor-findings cap to the template's posting policy
+            // (see the Evaluation Protocol section in the templates)
+            const promptWithDirectives = applyMinorIssueLimit(fs.readFileSync(promptFilePath, 'utf8'), maxMinorIssues)
                 + buildReviewDirectives(resolveThreads, suppressPositiveFeedback);
             const directivePromptPath = path.join(workingDirectory, '_directive_prompt.txt');
             fs.writeFileSync(directivePromptPath, promptWithDirectives, 'utf8');
             promptFilePath = directivePromptPath;
-            console.log(`Applied review behavior directives (resolveThreads: ${resolveThreads}, suppressPositiveFeedback: ${suppressPositiveFeedback}).`);
+            console.log(`Applied review behavior directives (resolveThreads: ${resolveThreads}, suppressPositiveFeedback: ${suppressPositiveFeedback}, maxMinorIssues: ${maxMinorIssues}).`);
         }
 
         // When using Claude Code, replace the Copilot attribution tag in the prompt
@@ -1160,4 +1195,4 @@ if (require.main === module) {
 }
 
 // Exported for tests
-export { runInstallerWithRetry, normalizeGitHubHost, buildReviewDirectives };
+export { runInstallerWithRetry, normalizeGitHubHost, buildReviewDirectives, applyMinorIssueLimit };

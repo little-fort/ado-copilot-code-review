@@ -41,7 +41,8 @@ function extractStringConstant(source, name) {
     assert.ok(match,
         `Could not find "const ${name} = '...';" in index.ts. ` +
         'If the constant was renamed or converted to a template literal, update tests/invariants.test.js to match.');
-    return match[1].replace(/\\'/g, "'");
+    // Unescape \n and \' — the only escapes the tracked constants use
+    return match[1].replace(/\\n/g, '\n').replace(/\\'/g, "'");
 }
 
 describe('Version sync', () => {
@@ -88,6 +89,22 @@ describe('Prompt template lockstep', () => {
         const guidelines = extractStringConstant(indexTs, 'originalGuidelines');
         assert.ok(promptDefault.includes(guidelines),
             'originalGuidelines in index.ts no longer appears verbatim in prompt.txt — update them together.');
+    });
+
+    it('the Minor-findings policy section in index.ts matches both templates', () => {
+        // The maxMinorIssues=0 path replaces this exact section with a
+        // never-post rule; if the template text drifts from the constant, the
+        // replacement silently degrades to numeric substitution
+        const section = extractStringConstant(indexTs, 'minorPolicySection');
+        assert.ok(section.includes('%MINORLIMIT%'),
+            'minorPolicySection in index.ts no longer contains the %MINORLIMIT% placeholder.');
+
+        const normalizedDefault = promptDefault.replace(/\r\n/g, '\n');
+        const normalizedCustom = promptCustom.replace(/\r\n/g, '\n');
+        assert.ok(normalizedDefault.includes(section),
+            'minorPolicySection in index.ts no longer appears verbatim in prompt.txt — update them together.');
+        assert.ok(normalizedCustom.includes(section),
+            'minorPolicySection in index.ts no longer appears verbatim in prompt-custom.txt — update them together.');
     });
 
     it('both templates carry the Copilot attribution tag used for Claude Code substitution', () => {

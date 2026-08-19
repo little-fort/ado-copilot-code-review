@@ -106,6 +106,18 @@ else {
 
 # Step 4: Package the dev extension
 Write-Host "`n[Step 4/4] Packaging dev extension..." -ForegroundColor Yellow
+
+# Remove stray .taskkey files before packaging — azure-pipelines-task-lib writes
+# one whenever the task (or a test importing it) runs locally, and tfx would
+# otherwise bundle it into the .vsix
+foreach ($taskDir in @($prodTaskDir, $devTaskDir)) {
+    $taskKey = Join-Path $taskDir ".taskkey"
+    if (Test-Path $taskKey) {
+        Remove-Item $taskKey -Force
+        Write-Host "  Removed stray .taskkey from $taskDir" -ForegroundColor Gray
+    }
+}
+
 Push-Location $repoRoot
 try {
     tfx extension create --manifest-globs vss-extension.dev.json

@@ -31,6 +31,9 @@ test-results.xml
 # Temporary files
 *.tmp
 *.temp
+# Per-run secret-encryption key written by azure-pipelines-task-lib whenever
+# the task (or a test importing it) loads locally — ephemeral, never commit
+.taskkey
 PR_Details.txt
 Iteration_Details.txt
 # Dev task folder (built files copied at package time)

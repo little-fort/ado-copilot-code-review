@@ -7,6 +7,7 @@
         "build:dev": "cd CopilotCodeReviewV1 && npm run build",
         "test": "mocha tests/**/*.test.js",
         "test:ps": "pwsh -NoProfile -File tests/powershell/Invoke-Tests.ps1",
+        "prepackage:prod": "node -e \"try { require('fs').unlinkSync('CopilotCodeReviewV1/.taskkey') } catch {}\"",
         "package:prod": "tfx extension create --manifest-globs vss-extension.json",
         "package:dev": "pwsh -File build-dev.ps1"
     },

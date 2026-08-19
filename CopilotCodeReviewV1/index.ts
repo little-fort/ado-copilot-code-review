@@ -705,53 +705,89 @@ async function checkCopilotCli(): Promise<boolean> {
     }
 }
 
-async function installCopilotCli(): Promise<void> {
+/**
+ * Runs a single installer command to completion, resolving on exit code 0.
+ */
+function runInstallerOnce(command: string, args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
-        let command: string;
-        let args: string[];
-
-        if (isWindows()) {
-            console.log('Installing GitHub Copilot CLI via winget...');
-            command = 'winget';
-            args = ['install', 'GitHub.Copilot', '--silent', '--accept-package-agreements', '--accept-source-agreements'];
-        } else {
-            console.log('Installing GitHub Copilot CLI via official install script...');
-            // Use the official GitHub install script which downloads a pre-built binary
-            // The script installs to $HOME/.local/bin by default for non-root users
-            // Pass the full command as a single string when using shell: true
-            command = 'curl -fsSL https://gh.io/copilot-install | bash';
-            args = [];
-        }
-        
-        const installProcess = child_process.spawn(
-            command,
-            args,
-            {
-                shell: true,
-                stdio: 'inherit'
-            }
-        );
+        const installProcess = child_process.spawn(command, args, {
+            shell: true,
+            stdio: 'inherit'
+        });
 
         installProcess.on('close', (code: number | null) => {
             if (code === 0) {
-                console.log('GitHub Copilot CLI installed successfully.');
-                // On Linux, add the install location to PATH for the current process
-                if (!isWindows()) {
-                    const homeDir = process.env['HOME'] || '';
-                    const localBin = path.join(homeDir, '.local', 'bin');
-                    process.env['PATH'] = `${localBin}:${process.env['PATH']}`;
-                    console.log(`Added ${localBin} to PATH.`);
-                }
                 resolve();
             } else {
-                reject(new Error(`Failed to install GitHub Copilot CLI. Exit code: ${code}`));
+                reject(new Error(`Exit code: ${code}`));
             }
         });
 
         installProcess.on('error', (err: Error) => {
-            reject(new Error(`Failed to install GitHub Copilot CLI: ${err.message}`));
+            reject(err);
         });
     });
+}
+
+/**
+ * Runs an installer command, retrying with exponential backoff on failure.
+ * CLI installs regularly hit transient CDN errors — e.g. GitHub returning 504
+ * on release assets (issue #57) — so failed attempts are usually worth
+ * retrying before failing the whole task.
+ */
+async function runInstallerWithRetry(
+    description: string,
+    command: string,
+    args: string[],
+    maxAttempts: number = 3
+): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            await runInstallerOnce(command, args);
+            return;
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (attempt === maxAttempts) {
+                throw new Error(`${description} failed after ${maxAttempts} attempts. Last error: ${message}`);
+            }
+            const delaySeconds = Math.pow(2, attempt);
+            console.log(`${description} failed (attempt ${attempt} of ${maxAttempts}): ${message}`);
+            console.log(`Retrying in ${delaySeconds} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        }
+    }
+}
+
+async function installCopilotCli(): Promise<void> {
+    let command: string;
+    let args: string[];
+
+    if (isWindows()) {
+        console.log('Installing GitHub Copilot CLI via winget...');
+        command = 'winget';
+        args = ['install', 'GitHub.Copilot', '--silent', '--accept-package-agreements', '--accept-source-agreements'];
+    } else {
+        console.log('Installing GitHub Copilot CLI via official install script...');
+        // Use the official GitHub install script which downloads a pre-built binary
+        // The script installs to $HOME/.local/bin by default for non-root users
+        // Pass the full command as a single string when using shell: true.
+        // curl's --retry covers transient failures fetching the install script
+        // itself; the outer retry loop covers failures inside the piped script,
+        // e.g. 504s downloading the release tarball (issue #57).
+        command = 'curl -fsSL --retry 3 --retry-all-errors https://gh.io/copilot-install | bash';
+        args = [];
+    }
+
+    await runInstallerWithRetry('GitHub Copilot CLI installation', command, args);
+
+    console.log('GitHub Copilot CLI installed successfully.');
+    // On Linux, add the install location to PATH for the current process
+    if (!isWindows()) {
+        const homeDir = process.env['HOME'] || '';
+        const localBin = path.join(homeDir, '.local', 'bin');
+        process.env['PATH'] = `${localBin}:${process.env['PATH']}`;
+        console.log(`Added ${localBin} to PATH.`);
+    }
 }
 
 async function runPowerShellScript(scriptPath: string, args: string[]): Promise<void> {
@@ -849,41 +885,21 @@ async function checkClaudeCodeCli(): Promise<boolean> {
 }
 
 async function installClaudeCodeCli(): Promise<void> {
-    return new Promise((resolve, reject) => {
-        console.log('Installing Claude Code CLI via npm...');
-        const installProcess = child_process.spawn(
-            'npm',
-            ['install', '-g', '@anthropic-ai/claude-code'],
-            {
-                shell: true,
-                stdio: 'inherit'
-            }
-        );
+    console.log('Installing Claude Code CLI via npm...');
+    await runInstallerWithRetry('Claude Code CLI installation', 'npm', ['install', '-g', '@anthropic-ai/claude-code']);
 
-        installProcess.on('close', (code: number | null) => {
-            if (code === 0) {
-                console.log('Claude Code CLI installed successfully.');
-                // Ensure npm global bin is on PATH for the current process
-                const npmBinResult = child_process.spawnSync('npm', ['bin', '-g'], {
-                    encoding: 'utf8',
-                    shell: true
-                });
-                if (npmBinResult.status === 0 && npmBinResult.stdout.trim()) {
-                    const npmGlobalBin = npmBinResult.stdout.trim();
-                    const pathSep = isWindows() ? ';' : ':';
-                    process.env['PATH'] = `${npmGlobalBin}${pathSep}${process.env['PATH']}`;
-                    console.log(`Added ${npmGlobalBin} to PATH.`);
-                }
-                resolve();
-            } else {
-                reject(new Error(`Failed to install Claude Code CLI. Exit code: ${code}`));
-            }
-        });
-
-        installProcess.on('error', (err: Error) => {
-            reject(new Error(`Failed to install Claude Code CLI: ${err.message}`));
-        });
+    console.log('Claude Code CLI installed successfully.');
+    // Ensure npm global bin is on PATH for the current process
+    const npmBinResult = child_process.spawnSync('npm', ['bin', '-g'], {
+        encoding: 'utf8',
+        shell: true
     });
+    if (npmBinResult.status === 0 && npmBinResult.stdout.trim()) {
+        const npmGlobalBin = npmBinResult.stdout.trim();
+        const pathSep = isWindows() ? ';' : ':';
+        process.env['PATH'] = `${npmGlobalBin}${pathSep}${process.env['PATH']}`;
+        console.log(`Added ${npmGlobalBin} to PATH.`);
+    }
 }
 
 async function runClaudeCodeCli(
@@ -1012,4 +1028,11 @@ async function runClaudeCodeCli(
     });
 }
 
-run();
+// Run only when executed as the task entry point (node index.js). Importing
+// this module (e.g. from tests) must not kick off a task run.
+if (require.main === module) {
+    run();
+}
+
+// Exported for tests
+export { runInstallerWithRetry };

@@ -81,6 +81,7 @@ async function run(): Promise<void> {
         const useCustomModelProvider = tl.getBoolInput('useCustomModelProvider', false);
         const githubPat = tl.getInput('githubPat');
         const anthropicApiKey = tl.getInput('anthropicApiKey');
+        const claudeCodeOAuthToken = tl.getInput('claudeCodeOAuthToken');
         const maxTurns = tl.getInput('maxTurns');
         const maxBudget = tl.getInput('maxBudget');
         const copilotProviderBaseUrl = tl.getInput('copilotProviderBaseUrl');
@@ -97,9 +98,16 @@ async function run(): Promise<void> {
         }
 
         if (useClaudeCode) {
-            if (!anthropicApiKey) {
+            if (anthropicApiKey && claudeCodeOAuthToken) {
                 tl.setResult(tl.TaskResult.Failed,
-                    'Anthropic API Key is required when using Claude Code CLI. Please provide the anthropicApiKey input.');
+                    "Both 'anthropicApiKey' and 'claudeCodeOAuthToken' are set. Please provide exactly one — " +
+                    'the API key bills against Anthropic API usage, while the OAuth token bills against a Claude subscription.');
+                return;
+            }
+            if (!anthropicApiKey && !claudeCodeOAuthToken) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Claude Code CLI requires authentication. Provide either the anthropicApiKey input (Anthropic API billing) ' +
+                    "or the claudeCodeOAuthToken input (Claude subscription billing — generate one by running 'claude setup-token' locally).");
                 return;
             }
         } else if (useCustomModelProvider) {
@@ -255,7 +263,14 @@ async function run(): Promise<void> {
 
         // Set environment variables for the CLI agent
         if (useClaudeCode) {
-            process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
+            if (claudeCodeOAuthToken) {
+                // Long-lived subscription token generated via `claude setup-token`
+                process.env['CLAUDE_CODE_OAUTH_TOKEN'] = claudeCodeOAuthToken;
+                console.log('Using Claude Code OAuth token (subscription billing) for authentication.');
+            } else {
+                process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
+                console.log('Using Anthropic API key (API usage billing) for authentication.');
+            }
         } else {
             if (useCustomModelProvider) {
                 // The Copilot CLI reads these to route model requests to a BYOK provider

@@ -23,7 +23,7 @@ This extension supports Windows and Linux Azure DevOps agents. Compatible with M
 
 - **AI Agent** (one of the following):
   - **GitHub Copilot** (default): An active GitHub Copilot subscription and a GitHub PAT with Copilot access permissions
-  - **Claude Code**: An Anthropic API key with access to Claude Code
+  - **Claude Code**: An Anthropic API key with access to Claude Code, or a Claude subscription OAuth token generated with `claude setup-token`
 - **Azure DevOps Authentication** (one of the following):
   - **System Access Token (Recommended)**: Use the pipeline's built-in OAuth token for Azure DevOps Services. Must grant permissions to Build Service Identity (see below).
   - **Personal Access Token**: Required for Azure DevOps Server (on-prem) or if you prefer explicit token management. Needs permissions to read pull requests, write comments, and read code.
@@ -83,7 +83,7 @@ steps:
 
 #### Using Claude Code CLI
 
-To use Claude Code instead of GitHub Copilot, enable `useClaudeCode` and provide an Anthropic API key:
+To use Claude Code instead of GitHub Copilot, enable `useClaudeCode` and provide an Anthropic API key (or a Claude Code OAuth token):
 
 ```yaml
 trigger: none
@@ -107,6 +107,8 @@ steps:
 ```
 
 > **NOTE**: Claude Code CLI is installed automatically via `npm install -g @anthropic-ai/claude-code`. Node.js is available on all Azure DevOps agents. Output is streamed to the pipeline logs in real time.
+
+> **TIP**: To bill reviews against a Claude subscription (Pro/Max/Team/Enterprise) instead of Anthropic API usage, run `claude setup-token` locally to generate a long-lived OAuth token, store it as a secret pipeline variable, and pass it via `claudeCodeOAuthToken` instead of `anthropicApiKey`. Provide one or the other — not both.
 
 #### Set Trigger
 
@@ -177,7 +179,8 @@ steps:
 |-------|----------|---------|-------------|
 | `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI with GitHub-hosted models (default). Optional when `useCustomModelProvider` is `true`. |
 | `useClaudeCode` | No | `false` | Use Claude Code CLI (Anthropic) instead of GitHub Copilot CLI |
-| `anthropicApiKey` | Conditional | - | Anthropic API key. Required when `useClaudeCode` is `true`. |
+| `anthropicApiKey` | Conditional | - | Anthropic API key (API usage billing). Provide this **or** `claudeCodeOAuthToken` when `useClaudeCode` is `true`. |
+| `claudeCodeOAuthToken` | Conditional | - | Claude Code OAuth token from `claude setup-token` (subscription billing). Provide this **or** `anthropicApiKey` when `useClaudeCode` is `true`. |
 | `maxTurns` | No | - | Maximum agentic turns for Claude Code CLI |
 | `maxBudget` | No | - | Maximum cost in USD for a Claude Code session |
 | `useCustomModelProvider` | No | `false` | Use a custom model provider (BYOK) with the GitHub Copilot CLI instead of GitHub-hosted models (see [Custom Model Providers](#custom-model-providers)) |
@@ -374,11 +377,21 @@ Create a personal access token:
 
 > **IMPORTANT**: If your user account is part of a GitHub organization, ensure the organization admin goes to **GitHub Policies** > **Copilot** > **Copilot CLI** and sets the policy to **Enabled everywhere**
 
-### Anthropic API Key (for Claude Code CLI)
+### Anthropic Authentication (for Claude Code CLI)
+
+Two options are supported — provide exactly one:
+
+**Option A — API key (billed against Anthropic API usage):**
 
 1. Go to [Anthropic Console](https://console.anthropic.com/)
 2. Create an API key
-3. Store the key as a secret variable in your Azure DevOps pipeline (e.g., `ANTHROPIC_API_KEY`)
+3. Store the key as a secret variable in your Azure DevOps pipeline (e.g., `ANTHROPIC_API_KEY`) and pass it via `anthropicApiKey`
+
+**Option B — OAuth token (billed against a Claude Pro/Max/Team/Enterprise subscription):**
+
+1. On your local machine, run `claude setup-token` and complete the browser authorization
+2. Copy the long-lived token it prints (valid for about a year)
+3. Store it as a secret variable in your Azure DevOps pipeline (e.g., `CLAUDE_CODE_OAUTH_TOKEN`) and pass it via `claudeCodeOAuthToken`
 
 ### Storing Tokens in Azure DevOps
 
@@ -386,7 +399,8 @@ Create a personal access token:
 2. Create a new Variable Group or edit an existing one
 3. Add the relevant variables:
    - `GITHUB_PAT` (mark as secret) — for Copilot CLI
-   - `ANTHROPIC_API_KEY` (mark as secret) — for Claude Code CLI
+   - `ANTHROPIC_API_KEY` (mark as secret) — for Claude Code CLI with API billing
+   - `CLAUDE_CODE_OAUTH_TOKEN` (mark as secret) — for Claude Code CLI with subscription billing
    - `AZURE_DEVOPS_PAT` (mark as secret) — if not using System Access Token
 4. Link the variable group to your pipeline
 

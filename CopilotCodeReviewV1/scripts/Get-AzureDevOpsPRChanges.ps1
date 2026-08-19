@@ -257,11 +257,13 @@ Write-Output-Line "`n[Iteration Details]" -ForegroundColor Yellow
 Write-Output-Line "  Iteration ID:     #$iterationId"
 Write-Output-Line "  Created:          $(Format-DateForDisplay $latestIteration.createdDate)"
 Write-Output-Line "  Updated:          $(Format-DateForDisplay $latestIteration.updatedDate)"
+# Full SHAs with old/new labels so the review agent diffs in the correct direction
+# (see the diff-direction guidance in prompt.txt)
 if ($latestIteration.sourceRefCommit) {
-    Write-Output-Line "  Source Commit:    $($latestIteration.sourceRefCommit.commitId.Substring(0, 8))"
+    Write-Output-Line "  Source Commit (PR branch, new code):   $($latestIteration.sourceRefCommit.commitId)"
 }
 if ($latestIteration.targetRefCommit) {
-    Write-Output-Line "  Target Commit:    $($latestIteration.targetRefCommit.commitId.Substring(0, 8))"
+    Write-Output-Line "  Target Commit (base branch, old code): $($latestIteration.targetRefCommit.commitId)"
 }
 
 # Commits

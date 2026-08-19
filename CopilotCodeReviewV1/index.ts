@@ -78,17 +78,55 @@ async function run(): Promise<void> {
 
         // Get agent selection and auth inputs
         const useClaudeCode = tl.getBoolInput('useClaudeCode', false);
+        const useCustomModelProvider = tl.getBoolInput('useCustomModelProvider', false);
         const githubPat = tl.getInput('githubPat');
         const anthropicApiKey = tl.getInput('anthropicApiKey');
         const maxTurns = tl.getInput('maxTurns');
         const maxBudget = tl.getInput('maxBudget');
+        const copilotProviderBaseUrl = tl.getInput('copilotProviderBaseUrl');
+        const copilotProviderType = tl.getInput('copilotProviderType');
+        const copilotProviderApiKey = tl.getInput('copilotProviderApiKey');
+        const model = tl.getInput('model');
 
         // Validate agent-specific auth
+        if (useClaudeCode && useCustomModelProvider) {
+            tl.setResult(tl.TaskResult.Failed,
+                "The 'useClaudeCode' and 'useCustomModelProvider' inputs are mutually exclusive—custom model providers " +
+                'apply only to the GitHub Copilot CLI. Please enable at most one of them.');
+            return;
+        }
+
         if (useClaudeCode) {
             if (!anthropicApiKey) {
                 tl.setResult(tl.TaskResult.Failed,
                     'Anthropic API Key is required when using Claude Code CLI. Please provide the anthropicApiKey input.');
                 return;
+            }
+        } else if (useCustomModelProvider) {
+            // BYOK mode: the Copilot CLI talks directly to the configured provider,
+            // so a GitHub PAT is optional (it only adds GitHub-backed features like code search)
+            if (!copilotProviderBaseUrl) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A provider base URL is required when using a custom model provider. Please provide the copilotProviderBaseUrl input.');
+                return;
+            }
+            if (!copilotProviderType) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A provider type is required when using a custom model provider. Please provide the copilotProviderType input.');
+                return;
+            }
+            if (!model) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A model is required when using a custom model provider. Please set the model input to a model identifier your provider serves.');
+                return;
+            }
+            const knownProviderTypes = ['openai', 'azure', 'anthropic'];
+            if (!knownProviderTypes.includes(copilotProviderType.toLowerCase())) {
+                tl.warning(`Provider type '${copilotProviderType}' is not one of the documented values (${knownProviderTypes.join(', ')}). ` +
+                    'The Copilot CLI may reject it.');
+            }
+            if (!copilotProviderApiKey) {
+                console.log('No custom provider API key supplied—assuming the provider endpoint does not require authentication.');
             }
         } else {
             if (!githubPat) {
@@ -174,7 +212,6 @@ async function run(): Promise<void> {
         // Get optional inputs
         let pullRequestId = tl.getInput('pullRequestId');
         const timeoutMinutes = parseInt(tl.getInput('timeout') || '15', 10);
-        const model = tl.getInput('model');
         const promptFile = tl.getInput('promptFile');
         const prompt = tl.getInput('prompt');
         const promptRaw = tl.getInput('promptRaw');
@@ -203,6 +240,9 @@ async function run(): Promise<void> {
         console.log(`${agentName} Code Review Task`);
         console.log('='.repeat(60));
         console.log(`Agent: ${agentName}`);
+        if (useCustomModelProvider) {
+            console.log(`Model Provider: custom (${copilotProviderType})`);
+        }
         console.log(`Collection URI: ${resolvedCollectionUri}`);
         console.log(`Project: ${project}`);
         console.log(`Repository: ${repository}`);
@@ -213,11 +253,23 @@ async function run(): Promise<void> {
         }
         console.log('='.repeat(60));
 
-        // Set environment variables for PowerShell scripts
+        // Set environment variables for the CLI agent
         if (useClaudeCode) {
             process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
         } else {
-            process.env['GH_TOKEN'] = githubPat!;
+            if (useCustomModelProvider) {
+                // The Copilot CLI reads these to route model requests to a BYOK provider
+                // instead of GitHub-hosted models
+                process.env['COPILOT_PROVIDER_BASE_URL'] = copilotProviderBaseUrl!;
+                process.env['COPILOT_PROVIDER_TYPE'] = copilotProviderType!;
+                if (copilotProviderApiKey) {
+                    process.env['COPILOT_PROVIDER_API_KEY'] = copilotProviderApiKey;
+                }
+            }
+            // Optional in BYOK mode: a PAT additionally enables GitHub-backed features (e.g. code search)
+            if (githubPat) {
+                process.env['GH_TOKEN'] = githubPat;
+            }
         }
         process.env['AZUREDEVOPS_TOKEN'] = azureDevOpsToken;
         process.env['AZUREDEVOPS_AUTH_TYPE'] = azureDevOpsAuthType;
@@ -524,7 +576,7 @@ async function run(): Promise<void> {
                     currentPrompt = currentPrompt.replace(originalGuidelines, replacedGuidelines);
                 }
 
-                const originalOverview = 'The details of a pull request for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for broad context on the pull request. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
+                const originalOverview = 'The details of a pull request for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for broad context on the pull request. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. The Iteration_Details.txt file also lists the full commit SHAs for the latest iteration: the Source Commit contains the pull request\'s changes (the new code), and the Target Commit is the tip of the base branch it will merge into (the old code). When using git to inspect the changes, always diff from base to PR branch using the merge-base form—git diff <target-commit>...<source-commit>—so that additions in the output represent code introduced by this pull request and deletions represent code it removes. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
                 const replacedOverview = 'The PR details, iteration information, and code diff are all provided inline at the end of this prompt. Use this information to understand the context and review the code changes. Do NOT attempt to read files from disk or run git commands to explore the repository—all relevant context is embedded below.';
                 if (currentPrompt.includes(originalOverview)) {
                     currentPrompt = currentPrompt.replace(originalOverview, replacedOverview);

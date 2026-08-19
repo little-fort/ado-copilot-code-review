@@ -24,13 +24,50 @@
             "helpMarkDown": "When enabled, uses Claude Code CLI (Anthropic) instead of GitHub Copilot CLI for the code review. Requires an Anthropic API key."
         },
         {
+            "name": "useCustomModelProvider",
+            "type": "boolean",
+            "label": "Use Custom Model Provider (BYOK)",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, the GitHub Copilot CLI uses a custom model provider (bring your own key) instead of GitHub-hosted models. Requires a provider base URL, provider type, and an explicit 'model'. A GitHub PAT becomes optional in this mode. Cannot be combined with 'Use Claude Code CLI'. [Learn more](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models)",
+            "visibleRule": "useClaudeCode != true"
+        },
+        {
             "name": "githubPat",
             "type": "string",
             "label": "GitHub PAT",
             "required": false,
             "isSecret": true,
-            "helpMarkDown": "Personal Access Token for GitHub with Copilot access. Required when using the GitHub Copilot CLI (default). Not needed when 'Use Claude Code CLI' is enabled.",
+            "helpMarkDown": "Personal Access Token for GitHub with Copilot access. Required when using the GitHub Copilot CLI with GitHub-hosted models (default). Optional when 'Use Custom Model Provider' is enabled—providing it additionally enables GitHub-backed features such as code search. Not needed when 'Use Claude Code CLI' is enabled.",
             "visibleRule": "useClaudeCode != true"
+        },
+        {
+            "name": "copilotProviderBaseUrl",
+            "type": "string",
+            "label": "Model Provider Base URL",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Base URL of the custom model provider's API endpoint (e.g., 'https://api.openai.com/v1' or a local Ollama endpoint). Required when 'Use Custom Model Provider' is enabled.",
+            "visibleRule": "useCustomModelProvider = true && useClaudeCode != true"
+        },
+        {
+            "name": "copilotProviderType",
+            "type": "string",
+            "label": "Model Provider Type",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Type of the custom model provider. Documented values: 'openai' (any OpenAI-compatible endpoint, including Ollama and vLLM), 'azure', or 'anthropic'. Required when 'Use Custom Model Provider' is enabled.",
+            "visibleRule": "useCustomModelProvider = true && useClaudeCode != true"
+        },
+        {
+            "name": "copilotProviderApiKey",
+            "type": "string",
+            "label": "Model Provider API Key",
+            "required": false,
+            "isSecret": true,
+            "defaultValue": "",
+            "helpMarkDown": "API key for authenticating with the custom model provider. Optional—omit for providers that do not require authentication, such as a local Ollama instance.",
+            "visibleRule": "useCustomModelProvider = true && useClaudeCode != true"
         },
         {
             "name": "anthropicApiKey",
@@ -128,7 +165,7 @@
             "label": "Copilot Model",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. The Copilot model to use for the review (e.g., 'gpt-4', 'claude-sonnet'). If not specified, uses the default model."
+            "helpMarkDown": "Optional. The Copilot model to use for the review (e.g., 'gpt-4', 'claude-sonnet'). If not specified, uses the default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
         },
         {
             "name": "promptFile",
@@ -192,7 +229,7 @@
             "label": "Diff-Only Review",
             "required": false,
             "defaultValue": false,
-            "helpMarkDown": "When enabled, the agent is instructed to not explore the full codebase. The diff is pre-computed and embedded in the prompt, serving as the sole context for the review. This dramatically reduces token usage for large repositories. When using raw prompts, the diff context is appended to the end of the prompt."
+            "helpMarkDown": "When enabled, the review is restricted to ONLY the PR diff. The diff is pre-computed and embedded in the prompt, and CLI tool access is limited to posting comments only. This dramatically reduces token usage for large repositories. Compatible with all prompt modes — when using raw prompts, the diff context is appended to the end of the prompt."
         },
         {
             "name": "publishPromptArtifacts",

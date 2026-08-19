@@ -175,11 +175,15 @@ steps:
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI (default). |
+| `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI with GitHub-hosted models (default). Optional when `useCustomModelProvider` is `true`. |
 | `useClaudeCode` | No | `false` | Use Claude Code CLI (Anthropic) instead of GitHub Copilot CLI |
 | `anthropicApiKey` | Conditional | - | Anthropic API key. Required when `useClaudeCode` is `true`. |
 | `maxTurns` | No | - | Maximum agentic turns for Claude Code CLI |
 | `maxBudget` | No | - | Maximum cost in USD for a Claude Code session |
+| `useCustomModelProvider` | No | `false` | Use a custom model provider (BYOK) with the GitHub Copilot CLI instead of GitHub-hosted models (see [Custom Model Providers](#custom-model-providers)) |
+| `copilotProviderBaseUrl` | Conditional | - | Base URL of the custom provider's API endpoint. Required when `useCustomModelProvider` is `true`. |
+| `copilotProviderType` | Conditional | - | Custom provider type: `openai`, `azure`, or `anthropic`. Required when `useCustomModelProvider` is `true`. |
+| `copilotProviderApiKey` | No | - | API key for the custom provider. Optional for providers that do not require authentication (e.g., a local Ollama instance). |
 | `useSystemAccessToken` | No | `false` | Use pipeline's System.AccessToken instead of a PAT (recommended for Azure DevOps Services) |
 | `azureDevOpsPat` | Conditional | - | Azure DevOps PAT for API access. Required if `useSystemAccessToken` is `false`. |
 | `organization` | No | `$(System.CollectionUri)` (inferred) | Azure DevOps organization name for cloud-hosted teams |
@@ -188,7 +192,7 @@ steps:
 | `repository` | No | `$(Build.Repository.Name)` | Repository name |
 | `pullRequestId` | No | `$(System.PullRequest.PullRequestId)` | PR ID (auto-detected in PR builds) |
 | `timeout` | No | `15` | Timeout in minutes |
-| `model` | No | - | Preferred model to use (see valid options below) |
+| `model` | Conditional | - | Preferred model to use (see valid options below). Required when `useCustomModelProvider` is `true`. |
 | `promptFile` | No | - | Path to custom prompt file |
 | `prompt` | No | - | Inline custom prompt (overrides `promptFile`) |
 | `promptFileRaw` | No | - | _(Advanced)_ Path to custom prompt file that will be passed as-is with no supportive direction. |
@@ -214,6 +218,29 @@ As of May 2026, here are the model options supported by the GitHub Copilot CLI:
 - `gpt-5-mini`
 - `gpt-4.1`
 - `gemini-3-pro-preview`
+
+### Custom Model Providers
+
+The GitHub Copilot CLI supports bring-your-own-key (BYOK) model providers, letting the review run against any OpenAI-compatible endpoint (including Ollama and vLLM), Azure OpenAI, or Anthropic instead of GitHub-hosted models. Enable it with `useCustomModelProvider` and supply the provider details:
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    useCustomModelProvider: true
+    copilotProviderBaseUrl: 'https://api.openai.com/v1'
+    copilotProviderType: 'openai'
+    copilotProviderApiKey: '$(OPENAI_API_KEY)'
+    model: 'gpt-5.2'
+    useSystemAccessToken: true
+```
+
+Notes:
+
+- `model` is **required** in this mode and must be a model identifier your provider serves.
+- `copilotProviderApiKey` may be omitted for providers that do not require authentication (e.g., a local Ollama instance on a self-hosted agent).
+- `githubPat` is optional in this mode. No GitHub authentication is needed to run the review against your own provider, but supplying a PAT additionally enables GitHub-backed CLI features such as code search.
+- The provider's model must support tool calling and streaming; a context window of at least 128k tokens is recommended. See [GitHub's BYOK documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models) for details.
 
 ### Claude Code Models
 

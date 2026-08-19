@@ -242,6 +242,26 @@
             "helpMarkDown": "When enabled, fetches full details (title, description, acceptance criteria, repro steps) for work items linked to the pull request and includes them as context for the Copilot review. Disable to reduce API calls and context window usage."
         },
         {
+            "name": "resolveThreads",
+            "type": "pickList",
+            "label": "Thread Resolution Scope",
+            "required": false,
+            "defaultValue": "agentOnly",
+            "options": {
+                "agentOnly": "Agent threads only",
+                "all": "All addressed threads (including human reviewers')"
+            },
+            "helpMarkDown": "Controls which existing comment threads the review agent may resolve when their issues have been addressed. 'agentOnly' (default): only threads created by previous automated reviews. 'all': additionally allows resolving threads created by human reviewers. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
+        },
+        {
+            "name": "suppressPositiveFeedback",
+            "type": "boolean",
+            "label": "Suppress Positive Feedback",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, the review agent will not post praise or 'looks good' comments. If a review finds no impactful issues, no comment is posted at all. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
+        },
+        {
             "name": "diffOnlyReview",
             "type": "boolean",
             "label": "Diff-Only Review",

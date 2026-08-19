@@ -203,6 +203,8 @@ steps:
 | `promptRaw` | No | - | _(Advanced)_ Inline custom prompt that will be passed as-is with no supportive direction. |
 | `authors` | No | - | Comma-separated list of email addresses to filter reviews (see below) |
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
+| `resolveThreads` | No | `agentOnly` | Which existing comment threads the agent may resolve: `agentOnly` or `all` (see [Review Behavior Options](#review-behavior-options)) |
+| `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
@@ -285,6 +287,27 @@ When configured:
 - If the PR author's email matches any in the list, the review proceeds normally
 - If no match is found, the task completes successfully without running the code review
 - Email comparison is case-insensitive
+
+### Review Behavior Options
+
+Two inputs tune how the review agent behaves across iterations. Both apply to Copilot and Claude Code alike, and both are appended to the review prompt as directives — so they do not apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
+
+**`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
+
+- `agentOnly` (default) — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
+- `all` — the agent may also resolve human reviewers' threads when the current changes clearly address them, replying with an explanation before marking the thread fixed.
+
+**`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    resolveThreads: 'all'
+    suppressPositiveFeedback: true
+```
 
 ### Diff-Only Review Mode
 

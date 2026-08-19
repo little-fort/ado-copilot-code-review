@@ -44,6 +44,45 @@ function normalizeGitHubHost(host: string): string {
     return host.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
 
+/**
+ * Builds the "Review Behavior Directives" prompt section from task inputs
+ * (issues #55 and #28). The section is appended to template-based prompts for
+ * both Copilot and Claude Code; raw prompts are contractually passed as-is
+ * and never receive it.
+ */
+function buildReviewDirectives(resolveThreads: string, suppressPositiveFeedback: boolean): string {
+    const directives: string[] = [];
+
+    if (resolveThreads === 'all') {
+        directives.push(
+            'Thread resolution scope: In addition to the automated-review threads listed in the ' +
+            'COPILOT COMMENT THREADS (JSON) section of PR_Details.txt, you may resolve threads created by ' +
+            'human reviewers when the changes in the current iteration clearly and completely address their ' +
+            'concern. Follow the same two-step process: first reply to the thread explaining what change ' +
+            "addressed it, then mark the thread as fixed. If in doubt, leave human reviewers' threads untouched.");
+    } else {
+        directives.push(
+            'Thread resolution scope: Only resolve or change the status of comment threads that appear in ' +
+            'the COPILOT COMMENT THREADS (JSON) section of PR_Details.txt — those threads were created by ' +
+            'previous automated reviews. NEVER resolve, close, or otherwise change the status of threads ' +
+            'created by human reviewers, even if the underlying issue appears to have been addressed; leave ' +
+            'those threads to the people involved in them.');
+    }
+
+    if (suppressPositiveFeedback) {
+        directives.push(
+            "Positive feedback suppression: Do NOT post positive, congratulatory, or 'looks good' comments. " +
+            'If the review finds no impactful issues, do not post any comment at all — simply end the review. ' +
+            'This overrides any earlier instruction to leave a comment indicating the code looks good to ' +
+            'merge. Only post comments that request changes or flag genuine concerns.');
+    }
+
+    return '\n\n# Review Behavior Directives\n\n' +
+        'The following directives are configured by the pipeline administrator and take precedence over any ' +
+        'conflicting instructions elsewhere in this prompt:\n\n' +
+        directives.map(d => '- ' + d).join('\n\n') + '\n';
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -237,6 +276,16 @@ async function run(): Promise<void> {
         const includeWorkItems = tl.getBoolInput('includeWorkItems', false);
         const diffOnlyReview = tl.getBoolInput('diffOnlyReview', false);
         const publishPromptArtifacts = tl.getBoolInput('publishPromptArtifacts', false);
+        const resolveThreads = tl.getInput('resolveThreads') || 'agentOnly';
+        const suppressPositiveFeedback = tl.getBoolInput('suppressPositiveFeedback', false);
+
+        // Fail fast on a typo'd value — falling back silently would change
+        // which PR threads the agent is allowed to resolve
+        if (resolveThreads !== 'agentOnly' && resolveThreads !== 'all') {
+            tl.setResult(tl.TaskResult.Failed,
+                `Invalid resolveThreads value '${resolveThreads}'. Valid values: 'agentOnly', 'all'.`);
+            return;
+        }
 
         // filePath inputs return the working directory path when not set, so check both
         // the input value and that the path actually points to a real file.
@@ -577,6 +626,18 @@ async function run(): Promise<void> {
             // Use default prompt file bundled with the task
             promptFilePath = path.join(scriptsDir, 'prompt.txt');
             console.log('Using default prompt.');
+        }
+
+        // Append administrator-configured behavior directives (thread resolution
+        // scope, positive feedback suppression) to template-based prompts.
+        // Raw prompts are contractually passed as-is, so they are never modified.
+        if (!promptRaw && !isPromptFileRawSet && promptFilePath) {
+            const promptWithDirectives = fs.readFileSync(promptFilePath, 'utf8')
+                + buildReviewDirectives(resolveThreads, suppressPositiveFeedback);
+            const directivePromptPath = path.join(workingDirectory, '_directive_prompt.txt');
+            fs.writeFileSync(directivePromptPath, promptWithDirectives, 'utf8');
+            promptFilePath = directivePromptPath;
+            console.log(`Applied review behavior directives (resolveThreads: ${resolveThreads}, suppressPositiveFeedback: ${suppressPositiveFeedback}).`);
         }
 
         // When using Claude Code, replace the Copilot attribution tag in the prompt
@@ -1068,4 +1129,4 @@ if (require.main === module) {
 }
 
 // Exported for tests
-export { runInstallerWithRetry, normalizeGitHubHost };
+export { runInstallerWithRetry, normalizeGitHubHost, buildReviewDirectives };

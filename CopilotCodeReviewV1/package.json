@@ -4,8 +4,7 @@
     "description": "Azure DevOps extension for automated code reviews using agentic AI tools",
     "main": "index.js",
     "scripts": {
-        "build": "tsc",
-        "test": "mocha tests/_suite.js"
+        "build": "tsc"
     },
     "repository": {
         "type": "git",

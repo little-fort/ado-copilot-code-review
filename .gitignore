@@ -6,6 +6,8 @@ node_modules/
 *.js.map
 *.d.ts
 !jest.config.js
+# Test sources are hand-written JS, not build output
+!tests/**/*.js
 
 # Package outputs
 *.vsix

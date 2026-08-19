@@ -47,5 +47,13 @@ jobs:
           npm install -g tfx-cli
           tfx extension create --manifest-globs vss-extension.json --output-path "$RUNNER_TEMP/ci-package"
 
-      # NOTE: A Pester step for the PowerShell scripts will be added here once
-      # the first Pester tests land (planned alongside the issue #56 fix).
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0.0' })) {
+            Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          }
+
+      - name: Run PowerShell tests
+        shell: pwsh
+        run: ./tests/powershell/Invoke-Tests.ps1

@@ -6,6 +6,7 @@
         "build": "cd CopilotCodeReviewV1 && npm run build",
         "build:dev": "cd CopilotCodeReviewV1 && npm run build",
         "test": "mocha tests/**/*.test.js",
+        "test:ps": "pwsh -NoProfile -File tests/powershell/Invoke-Tests.ps1",
         "package:prod": "tfx extension create --manifest-globs vss-extension.json",
         "package:dev": "pwsh -File build-dev.ps1"
     },

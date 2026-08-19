@@ -101,7 +101,7 @@ steps:
     useClaudeCode: true
     anthropicApiKey: '$(ANTHROPIC_API_KEY)'
     useSystemAccessToken: true
-    model: 'claude-sonnet-4-6'
+    model: 'sonnet'
     maxTurns: '50'
     maxBudget: '5.00'
 ```
@@ -216,20 +216,40 @@ steps:
 
 ### Copilot Models
 
-As of May 2026, here are the model options supported by the GitHub Copilot CLI:
+As of August 2026 (Copilot CLI 1.0.80), here are the model options supported by the GitHub Copilot CLI:
 
-- `claude-sonnet-4.6` (default)
-- `claude-sonnet-4.5`
+- `auto` — lets Copilot route each request to the most efficient model for the task
+- `claude-sonnet-5` (default when no model is specified)
+- `claude-fable-5`
+- `claude-opus-5`
+- `claude-opus-4.8`
+- `claude-opus-4.8-fast` (preview)
+- `claude-opus-4.7`
+- `claude-sonnet-4.6` †
+- `claude-opus-4.6` †
+- `claude-sonnet-4.5` †
+- `claude-opus-4.5` †
 - `claude-haiku-4.5`
-- `claude-opus-4.5`
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+- `gpt-5.5`
 - `gpt-5.4`
 - `gpt-5.4-mini`
 - `gpt-5.3-codex`
-- `gpt-5.2-codex` 
-- `gpt-5.2`
 - `gpt-5-mini`
-- `gpt-4.1`
-- `gemini-3-pro-preview`
+- `gemini-3.7-flash`
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3.1-pro-preview` † (public preview)
+- `grok-4.5`
+- `kimi-k3`
+- `kimi-k2.7-code`
+- `mai-code-1-flash-picker` (MAI-Code-1-Flash)
+
+† Scheduled for [deprecation on September 1, 2026](https://github.blog/changelog/2026-07-31-upcoming-august-2026-model-deprecations-in-github-copilot/); Claude Sonnet 4.6 remains available to individual Copilot subscribers on annual plans.
+
+Model availability varies by Copilot plan and organization policy, so a model the CLI accepts may still be rejected at runtime if your subscription doesn't include it. See [supported AI models in Copilot](https://docs.github.com/en/copilot/reference/ai-models/supported-ai-models-in-copilot) for the full availability matrix.
 
 ### Custom Model Providers
 
@@ -257,19 +277,21 @@ Notes:
 
 ### Claude Code Models
 
-As of April 2026, here are the model options supported by the Claude Code CLI:
+As of August 2026, here are the model options supported by the Claude Code CLI:
 
 | Alias | Description |
 | --- | ---- |
 | `default` | Recommended model setting, depending on your account type |
-| `sonnet` | Uses the latest Sonnet model (currently Sonnet 4.6) for daily coding tasks |
-| `opus` | Uses the latest Opus model (currently Opus 4.6) for complex reasoning tasks |
+| `best` | Uses Fable 5 where your organization has access to it, otherwise the latest Opus model |
+| `fable` | Uses Claude Fable 5, the most capable model for the hardest and longest-running tasks (requires organization access) |
+| `sonnet` | Uses the latest Sonnet model (currently Sonnet 5) for daily coding tasks |
+| `opus` | Uses the latest Opus model (currently Opus 5) for complex reasoning tasks |
 | `haiku` | Uses the fast and efficient Haiku model for simple tasks |
-| `sonnet[1m]` | Uses Sonnet with a 1 million token context window for long sessions |
+| `sonnet[1m]` | Uses Sonnet with a 1 million token context window for long sessions (no effect when `sonnet` already resolves to Sonnet 5, which has a native 1M window) |
 | `opus[1m]` | Uses Opus with a 1 million token context window for long sessions |
 | `opusplan` | Special mode that uses `opus` during plan mode, then switches to `sonnet` for execution |
 
-Aliases always point to the latest version. To pin to a specific version, use the full model name (for example, `claude-opus-4-6`).
+Aliases always point to the latest version available to your account. To pin to a specific version, use the full model name (for example, `claude-opus-5`).
 
 ### Author Filtering
 
@@ -297,7 +319,7 @@ When configured:
 
 ### Review Behavior Options
 
-Two inputs tune how the review agent behaves across iterations. Both apply to Copilot and Claude Code alike, and both are appended to the review prompt as directives — so they do not apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
+Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt — so none of them apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
 
 **`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
 
@@ -484,7 +506,7 @@ Alternatively, you can create the pipeline first and then configure the pipeline
 ## How It Works
 
 1. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
-2. **Fetch PR Context**: The task retrieves pull request metadata, existing comments, iteration details, and linked work item details via the Azure DevOps API
+2. **Fetch PR Context**: The task retrieves pull request metadata, existing comments, iteration details, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured)
 3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
 4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
 
@@ -505,8 +527,8 @@ Findings are triaged in two phases: the agent first enumerates every candidate i
 ## Limitations
 
 - **GitHub Copilot CLI**: On Windows, requires `winget` to be available. On Linux, requires `curl` and `bash` (standard on most systems). If using MS-hosted agents, these should be available by default.
-- **Claude Code CLI**: Requires `npm` to be available (pre-installed on all Azure DevOps agents). Requires an Anthropic API key.
-- **General Comments Only**: Posts general PR comments (file-level inline comments not yet supported)
+- **Claude Code CLI**: Requires `npm` to be available (pre-installed on all Azure DevOps agents). Requires an Anthropic API key or a Claude subscription OAuth token.
+- **Inline Comment Fallback**: Review comments are posted inline on the relevant file and lines. If Azure DevOps rejects an inline anchor, the comment is posted as a general PR comment with the file and line reference included in the text instead.
 - **Context Window**: Very large PRs may exceed the agent's context limits
 
 ## Troubleshooting
@@ -549,7 +571,7 @@ For large PRs, increase the `timeout` input value. The default is 15 minutes.
 
 ### No comments posted
 
-Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating the PR looks good when using the default prompt.
+Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating the PR looks good when using the default prompt — unless `suppressPositiveFeedback` is enabled, in which case a clean review intentionally posts nothing.
 
 ## Contributing
 

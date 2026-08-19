@@ -183,7 +183,7 @@
             "label": "Copilot Model",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. The Copilot model to use for the review (e.g., 'gpt-4', 'claude-sonnet'). If not specified, uses the default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
+            "helpMarkDown": "Optional. The model to use for the review (e.g., 'claude-sonnet-5', 'gpt-5.5'). If not specified, uses the CLI's default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
         },
         {
             "name": "reasoningEffort",

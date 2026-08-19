@@ -178,6 +178,7 @@ steps:
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI with GitHub-hosted models (default). Optional when `useCustomModelProvider` is `true`. |
+| `githubHost` | No | - | GitHub Enterprise hostname (e.g., `subdomain.ghe.com`) for enterprise accounts with data residency (see [GitHub Enterprise Accounts](#github-enterprise-accounts)) |
 | `useClaudeCode` | No | `false` | Use Claude Code CLI (Anthropic) instead of GitHub Copilot CLI |
 | `anthropicApiKey` | Conditional | - | Anthropic API key (API usage billing). Provide this **or** `claudeCodeOAuthToken` when `useClaudeCode` is `true`. |
 | `claudeCodeOAuthToken` | Conditional | - | Claude Code OAuth token from `claude setup-token` (subscription billing). Provide this **or** `anthropicApiKey` when `useClaudeCode` is `true`. |
@@ -376,6 +377,21 @@ Create a personal access token:
 3. Store the token as a secret variable in your Azure DevOps pipeline
 
 > **IMPORTANT**: If your user account is part of a GitHub organization, ensure the organization admin goes to **GitHub Policies** > **Copilot** > **Copilot CLI** and sets the policy to **Enabled everywhere**
+
+#### GitHub Enterprise Accounts
+
+If your Copilot subscription lives on a GitHub Enterprise account with data residency (`subdomain.ghe.com`), a PAT from that instance will fail validation against github.com with a "Bad credentials" error. Set the `githubHost` input so the Copilot CLI authenticates against your enterprise instance:
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_ENTERPRISE_PAT)'
+    githubHost: 'subdomain.ghe.com'
+    useSystemAccessToken: true
+```
+
+A full URL (e.g., `https://subdomain.ghe.com/`) is also accepted and normalized to the hostname automatically.
 
 ### Anthropic Authentication (for Claude Code CLI)
 

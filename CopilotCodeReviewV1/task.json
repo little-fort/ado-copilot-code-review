@@ -42,6 +42,15 @@
             "visibleRule": "useClaudeCode != true"
         },
         {
+            "name": "githubHost",
+            "type": "string",
+            "label": "GitHub Enterprise Host",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Optional. GitHub Enterprise hostname (e.g., 'subdomain.ghe.com') for accounts with data residency. Sets the GH_HOST environment variable so the Copilot CLI validates the GitHub PAT against your enterprise instance instead of github.com. Leave empty for github.com accounts.",
+            "visibleRule": "useClaudeCode != true"
+        },
+        {
             "name": "copilotProviderBaseUrl",
             "type": "string",
             "label": "Model Provider Base URL",

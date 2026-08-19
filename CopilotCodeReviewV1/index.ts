@@ -35,6 +35,15 @@ function sanitizePipelineLog(text: string): string {
     return text.replace(/^##/gm, ' ##');
 }
 
+/**
+ * Normalizes a GitHub Enterprise host input to a bare hostname.
+ * GH_HOST expects a hostname (e.g. 'subdomain.ghe.com'), but users commonly
+ * paste a full URL — strip any scheme and trailing slashes.
+ */
+function normalizeGitHubHost(host: string): string {
+    return host.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -80,6 +89,7 @@ async function run(): Promise<void> {
         const useClaudeCode = tl.getBoolInput('useClaudeCode', false);
         const useCustomModelProvider = tl.getBoolInput('useCustomModelProvider', false);
         const githubPat = tl.getInput('githubPat');
+        const githubHost = tl.getInput('githubHost');
         const anthropicApiKey = tl.getInput('anthropicApiKey');
         const claudeCodeOAuthToken = tl.getInput('claudeCodeOAuthToken');
         const maxTurns = tl.getInput('maxTurns');
@@ -284,6 +294,14 @@ async function run(): Promise<void> {
             // Optional in BYOK mode: a PAT additionally enables GitHub-backed features (e.g. code search)
             if (githubPat) {
                 process.env['GH_TOKEN'] = githubPat;
+            }
+            // GitHub Enterprise (e.g. subdomain.ghe.com): the Copilot CLI honors
+            // GH_HOST when validating the PAT, so enterprise-scoped tokens
+            // authenticate against the right instance (issue #59)
+            if (githubHost) {
+                const normalizedHost = normalizeGitHubHost(githubHost);
+                process.env['GH_HOST'] = normalizedHost;
+                console.log(`Using GitHub Enterprise host: ${normalizedHost}`);
             }
         }
         process.env['AZUREDEVOPS_TOKEN'] = azureDevOpsToken;
@@ -1050,4 +1068,4 @@ if (require.main === module) {
 }
 
 // Exported for tests
-export { runInstallerWithRetry };
+export { runInstallerWithRetry, normalizeGitHubHost };

@@ -165,7 +165,11 @@ function Invoke-AzureDevOpsApi {
         [hashtable]$Headers,
         [string]$Method = "Get",
         [object]$Body = $null,
-        [int]$MaxAttempts = 3
+        [int]$MaxAttempts = 3,
+        # For non-idempotent requests (POST): a probe that checks whether the
+        # failed request was actually committed server-side. Must return the
+        # created resource (used as the response) or $null if nothing landed.
+        [scriptblock]$VerifyCompleted = $null
     )
 
     $attempt = 0
@@ -199,7 +203,32 @@ function Invoke-AzureDevOpsApi {
 
             # Throttling, server errors, and network failures are worth retrying;
             # other 4xx responses are deterministic and fail immediately.
-            $isTransient = (-not $statusCode) -or $statusCode -eq 429 -or $statusCode -ge 500
+            $isThrottled = $statusCode -eq 429
+            $isTransient = (-not $statusCode) -or $isThrottled -or $statusCode -ge 500
+
+            # POST is not idempotent: a 5xx or network error can occur AFTER the
+            # server committed the write, so blindly replaying the request could
+            # create a duplicate comment. Before retrying (and before giving up
+            # on the final attempt), probe whether the write actually landed and
+            # reuse it if so. 429 means the request was rejected unprocessed, so
+            # no probe is needed there.
+            if ($isTransient -and -not $isThrottled -and $Method -eq 'Post' -and $VerifyCompleted) {
+                $committed = $null
+                try {
+                    $committed = & $VerifyCompleted
+                }
+                catch {
+                    # The probe itself failed (likely the same outage). Fall
+                    # through to the normal retry path: a rare duplicate comment
+                    # is preferable to silently dropping review feedback.
+                    Write-Host "Could not verify whether the failed $Method request was committed; proceeding with retry." -ForegroundColor Yellow
+                }
+                if ($null -ne $committed) {
+                    Write-Host "The failed $Method request was committed by the server despite the error; using the existing resource instead of retrying." -ForegroundColor Yellow
+                    return $committed
+                }
+            }
+
             if ($isTransient -and $attempt -lt $MaxAttempts) {
                 $delaySeconds = [math]::Pow(2, $attempt)
                 $statusText = if ($statusCode) { "HTTP $statusCode" } else { $_.Exception.Message }
@@ -310,8 +339,15 @@ if ($ThreadId -gt 0) {
         commentType   = 1  # Text comment
     }
 
+    # Duplicate guard for ambiguous POST failures: re-read the thread and treat
+    # a reply with the exact same text as the committed result
+    $verifyReplyCommitted = {
+        $thread = Invoke-AzureDevOpsApi -Uri $threadUrl -Headers $headers
+        @($thread.comments) | Select-Object -Skip 1 | Where-Object { $_.content -eq $Comment } | Select-Object -First 1
+    }
+
     try {
-        $result = Invoke-AzureDevOpsApi -Uri $commentsUrl -Headers $headers -Method "Post" -Body $body
+        $result = Invoke-AzureDevOpsApi -Uri $commentsUrl -Headers $headers -Method "Post" -Body $body -VerifyCompleted $verifyReplyCommitted
     }
     catch {
         Write-Host "##[error]Failed to post reply to thread #$ThreadId on pull request #$Id."
@@ -382,9 +418,20 @@ else {
     $result = $null
     $inlineCommentFailed = $false
 
+    # Duplicate guard for ambiguous POST failures: list the PR's threads and
+    # treat one whose first comment has the exact same text as the committed
+    # result. Content equality is safe here because the probe only runs seconds
+    # after our own POST failed ambiguously.
+    $verifyThreadCommitted = {
+        $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+        @($threads.value) | Where-Object {
+            $_.comments -and @($_.comments)[0].content -eq $Comment
+        } | Select-Object -First 1
+    }
+
     # Attempt to post the comment
     try {
-        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body
+        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body -VerifyCompleted $verifyThreadCommitted
     }
     catch {
         if ($isInlineComment) {
@@ -416,9 +463,17 @@ else {
             status   = Get-ThreadStatusValue -StatusName $Status
         }
         
+        # Same duplicate guard as above, matching the fallback comment text
+        $verifyFallbackCommitted = {
+            $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+            @($threads.value) | Where-Object {
+                $_.comments -and @($_.comments)[0].content -eq $fallbackComment
+            } | Select-Object -First 1
+        }
+
         Write-Host "Posting generic comment with file/line information..." -ForegroundColor Yellow
         try {
-            $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $fallbackBody
+            $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $fallbackBody -VerifyCompleted $verifyFallbackCommitted
         }
         catch {
             Write-Host "##[error]Fallback generic comment also failed for pull request #$Id."

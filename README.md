@@ -208,7 +208,7 @@ steps:
 | `jiraEmail` | Conditional | - | Atlassian account email for the API token. Required when `jiraBaseUrl` is set. |
 | `jiraApiToken` | Conditional | - | Jira Cloud API token. Required when `jiraBaseUrl` is set. |
 | `jiraProjectKeys` | No | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) to restrict issue key lookup |
-| `resolveThreads` | No | `agentOnly` | Which existing comment threads the agent may resolve: `agentOnly` or `all` (see [Review Behavior Options](#review-behavior-options)) |
+| `resolveThreads` | No | `all` | Which existing comment threads the agent may resolve: `all` or `agentOnly` (see [Review Behavior Options](#review-behavior-options)) |
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
@@ -323,8 +323,8 @@ Three inputs tune how the review agent behaves across iterations. All of them ap
 
 **`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
 
-- `agentOnly` (default) — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
-- `all` — the agent may also resolve human reviewers' threads when the current changes clearly address them, replying with an explanation before marking the thread fixed.
+- `all` (default) — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers, replying with an explanation before marking the thread fixed. This matches the behavior the extension has had since thread resolution was introduced.
+- `agentOnly` — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
 
 **`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
 
@@ -336,7 +336,7 @@ Three inputs tune how the review agent behaves across iterations. All of them ap
   inputs:
     githubPat: '$(GITHUB_PAT)'
     useSystemAccessToken: true
-    resolveThreads: 'all'
+    resolveThreads: 'agentOnly'
     suppressPositiveFeedback: true
 ```
 

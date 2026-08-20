@@ -320,7 +320,10 @@ async function run(): Promise<void> {
         const includeWorkItems = tl.getBoolInput('includeWorkItems', false);
         const diffOnlyReview = tl.getBoolInput('diffOnlyReview', false);
         const publishPromptArtifacts = tl.getBoolInput('publishPromptArtifacts', false);
-        const resolveThreads = tl.getInput('resolveThreads') || 'agentOnly';
+        // Default 'all': the agent has resolved addressed human threads since the
+        // feature landed (issue #3), so existing users expect that behavior.
+        // 'agentOnly' is the opt-out for teams that want human threads untouched.
+        const resolveThreads = tl.getInput('resolveThreads') || 'all';
         const suppressPositiveFeedback = tl.getBoolInput('suppressPositiveFeedback', false);
         const maxMinorIssues = tl.getInput('maxMinorIssues') || '5';
 
@@ -353,12 +356,18 @@ async function run(): Promise<void> {
             ['jiraEmail', jiraEmail],
             ['jiraApiToken', jiraApiToken]
         ].filter(([, value]) => !value).map(([name]) => name);
-        const useJiraWorkItems = missingJiraInputs.length === 0;
+        // Jira config is only validated and used when work items are enabled at
+        // all — stale Jira inputs must not fail a review that has work-item
+        // fetching turned off.
+        const useJiraWorkItems = includeWorkItems && missingJiraInputs.length === 0;
 
-        if (missingJiraInputs.length > 0 && missingJiraInputs.length < 3) {
+        if (includeWorkItems && missingJiraInputs.length > 0 && missingJiraInputs.length < 3) {
             tl.setResult(tl.TaskResult.Failed,
                 `Jira integration requires jiraBaseUrl, jiraEmail, and jiraApiToken together. Missing: ${missingJiraInputs.join(', ')}.`);
             return;
+        }
+        if (!includeWorkItems && missingJiraInputs.length < 3) {
+            console.log('Note: Jira inputs are configured but includeWorkItems is disabled; they will be ignored.');
         }
 
         // Normalize the Jira base URL: default to https and strip trailing slashes
@@ -367,6 +376,14 @@ async function run(): Promise<void> {
             normalizedJiraBaseUrl = jiraBaseUrl!.trim().replace(/\/+$/, '');
             if (!/^https?:\/\//i.test(normalizedJiraBaseUrl)) {
                 normalizedJiraBaseUrl = `https://${normalizedJiraBaseUrl}`;
+            }
+            // Basic auth sends the email and API token with every request, so an
+            // explicit http:// URL would transmit credentials in cleartext. Jira
+            // Cloud is HTTPS-only, so there is no legitimate http:// target.
+            if (/^http:\/\//i.test(normalizedJiraBaseUrl)) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'jiraBaseUrl must use HTTPS. Jira Cloud authentication sends credentials with every request, so a plain http:// URL is not allowed.');
+                return;
             }
         }
 
@@ -612,6 +629,16 @@ async function run(): Promise<void> {
         }
 
         // Step 4: Fetch linked work item details (optional)
+        // Self-hosted agents can reuse the workspace between runs, and the fetch
+        // below only (re)creates Work_Item_Details.txt on a successful lookup. A
+        // leftover file from an earlier run would silently attach unrelated work
+        // item context to this review, so clear it up front.
+        const previousWorkItemDetails = path.join(workingDirectory, 'Work_Item_Details.txt');
+        if (fs.existsSync(previousWorkItemDetails)) {
+            fs.unlinkSync(previousWorkItemDetails);
+            console.log('Removed Work_Item_Details.txt left over from a previous run.');
+        }
+
         if (includeWorkItems && useJiraWorkItems) {
             // Jira replaces Azure Boards as the work item source (issue #53)
             console.log('\n[Step 4/5] Fetching linked Jira issue details...');

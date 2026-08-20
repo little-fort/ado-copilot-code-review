@@ -177,6 +177,21 @@ Describe 'Get-JiraWorkItems.ps1 fetch flow (issue #53)' {
         }
     }
 
+    It 'refuses a non-loopback http base URL before sending credentials' {
+        # Basic auth over cleartext must be rejected up front; the loopback
+        # exemption exists only so these tests can use a local mock API
+        $result = Invoke-ScriptWithMockApi -Responses @() -BuildArgs {
+            param($baseUrl)
+            @('-File', $JiraScript,
+              '-BaseUrl', 'http://jira.internal.example.com', '-Email', 'me@example.com', '-ApiToken', 'test-token',
+              '-PrMetadataFile', 'unused.json')
+        }
+
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Match 'must use HTTPS'
+        $result.Requests.Count | Should -Be 0
+    }
+
     It 'exits non-zero when the metadata file is missing' {
         $result = Invoke-ScriptWithMockApi -Responses @() -BuildArgs {
             param($baseUrl)

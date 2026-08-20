@@ -291,12 +291,12 @@
             "type": "pickList",
             "label": "Thread Resolution Scope",
             "required": false,
-            "defaultValue": "agentOnly",
+            "defaultValue": "all",
             "options": {
                 "agentOnly": "Agent threads only",
                 "all": "All addressed threads (including human reviewers')"
             },
-            "helpMarkDown": "Controls which existing comment threads the review agent may resolve when their issues have been addressed. 'agentOnly' (default): only threads created by previous automated reviews. 'all': additionally allows resolving threads created by human reviewers. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
+            "helpMarkDown": "Controls which existing comment threads the review agent may resolve when their issues have been addressed. 'all' (default): threads created by previous automated reviews, plus threads created by human reviewers when the changes clearly address them. 'agentOnly': only threads created by previous automated reviews — human reviewers' threads are never touched. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
         },
         {
             "name": "suppressPositiveFeedback",

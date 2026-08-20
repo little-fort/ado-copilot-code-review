@@ -58,10 +58,13 @@ Describe 'Add-AzureDevOpsPRComment.ps1 failure surfacing (issue #56)' {
         $result.Requests.Count | Should -Be 2
     }
 
-    It 'retries transient 5xx failures and succeeds' {
+    It 'retries transient 5xx failures after verifying nothing was committed' {
+        # A failed POST is ambiguous, so the script first probes the thread list;
+        # only when the comment is genuinely absent does it replay the POST.
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 200; Body = $PrJson },
             @{ Status = 500; Body = '{"message":"internal server error"}' },
+            @{ Status = 200; Body = '{"value":[],"count":0}' },
             @{ Status = 200; Body = $ThreadJson }
         ) -BuildArgs {
             param($baseUrl)
@@ -74,7 +77,57 @@ Describe 'Add-AzureDevOpsPRComment.ps1 failure surfacing (issue #56)' {
         $result.ExitCode | Should -Be 0
         $result.Output | Should -Match 'Retrying in'
         $result.Output | Should -Match 'COMMENT THREAD CREATED SUCCESSFULLY'
+        # GET PR, failed POST, verification GET, replayed POST
+        $result.Requests.Count | Should -Be 4
+        $result.Requests[2].Method | Should -Be 'GET'
+        $result.Requests[3].Method | Should -Be 'POST'
+    }
+
+    It 'reuses the committed thread instead of retrying when an ambiguous POST failure actually landed' {
+        # The 500 arrives after the server committed the write; the verification
+        # probe finds the thread, so no duplicate POST is sent.
+        $committedThreads = '{"value":[{"id":77,"status":"active","comments":[{"id":1,"content":"General feedback","author":{"displayName":"CI Mock"},"publishedDate":"2026-01-01T00:00:00Z"}]}],"count":1}'
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = $PrJson },
+            @{ Status = 500; Body = '{"message":"internal server error"}' },
+            @{ Status = 200; Body = $committedThreads }
+        ) -BuildArgs {
+            param($baseUrl)
+            @('-File', $AddCommentScript,
+              '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
+              '-Project', 'TestProject', '-Repository', 'TestRepo',
+              '-Id', '123', '-Comment', 'General feedback')
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'committed by the server'
+        $result.Output | Should -Match 'COMMENT THREAD CREATED SUCCESSFULLY'
+        # GET PR, failed POST, verification GET — and nothing after it
         $result.Requests.Count | Should -Be 3
+        $result.Requests[2].Method | Should -Be 'GET'
+    }
+
+    It 'retries throttled POSTs without a verification probe' {
+        # 429 means the request was rejected before processing, so an immediate
+        # replay is safe and no probe is needed.
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 429; Body = '{"message":"too many requests"}' },
+            @{ Status = 200; Body = $PrJson },
+            @{ Status = 429; Body = '{"message":"too many requests"}' },
+            @{ Status = 200; Body = $ThreadJson }
+        ) -BuildArgs {
+            param($baseUrl)
+            @('-File', $AddCommentScript,
+              '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
+              '-Project', 'TestProject', '-Repository', 'TestRepo',
+              '-Id', '123', '-Comment', 'General feedback')
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'COMMENT THREAD CREATED SUCCESSFULLY'
+        # Throttled GET replayed, then throttled POST replayed directly
+        $result.Requests.Count | Should -Be 4
+        $result.Requests[3].Method | Should -Be 'POST'
     }
 
     It 'falls back to a generic comment when the inline comment is rejected' {

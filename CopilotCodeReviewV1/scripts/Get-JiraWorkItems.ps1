@@ -231,6 +231,20 @@ $script:OutputBuilder = [System.Text.StringBuilder]::new()
 # Normalize the base URL: strip trailing slashes
 $BaseUrl = $BaseUrl.TrimEnd('/')
 
+# Refuse to send Basic auth credentials over cleartext: Jira Cloud is
+# HTTPS-only, so any http:// target is a misconfiguration. Loopback addresses
+# are exempt (traffic never leaves the host) so tests can run against a local
+# mock API.
+$baseUri = $null
+if (-not [Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$baseUri)) {
+    Write-Host "##[error]Invalid Jira base URL: $BaseUrl"
+    exit 1
+}
+if ($baseUri.Scheme -ne 'https' -and -not $baseUri.IsLoopback) {
+    Write-Host "##[error]Jira base URL must use HTTPS ($BaseUrl). Basic auth credentials must not be sent over cleartext HTTP."
+    exit 1
+}
+
 # Read PR metadata written by Get-AzureDevOpsPR.ps1
 if (-not (Test-Path $PrMetadataFile)) {
     Write-Host "##[error]PR metadata file not found: $PrMetadataFile"

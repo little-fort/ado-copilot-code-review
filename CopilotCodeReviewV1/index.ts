@@ -35,6 +35,78 @@ function sanitizePipelineLog(text: string): string {
     return text.replace(/^##/gm, ' ##');
 }
 
+/**
+ * Normalizes a GitHub Enterprise host input to a bare hostname.
+ * GH_HOST expects a hostname (e.g. 'subdomain.ghe.com'), but users commonly
+ * paste a full URL — strip any scheme and trailing slashes.
+ */
+function normalizeGitHubHost(host: string): string {
+    return host.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
+/**
+ * Builds the "Review Behavior Directives" prompt section from task inputs
+ * (issues #55 and #28). The section is appended to template-based prompts for
+ * both Copilot and Claude Code; raw prompts are contractually passed as-is
+ * and never receive it.
+ */
+function buildReviewDirectives(resolveThreads: string, suppressPositiveFeedback: boolean): string {
+    const directives: string[] = [];
+
+    if (resolveThreads === 'all') {
+        directives.push(
+            'Thread resolution scope: In addition to the automated-review threads listed in the ' +
+            'COPILOT COMMENT THREADS (JSON) section of PR_Details.txt, you may resolve threads created by ' +
+            'human reviewers when the changes in the current iteration clearly and completely address their ' +
+            'concern. Follow the same two-step process: first reply to the thread explaining what change ' +
+            "addressed it, then mark the thread as fixed. If in doubt, leave human reviewers' threads untouched.");
+    } else {
+        directives.push(
+            'Thread resolution scope: Only resolve or change the status of comment threads that appear in ' +
+            'the COPILOT COMMENT THREADS (JSON) section of PR_Details.txt — those threads were created by ' +
+            'previous automated reviews. NEVER resolve, close, or otherwise change the status of threads ' +
+            'created by human reviewers, even if the underlying issue appears to have been addressed; leave ' +
+            'those threads to the people involved in them.');
+    }
+
+    if (suppressPositiveFeedback) {
+        directives.push(
+            "Positive feedback suppression: Do NOT post positive, congratulatory, or 'looks good' comments. " +
+            'If the review finds no impactful issues, do not post any comment at all — simply end the review. ' +
+            'This overrides any earlier instruction to leave a comment indicating the code looks good to ' +
+            'merge. Only post comments that request changes or flag genuine concerns.');
+    }
+
+    return '\n\n# Review Behavior Directives\n\n' +
+        'The following directives are configured by the pipeline administrator and take precedence over any ' +
+        'conflicting instructions elsewhere in this prompt:\n\n' +
+        directives.map(d => '- ' + d).join('\n\n') + '\n';
+}
+
+// Minor-findings policy in the prompt templates. MUST match prompt.txt and
+// prompt-custom.txt verbatim — guarded by tests/invariants.test.js.
+const minorPolicySection = '- Minor findings: post ONLY high-confidence Minor findings, consolidated into a single roll-up comment in the format described below. Include at most %MINORLIMIT% Minor items, prioritized by impact, and silently drop the remainder.\n- Nit findings and low-confidence speculation: never post.\n\nMinor roll-up format: post ONE general PR-level comment (Status \'Active\') that starts with the heading \'**Minor suggestions**\', followed by exactly one bullet line per item in this form:\n\n- path/to/file.ext:123 — one-sentence description and suggested fix.\n\nKeep every bullet under thirty words. Do NOT include code blocks, multi-paragraph explanations, or per-item headings in the roll-up. If no Minor findings qualify, do not post a roll-up comment at all.';
+
+// Replacement used when maxMinorIssues is 0
+const minorPolicyDisabled = '- Minor findings, Nit findings, and low-confidence speculation: never post any of these. This review is configured to surface ONLY Critical and Major findings.';
+
+//Applies the maxMinorIssues setting to a template-based prompt
+function applyMinorIssueLimit(promptContent: string, maxMinorIssues: string): string {
+    // Normalize line endings so the multi-line section match is EOL-agnostic
+    const normalized = promptContent.replace(/\r\n/g, '\n');
+
+    if (maxMinorIssues === '0') {
+        if (normalized.includes(minorPolicySection)) {
+            return normalized.replace(minorPolicySection, minorPolicyDisabled);
+        }
+        tl.warning('maxMinorIssues is 0 but the expected Minor-findings policy text was not found in the prompt template. ' +
+            'The template may have been edited; update minorPolicySection in index.ts to match. Falling back to numeric substitution.');
+        return normalized.replace(/%MINORLIMIT%/g, '0');
+    }
+
+    return normalized.replace(/%MINORLIMIT%/g, maxMinorIssues);
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -78,23 +150,90 @@ async function run(): Promise<void> {
 
         // Get agent selection and auth inputs
         const useClaudeCode = tl.getBoolInput('useClaudeCode', false);
+        const useCustomModelProvider = tl.getBoolInput('useCustomModelProvider', false);
         const githubPat = tl.getInput('githubPat');
+        const githubHost = tl.getInput('githubHost');
         const anthropicApiKey = tl.getInput('anthropicApiKey');
+        const claudeCodeOAuthToken = tl.getInput('claudeCodeOAuthToken');
         const maxTurns = tl.getInput('maxTurns');
         const maxBudget = tl.getInput('maxBudget');
+        const copilotProviderBaseUrl = tl.getInput('copilotProviderBaseUrl');
+        const copilotProviderType = tl.getInput('copilotProviderType');
+        const copilotProviderApiKey = tl.getInput('copilotProviderApiKey');
+        const model = tl.getInput('model');
+        const reasoningEffort = tl.getInput('reasoningEffort');
 
         // Validate agent-specific auth
+        if (useClaudeCode && useCustomModelProvider) {
+            tl.setResult(tl.TaskResult.Failed,
+                "The 'useClaudeCode' and 'useCustomModelProvider' inputs are mutually exclusive—custom model providers " +
+                'apply only to the GitHub Copilot CLI. Please enable at most one of them.');
+            return;
+        }
+
         if (useClaudeCode) {
-            if (!anthropicApiKey) {
+            if (anthropicApiKey && claudeCodeOAuthToken) {
                 tl.setResult(tl.TaskResult.Failed,
-                    'Anthropic API Key is required when using Claude Code CLI. Please provide the anthropicApiKey input.');
+                    "Both 'anthropicApiKey' and 'claudeCodeOAuthToken' are set. Please provide exactly one — " +
+                    'the API key bills against Anthropic API usage, while the OAuth token bills against a Claude subscription.');
                 return;
+            }
+            if (!anthropicApiKey && !claudeCodeOAuthToken) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'Claude Code CLI requires authentication. Provide either the anthropicApiKey input (Anthropic API billing) ' +
+                    "or the claudeCodeOAuthToken input (Claude subscription billing — generate one by running 'claude setup-token' locally).");
+                return;
+            }
+        } else if (useCustomModelProvider) {
+            // BYOK mode: the Copilot CLI talks directly to the configured provider,
+            // so a GitHub PAT is optional (it only adds GitHub-backed features like code search)
+            if (!copilotProviderBaseUrl) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A provider base URL is required when using a custom model provider. Please provide the copilotProviderBaseUrl input.');
+                return;
+            }
+            if (!copilotProviderType) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A provider type is required when using a custom model provider. Please provide the copilotProviderType input.');
+                return;
+            }
+            if (!model) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'A model is required when using a custom model provider. Please set the model input to a model identifier your provider serves.');
+                return;
+            }
+            const knownProviderTypes = ['openai', 'azure', 'anthropic'];
+            if (!knownProviderTypes.includes(copilotProviderType.toLowerCase())) {
+                tl.warning(`Provider type '${copilotProviderType}' is not one of the documented values (${knownProviderTypes.join(', ')}). ` +
+                    'The Copilot CLI may reject it.');
+            }
+            if (!copilotProviderApiKey) {
+                console.log('No custom provider API key supplied—assuming the provider endpoint does not require authentication.');
             }
         } else {
             if (!githubPat) {
                 tl.setResult(tl.TaskResult.Failed,
                     'GitHub PAT is required when using GitHub Copilot CLI. Please provide the githubPat input.');
                 return;
+            }
+        }
+
+        // Validate reasoning effort per agent — the two CLIs accept different
+        // level sets, and both hard-fail on unrecognized values; catching a typo
+        // here gives a clearer pipeline error than a mid-run CLI failure.
+        if (reasoningEffort) {
+            const copilotEffortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+            const claudeEffortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
+            const validLevels = useClaudeCode ? claudeEffortLevels : copilotEffortLevels;
+            if (!validLevels.includes(reasoningEffort)) {
+                tl.setResult(tl.TaskResult.Failed,
+                    `Invalid reasoningEffort value '${reasoningEffort}' for the ${useClaudeCode ? 'Claude Code' : 'GitHub Copilot'} CLI. ` +
+                    `Valid values: ${validLevels.join(', ')}.`);
+                return;
+            }
+            if (useCustomModelProvider) {
+                tl.warning('reasoningEffort may be rejected when using a custom model provider — the Copilot API is known to ' +
+                    'reject reasoning parameters for BYOK models. Remove the reasoningEffort input if the review fails.');
             }
         }
 
@@ -174,7 +313,6 @@ async function run(): Promise<void> {
         // Get optional inputs
         let pullRequestId = tl.getInput('pullRequestId');
         const timeoutMinutes = parseInt(tl.getInput('timeout') || '15', 10);
-        const model = tl.getInput('model');
         const promptFile = tl.getInput('promptFile');
         const prompt = tl.getInput('prompt');
         const promptRaw = tl.getInput('promptRaw');
@@ -182,6 +320,72 @@ async function run(): Promise<void> {
         const includeWorkItems = tl.getBoolInput('includeWorkItems', false);
         const diffOnlyReview = tl.getBoolInput('diffOnlyReview', false);
         const publishPromptArtifacts = tl.getBoolInput('publishPromptArtifacts', false);
+        // Default 'all': the agent has resolved addressed human threads since the
+        // feature landed (issue #3), so existing users expect that behavior.
+        // 'agentOnly' is the opt-out for teams that want human threads untouched.
+        const resolveThreads = tl.getInput('resolveThreads') || 'all';
+        const suppressPositiveFeedback = tl.getBoolInput('suppressPositiveFeedback', false);
+        const maxMinorIssues = tl.getInput('maxMinorIssues') || '5';
+
+        // Fail fast on a typo'd value — falling back silently would change
+        // which PR threads the agent is allowed to resolve
+        if (resolveThreads !== 'agentOnly' && resolveThreads !== 'all') {
+            tl.setResult(tl.TaskResult.Failed,
+                `Invalid resolveThreads value '${resolveThreads}'. Valid values: 'agentOnly', 'all'.`);
+            return;
+        }
+
+        // Must be a non-negative integer — it is substituted into the prompt's
+        // Minor-findings posting policy (0 means suppress Minor findings)
+        if (!/^\d+$/.test(maxMinorIssues)) {
+            tl.setResult(tl.TaskResult.Failed,
+                `Invalid maxMinorIssues value '${maxMinorIssues}'. Provide a non-negative integer (0 suppresses Minor findings).`);
+            return;
+        }
+
+        // Jira work item integration (issue #53): when configured, linked work
+        // items are fetched from Jira Cloud instead of Azure Boards. The three
+        // core inputs are all-or-nothing.
+        const jiraBaseUrl = tl.getInput('jiraBaseUrl');
+        const jiraEmail = tl.getInput('jiraEmail');
+        const jiraApiToken = tl.getInput('jiraApiToken');
+        const jiraProjectKeys = tl.getInput('jiraProjectKeys');
+
+        const missingJiraInputs = [
+            ['jiraBaseUrl', jiraBaseUrl],
+            ['jiraEmail', jiraEmail],
+            ['jiraApiToken', jiraApiToken]
+        ].filter(([, value]) => !value).map(([name]) => name);
+        // Jira config is only validated and used when work items are enabled at
+        // all — stale Jira inputs must not fail a review that has work-item
+        // fetching turned off.
+        const useJiraWorkItems = includeWorkItems && missingJiraInputs.length === 0;
+
+        if (includeWorkItems && missingJiraInputs.length > 0 && missingJiraInputs.length < 3) {
+            tl.setResult(tl.TaskResult.Failed,
+                `Jira integration requires jiraBaseUrl, jiraEmail, and jiraApiToken together. Missing: ${missingJiraInputs.join(', ')}.`);
+            return;
+        }
+        if (!includeWorkItems && missingJiraInputs.length < 3) {
+            console.log('Note: Jira inputs are configured but includeWorkItems is disabled; they will be ignored.');
+        }
+
+        // Normalize the Jira base URL: default to https and strip trailing slashes
+        let normalizedJiraBaseUrl = '';
+        if (useJiraWorkItems) {
+            normalizedJiraBaseUrl = jiraBaseUrl!.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(normalizedJiraBaseUrl)) {
+                normalizedJiraBaseUrl = `https://${normalizedJiraBaseUrl}`;
+            }
+            // Basic auth sends the email and API token with every request, so an
+            // explicit http:// URL would transmit credentials in cleartext. Jira
+            // Cloud is HTTPS-only, so there is no legitimate http:// target.
+            if (/^http:\/\//i.test(normalizedJiraBaseUrl)) {
+                tl.setResult(tl.TaskResult.Failed,
+                    'jiraBaseUrl must use HTTPS. Jira Cloud authentication sends credentials with every request, so a plain http:// URL is not allowed.');
+                return;
+            }
+        }
 
         // filePath inputs return the working directory path when not set, so check both
         // the input value and that the path actually points to a real file.
@@ -203,6 +407,9 @@ async function run(): Promise<void> {
         console.log(`${agentName} Code Review Task`);
         console.log('='.repeat(60));
         console.log(`Agent: ${agentName}`);
+        if (useCustomModelProvider) {
+            console.log(`Model Provider: custom (${copilotProviderType})`);
+        }
         console.log(`Collection URI: ${resolvedCollectionUri}`);
         console.log(`Project: ${project}`);
         console.log(`Repository: ${repository}`);
@@ -211,13 +418,46 @@ async function run(): Promise<void> {
         if (model) {
             console.log(`Model: ${model}`);
         }
+        if (reasoningEffort) {
+            console.log(`Reasoning Effort: ${reasoningEffort}`);
+        }
+        if (useJiraWorkItems) {
+            console.log(`Work Item Source: Jira (${normalizedJiraBaseUrl})`);
+        }
         console.log('='.repeat(60));
 
-        // Set environment variables for PowerShell scripts
+        // Set environment variables for the CLI agent
         if (useClaudeCode) {
-            process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
+            if (claudeCodeOAuthToken) {
+                // Long-lived subscription token generated via `claude setup-token`
+                process.env['CLAUDE_CODE_OAUTH_TOKEN'] = claudeCodeOAuthToken;
+                console.log('Using Claude Code OAuth token (subscription billing) for authentication.');
+            } else {
+                process.env['ANTHROPIC_API_KEY'] = anthropicApiKey!;
+                console.log('Using Anthropic API key (API usage billing) for authentication.');
+            }
         } else {
-            process.env['GH_TOKEN'] = githubPat!;
+            if (useCustomModelProvider) {
+                // The Copilot CLI reads these to route model requests to a BYOK provider
+                // instead of GitHub-hosted models
+                process.env['COPILOT_PROVIDER_BASE_URL'] = copilotProviderBaseUrl!;
+                process.env['COPILOT_PROVIDER_TYPE'] = copilotProviderType!;
+                if (copilotProviderApiKey) {
+                    process.env['COPILOT_PROVIDER_API_KEY'] = copilotProviderApiKey;
+                }
+            }
+            // Optional in BYOK mode: a PAT additionally enables GitHub-backed features (e.g. code search)
+            if (githubPat) {
+                process.env['GH_TOKEN'] = githubPat;
+            }
+            // GitHub Enterprise (e.g. subdomain.ghe.com): the Copilot CLI honors
+            // GH_HOST when validating the PAT, so enterprise-scoped tokens
+            // authenticate against the right instance (issue #59)
+            if (githubHost) {
+                const normalizedHost = normalizeGitHubHost(githubHost);
+                process.env['GH_HOST'] = normalizedHost;
+                console.log(`Using GitHub Enterprise host: ${normalizedHost}`);
+            }
         }
         process.env['AZUREDEVOPS_TOKEN'] = azureDevOpsToken;
         process.env['AZUREDEVOPS_AUTH_TYPE'] = azureDevOpsAuthType;
@@ -389,7 +629,46 @@ async function run(): Promise<void> {
         }
 
         // Step 4: Fetch linked work item details (optional)
-        if (includeWorkItems) {
+        // Self-hosted agents can reuse the workspace between runs, and the fetch
+        // below only (re)creates Work_Item_Details.txt on a successful lookup. A
+        // leftover file from an earlier run would silently attach unrelated work
+        // item context to this review, so clear it up front.
+        const previousWorkItemDetails = path.join(workingDirectory, 'Work_Item_Details.txt');
+        if (fs.existsSync(previousWorkItemDetails)) {
+            fs.unlinkSync(previousWorkItemDetails);
+            console.log('Removed Work_Item_Details.txt left over from a previous run.');
+        }
+
+        if (includeWorkItems && useJiraWorkItems) {
+            // Jira replaces Azure Boards as the work item source (issue #53)
+            console.log('\n[Step 4/5] Fetching linked Jira issue details...');
+            const prMetadataFile = path.join(workingDirectory, 'PR_Metadata.json');
+
+            if (fs.existsSync(prMetadataFile)) {
+                const jiraScript = path.join(scriptsDir, 'Get-JiraWorkItems.ps1');
+                const workItemDetailsOutput = path.join(workingDirectory, 'Work_Item_Details.txt');
+                const jiraArgs = [
+                    `-BaseUrl "${normalizedJiraBaseUrl}"`,
+                    `-Email "${jiraEmail}"`,
+                    `-ApiToken "${jiraApiToken}"`,
+                    `-PrMetadataFile "${prMetadataFile}"`,
+                    `-OutputFile "${workItemDetailsOutput}"`
+                ];
+                if (jiraProjectKeys) {
+                    jiraArgs.push(`-ProjectKeys "${jiraProjectKeys}"`);
+                }
+
+                try {
+                    await runPowerShellScript(jiraScript, jiraArgs);
+                    console.log(`Jira issue details saved to: ${workItemDetailsOutput}`);
+                } catch (err) {
+                    console.log('Warning: Failed to fetch Jira issue details. Continuing without work item context.');
+                    console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            } else {
+                console.log('PR metadata file not found. Skipping Jira issue detail fetch.');
+            }
+        } else if (includeWorkItems) {
             console.log('\n[Step 4/5] Fetching linked work item details...');
             const workItemIdsFile = path.join(workingDirectory, 'Work_Item_Ids.txt');
 
@@ -494,6 +773,20 @@ async function run(): Promise<void> {
             console.log('Using default prompt.');
         }
 
+        // Append administrator-configured behavior directives (thread resolution
+        // scope, positive feedback suppression) to template-based prompts.
+        // Raw prompts are contractually passed as-is, so they are never modified.
+        if (!promptRaw && !isPromptFileRawSet && promptFilePath) {
+            // Apply the Minor-findings cap to the template's posting policy
+            // (see the Evaluation Protocol section in the templates)
+            const promptWithDirectives = applyMinorIssueLimit(fs.readFileSync(promptFilePath, 'utf8'), maxMinorIssues)
+                + buildReviewDirectives(resolveThreads, suppressPositiveFeedback);
+            const directivePromptPath = path.join(workingDirectory, '_directive_prompt.txt');
+            fs.writeFileSync(directivePromptPath, promptWithDirectives, 'utf8');
+            promptFilePath = directivePromptPath;
+            console.log(`Applied review behavior directives (resolveThreads: ${resolveThreads}, suppressPositiveFeedback: ${suppressPositiveFeedback}, maxMinorIssues: ${maxMinorIssues}).`);
+        }
+
         // When using Claude Code, replace the Copilot attribution tag in the prompt
         if (useClaudeCode && promptFilePath) {
             let promptContent = fs.readFileSync(promptFilePath, 'utf8');
@@ -524,7 +817,7 @@ async function run(): Promise<void> {
                     currentPrompt = currentPrompt.replace(originalGuidelines, replacedGuidelines);
                 }
 
-                const originalOverview = 'The details of a pull request for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for broad context on the pull request. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
+                const originalOverview = 'The details of the PR for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for further context. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. The Iteration_Details.txt file also lists the full commit SHAs for the latest iteration: the Source Commit contains the pull request\'s changes (the new code), and the Target Commit is the tip of the base branch it will merge into (the old code). When using git to inspect the changes, always diff from base to PR branch using the merge-base form—git diff <target-commit>...<source-commit>—so that additions in the output represent code introduced by this pull request and deletions represent code it removes. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
                 const replacedOverview = 'The PR details, iteration information, and code diff are all provided inline at the end of this prompt. Use this information to understand the context and review the code changes. Do NOT attempt to read files from disk or run git commands to explore the repository—all relevant context is embedded below.';
                 if (currentPrompt.includes(originalOverview)) {
                     currentPrompt = currentPrompt.replace(originalOverview, replacedOverview);
@@ -608,6 +901,7 @@ async function run(): Promise<void> {
                 path.join(workingDirectory, 'Target_Commit.txt'),
                 path.join(workingDirectory, 'Work_Item_Ids.txt'),
                 path.join(workingDirectory, 'Work_Item_Details.txt'),
+                path.join(workingDirectory, 'PR_Metadata.json'),
                 promptFilePath,
             ];
 
@@ -625,9 +919,9 @@ async function run(): Promise<void> {
         // Run CLI agent with timeout
         const timeoutMs = timeoutMinutes * 60 * 1000;
         if (useClaudeCode) {
-            await runClaudeCodeCli(promptFilePath, model, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
+            await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
         } else {
-            await runCopilotCli(promptFilePath, model, workingDirectory, timeoutMs, diffOnlyActive);
+            await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive);
         }
 
         console.log('\n' + '='.repeat(60));
@@ -653,53 +947,89 @@ async function checkCopilotCli(): Promise<boolean> {
     }
 }
 
-async function installCopilotCli(): Promise<void> {
+/**
+ * Runs a single installer command to completion, resolving on exit code 0.
+ */
+function runInstallerOnce(command: string, args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
-        let command: string;
-        let args: string[];
-
-        if (isWindows()) {
-            console.log('Installing GitHub Copilot CLI via winget...');
-            command = 'winget';
-            args = ['install', 'GitHub.Copilot', '--silent', '--accept-package-agreements', '--accept-source-agreements'];
-        } else {
-            console.log('Installing GitHub Copilot CLI via official install script...');
-            // Use the official GitHub install script which downloads a pre-built binary
-            // The script installs to $HOME/.local/bin by default for non-root users
-            // Pass the full command as a single string when using shell: true
-            command = 'curl -fsSL https://gh.io/copilot-install | bash';
-            args = [];
-        }
-        
-        const installProcess = child_process.spawn(
-            command,
-            args,
-            {
-                shell: true,
-                stdio: 'inherit'
-            }
-        );
+        const installProcess = child_process.spawn(command, args, {
+            shell: true,
+            stdio: 'inherit'
+        });
 
         installProcess.on('close', (code: number | null) => {
             if (code === 0) {
-                console.log('GitHub Copilot CLI installed successfully.');
-                // On Linux, add the install location to PATH for the current process
-                if (!isWindows()) {
-                    const homeDir = process.env['HOME'] || '';
-                    const localBin = path.join(homeDir, '.local', 'bin');
-                    process.env['PATH'] = `${localBin}:${process.env['PATH']}`;
-                    console.log(`Added ${localBin} to PATH.`);
-                }
                 resolve();
             } else {
-                reject(new Error(`Failed to install GitHub Copilot CLI. Exit code: ${code}`));
+                reject(new Error(`Exit code: ${code}`));
             }
         });
 
         installProcess.on('error', (err: Error) => {
-            reject(new Error(`Failed to install GitHub Copilot CLI: ${err.message}`));
+            reject(err);
         });
     });
+}
+
+/**
+ * Runs an installer command, retrying with exponential backoff on failure.
+ * CLI installs regularly hit transient CDN errors — e.g. GitHub returning 504
+ * on release assets (issue #57) — so failed attempts are usually worth
+ * retrying before failing the whole task.
+ */
+async function runInstallerWithRetry(
+    description: string,
+    command: string,
+    args: string[],
+    maxAttempts: number = 3
+): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            await runInstallerOnce(command, args);
+            return;
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (attempt === maxAttempts) {
+                throw new Error(`${description} failed after ${maxAttempts} attempts. Last error: ${message}`);
+            }
+            const delaySeconds = Math.pow(2, attempt);
+            console.log(`${description} failed (attempt ${attempt} of ${maxAttempts}): ${message}`);
+            console.log(`Retrying in ${delaySeconds} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        }
+    }
+}
+
+async function installCopilotCli(): Promise<void> {
+    let command: string;
+    let args: string[];
+
+    if (isWindows()) {
+        console.log('Installing GitHub Copilot CLI via winget...');
+        command = 'winget';
+        args = ['install', 'GitHub.Copilot', '--silent', '--accept-package-agreements', '--accept-source-agreements'];
+    } else {
+        console.log('Installing GitHub Copilot CLI via official install script...');
+        // Use the official GitHub install script which downloads a pre-built binary
+        // The script installs to $HOME/.local/bin by default for non-root users
+        // Pass the full command as a single string when using shell: true.
+        // curl's --retry covers transient failures fetching the install script
+        // itself; the outer retry loop covers failures inside the piped script,
+        // e.g. 504s downloading the release tarball (issue #57).
+        command = 'curl -fsSL --retry 3 --retry-all-errors https://gh.io/copilot-install | bash';
+        args = [];
+    }
+
+    await runInstallerWithRetry('GitHub Copilot CLI installation', command, args);
+
+    console.log('GitHub Copilot CLI installed successfully.');
+    // On Linux, add the install location to PATH for the current process
+    if (!isWindows()) {
+        const homeDir = process.env['HOME'] || '';
+        const localBin = path.join(homeDir, '.local', 'bin');
+        process.env['PATH'] = `${localBin}:${process.env['PATH']}`;
+        console.log(`Added ${localBin} to PATH.`);
+    }
 }
 
 async function runPowerShellScript(scriptPath: string, args: string[]): Promise<void> {
@@ -727,12 +1057,15 @@ async function runPowerShellScript(scriptPath: string, args: string[]): Promise<
     });
 }
 
-async function runCopilotCli(promptFilePath: string, model: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
+async function runCopilotCli(promptFilePath: string, model: string | undefined, reasoningEffort: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
         // Build PowerShell command that reads prompt file and passes content to copilot CLI
         let copilotFlags = `--allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'`;
         if (model) {
             copilotFlags += ` --model ${model}`;
+        }
+        if (reasoningEffort) {
+            copilotFlags += ` --reasoning-effort ${reasoningEffort}`;
         }
 
         // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
@@ -797,46 +1130,27 @@ async function checkClaudeCodeCli(): Promise<boolean> {
 }
 
 async function installClaudeCodeCli(): Promise<void> {
-    return new Promise((resolve, reject) => {
-        console.log('Installing Claude Code CLI via npm...');
-        const installProcess = child_process.spawn(
-            'npm',
-            ['install', '-g', '@anthropic-ai/claude-code'],
-            {
-                shell: true,
-                stdio: 'inherit'
-            }
-        );
+    console.log('Installing Claude Code CLI via npm...');
+    await runInstallerWithRetry('Claude Code CLI installation', 'npm', ['install', '-g', '@anthropic-ai/claude-code']);
 
-        installProcess.on('close', (code: number | null) => {
-            if (code === 0) {
-                console.log('Claude Code CLI installed successfully.');
-                // Ensure npm global bin is on PATH for the current process
-                const npmBinResult = child_process.spawnSync('npm', ['bin', '-g'], {
-                    encoding: 'utf8',
-                    shell: true
-                });
-                if (npmBinResult.status === 0 && npmBinResult.stdout.trim()) {
-                    const npmGlobalBin = npmBinResult.stdout.trim();
-                    const pathSep = isWindows() ? ';' : ':';
-                    process.env['PATH'] = `${npmGlobalBin}${pathSep}${process.env['PATH']}`;
-                    console.log(`Added ${npmGlobalBin} to PATH.`);
-                }
-                resolve();
-            } else {
-                reject(new Error(`Failed to install Claude Code CLI. Exit code: ${code}`));
-            }
-        });
-
-        installProcess.on('error', (err: Error) => {
-            reject(new Error(`Failed to install Claude Code CLI: ${err.message}`));
-        });
+    console.log('Claude Code CLI installed successfully.');
+    // Ensure npm global bin is on PATH for the current process
+    const npmBinResult = child_process.spawnSync('npm', ['bin', '-g'], {
+        encoding: 'utf8',
+        shell: true
     });
+    if (npmBinResult.status === 0 && npmBinResult.stdout.trim()) {
+        const npmGlobalBin = npmBinResult.stdout.trim();
+        const pathSep = isWindows() ? ';' : ':';
+        process.env['PATH'] = `${npmGlobalBin}${pathSep}${process.env['PATH']}`;
+        console.log(`Added ${npmGlobalBin} to PATH.`);
+    }
 }
 
 async function runClaudeCodeCli(
     promptFilePath: string,
     model: string | undefined,
+    reasoningEffort: string | undefined,
     workingDirectory: string,
     timeoutMs: number,
     maxTurns: string | undefined,
@@ -856,6 +1170,10 @@ async function runClaudeCodeCli(
 
         if (model) {
             claudeFlags += ` --model ${model}`;
+        }
+        if (reasoningEffort) {
+            // Claude Code uses --effort (no --reasoning-effort alias)
+            claudeFlags += ` --effort ${reasoningEffort}`;
         }
         if (maxTurns) {
             claudeFlags += ` --max-turns ${maxTurns}`;
@@ -960,4 +1278,11 @@ async function runClaudeCodeCli(
     });
 }
 
-run();
+// Run only when executed as the task entry point (node index.js). Importing
+// this module (e.g. from tests) must not kick off a task run.
+if (require.main === module) {
+    run();
+}
+
+// Exported for tests
+export { runInstallerWithRetry, normalizeGitHubHost, buildReviewDirectives, applyMinorIssueLimit };

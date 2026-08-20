@@ -1,11 +1,10 @@
 {
     "name": "copilot-code-review-task",
-    "version": "1.5.4",
+    "version": "1.6.0",
     "description": "Azure DevOps extension for automated code reviews using agentic AI tools",
     "main": "index.js",
     "scripts": {
-        "build": "tsc",
-        "test": "mocha tests/_suite.js"
+        "build": "tsc"
     },
     "repository": {
         "type": "git",

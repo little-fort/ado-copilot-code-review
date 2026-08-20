@@ -1,10 +1,13 @@
 {
     "name": "ado-copilot-code-review",
-    "version": "1.5.4",
+    "version": "1.6.0",
     "description": "Azure DevOps extension for automated code reviews using agentic AI tools",
     "scripts": {
         "build": "cd CopilotCodeReviewV1 && npm run build",
         "build:dev": "cd CopilotCodeReviewV1 && npm run build",
+        "test": "mocha tests/**/*.test.js",
+        "test:ps": "pwsh -NoProfile -File tests/powershell/Invoke-Tests.ps1",
+        "prepackage:prod": "node -e \"try { require('fs').unlinkSync('CopilotCodeReviewV1/.taskkey') } catch {}\"",
         "package:prod": "tfx extension create --manifest-globs vss-extension.json",
         "package:dev": "pwsh -File build-dev.ps1"
     },
@@ -20,5 +23,8 @@
         "ai"
     ],
     "author": "LittleFortSoftware",
-    "license": "GPL-3.0"
+    "license": "GPL-3.0",
+    "devDependencies": {
+        "mocha": "^11.8.0"
+    }
 }

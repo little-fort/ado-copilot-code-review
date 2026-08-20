@@ -35,6 +35,10 @@ npm run package:dev               # Creates dev .vsix from vss-extension.dev.jso
 
 **Version Sync**: Update version in THREE places: `package.json`, `CopilotCodeReviewV1/package.json`, `CopilotCodeReviewV1/task.json`, and `vss-extension.json`.
 
+## Git Guidelines
+
+When generating a commit message, the first line should be a single line summary with no more than 70 characters. The second line should be blank. A summary of changes should start on the third line, formatted as a list.
+
 ## Code Patterns
 
 ### Authentication Handling

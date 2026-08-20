@@ -1,0 +1,153 @@
+/**
+ * Repo-level invariant checks.
+ *
+ * These tests encode consistency rules that span multiple files and would
+ * otherwise only be enforced by contributor vigilance:
+ *
+ *   1. The extension version must match across all four release files.
+ *   2. String constants in index.ts that rewrite the prompt templates at
+ *      runtime must match the template text exactly (they are matched with
+ *      String.includes(), so any drift silently disables the rewrite).
+ *   3. The dev task definition must stay behaviorally identical to prod
+ *      (only identity fields like id/name/version are allowed to differ).
+ *
+ * Run with `npm test` from the repo root. No build step is required — these
+ * tests read source files directly.
+ */
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const repoRoot = path.join(__dirname, '..');
+
+function readJson(relPath) {
+    return JSON.parse(fs.readFileSync(path.join(repoRoot, relPath), 'utf8'));
+}
+
+function readText(relPath) {
+    return fs.readFileSync(path.join(repoRoot, relPath), 'utf8');
+}
+
+/**
+ * Extracts the value of a `const <name> = '...';` single-quoted string literal
+ * from TypeScript source, unescaping any \' sequences. Throws if the constant
+ * is missing so a rename/refactor in index.ts forces this test to be updated
+ * rather than silently passing.
+ */
+function extractStringConstant(source, name) {
+    const re = new RegExp(`const ${name} = '((?:[^'\\\\]|\\\\.)*)';`);
+    const match = source.match(re);
+    assert.ok(match,
+        `Could not find "const ${name} = '...';" in index.ts. ` +
+        'If the constant was renamed or converted to a template literal, update tests/invariants.test.js to match.');
+    // Unescape \n and \' — the only escapes the tracked constants use
+    return match[1].replace(/\\n/g, '\n').replace(/\\'/g, "'");
+}
+
+describe('Version sync', () => {
+    // Release rule: the version must be updated in four places (see CLAUDE.md).
+    it('all four release files declare the same version', () => {
+        const rootVersion = readJson('package.json').version;
+        const taskPackageVersion = readJson('CopilotCodeReviewV1/package.json').version;
+        const manifestVersion = readJson('vss-extension.json').version;
+
+        const taskJsonVersion = readJson('CopilotCodeReviewV1/task.json').version;
+        const taskVersion = `${taskJsonVersion.Major}.${taskJsonVersion.Minor}.${taskJsonVersion.Patch}`;
+
+        const versions = {
+            'package.json': rootVersion,
+            'CopilotCodeReviewV1/package.json': taskPackageVersion,
+            'CopilotCodeReviewV1/task.json': taskVersion,
+            'vss-extension.json': manifestVersion,
+        };
+
+        const distinct = new Set(Object.values(versions));
+        assert.equal(distinct.size, 1,
+            `Version mismatch across release files: ${JSON.stringify(versions, null, 2)}`);
+    });
+});
+
+describe('Prompt template lockstep', () => {
+    // Diff-only mode rewrites the prompt by replacing exact sentences from the
+    // templates (see the diffOnlyReview block in index.ts). If the template text
+    // and the constants drift apart, includes() stops matching and the rewrite
+    // silently degrades, so both sides must be updated together.
+    const indexTs = readText('CopilotCodeReviewV1/index.ts');
+    const promptDefault = readText('CopilotCodeReviewV1/scripts/prompt.txt');
+    const promptCustom = readText('CopilotCodeReviewV1/scripts/prompt-custom.txt');
+
+    it('originalOverview matches the Overview paragraph in both templates', () => {
+        const overview = extractStringConstant(indexTs, 'originalOverview');
+        assert.ok(promptDefault.includes(overview),
+            'originalOverview in index.ts no longer appears verbatim in prompt.txt — update them together.');
+        assert.ok(promptCustom.includes(overview),
+            'originalOverview in index.ts no longer appears verbatim in prompt-custom.txt — update them together.');
+    });
+
+    it('originalGuidelines matches the Guidelines sentence in prompt.txt', () => {
+        const guidelines = extractStringConstant(indexTs, 'originalGuidelines');
+        assert.ok(promptDefault.includes(guidelines),
+            'originalGuidelines in index.ts no longer appears verbatim in prompt.txt — update them together.');
+    });
+
+    it('the Minor-findings policy section in index.ts matches both templates', () => {
+        // The maxMinorIssues=0 path replaces this exact section with a
+        // never-post rule; if the template text drifts from the constant, the
+        // replacement silently degrades to numeric substitution
+        const section = extractStringConstant(indexTs, 'minorPolicySection');
+        assert.ok(section.includes('%MINORLIMIT%'),
+            'minorPolicySection in index.ts no longer contains the %MINORLIMIT% placeholder.');
+
+        const normalizedDefault = promptDefault.replace(/\r\n/g, '\n');
+        const normalizedCustom = promptCustom.replace(/\r\n/g, '\n');
+        assert.ok(normalizedDefault.includes(section),
+            'minorPolicySection in index.ts no longer appears verbatim in prompt.txt — update them together.');
+        assert.ok(normalizedCustom.includes(section),
+            'minorPolicySection in index.ts no longer appears verbatim in prompt-custom.txt — update them together.');
+    });
+
+    it('both templates carry the Copilot attribution tag used for Claude Code substitution', () => {
+        // index.ts swaps 'Generated by GitHub Copilot' for 'Generated by Claude Code'
+        // when useClaudeCode is enabled; the swap silently no-ops if the tag changes.
+        const tag = 'Generated by GitHub Copilot';
+        assert.ok(promptDefault.includes(tag),
+            `prompt.txt no longer contains the attribution tag '${tag}' that index.ts rewrites for Claude Code.`);
+        assert.ok(promptCustom.includes(tag),
+            `prompt-custom.txt no longer contains the attribution tag '${tag}' that index.ts rewrites for Claude Code.`);
+    });
+});
+
+describe('Dev/prod task definition parity', () => {
+    // CopilotCodeReviewDevV1 exists so a dev build can be installed alongside
+    // prod. Only its identity (id, name, labels, version) should differ; the
+    // behavioral definition must stay in sync or dev testing stops representing
+    // what ships.
+    const prodTask = readJson('CopilotCodeReviewV1/task.json');
+    const devTask = readJson('CopilotCodeReviewDevV1/task.json');
+
+    it('declares the same inputs in the same order', () => {
+        const prodNames = prodTask.inputs.map(i => i.name);
+        const devNames = devTask.inputs.map(i => i.name);
+        assert.deepEqual(devNames, prodNames,
+            'Dev and prod task.json declare different input lists.');
+    });
+
+    it('defines each input identically', () => {
+        const devByName = new Map(devTask.inputs.map(i => [i.name, i]));
+        for (const prodInput of prodTask.inputs) {
+            const devInput = devByName.get(prodInput.name);
+            assert.deepEqual(devInput, prodInput,
+                `Input '${prodInput.name}' differs between dev and prod task.json.`);
+        }
+    });
+
+    it('matches on execution targets and agent requirements', () => {
+        assert.deepEqual(devTask.execution, prodTask.execution,
+            'Execution block differs between dev and prod task.json.');
+        assert.deepEqual(devTask.restrictions, prodTask.restrictions,
+            'Restrictions block differs between dev and prod task.json.');
+        assert.equal(devTask.minimumAgentVersion, prodTask.minimumAgentVersion,
+            'minimumAgentVersion differs between dev and prod task.json.');
+    });
+});

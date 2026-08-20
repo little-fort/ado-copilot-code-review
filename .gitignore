@@ -6,6 +6,8 @@ node_modules/
 *.js.map
 *.d.ts
 !jest.config.js
+# Test sources are hand-written JS, not build output
+!tests/**/*.js
 
 # Package outputs
 *.vsix
@@ -29,6 +31,9 @@ test-results.xml
 # Temporary files
 *.tmp
 *.temp
+# Per-run secret-encryption key written by azure-pipelines-task-lib whenever
+# the task (or a test importing it) loads locally — ephemeral, never commit
+.taskkey
 PR_Details.txt
 Iteration_Details.txt
 # Dev task folder (built files copied at package time)
@@ -37,3 +42,4 @@ CopilotCodeReviewDevV1/*
 tmpclaude*
 CLAUDE.md
 .claude/*
+/.vs

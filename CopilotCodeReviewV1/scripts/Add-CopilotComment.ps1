@@ -146,3 +146,10 @@ if ($FilePath) {
 }
 
 & "$scriptDir\Add-AzureDevOpsPRComment.ps1" @params
+
+# The call operator runs the child script in-process: its 'exit' sets
+# $LASTEXITCODE here without terminating this script, so failures must be
+# propagated explicitly or the calling agent sees a successful exit (issue #56)
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

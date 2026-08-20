@@ -23,7 +23,7 @@ This extension supports Windows and Linux Azure DevOps agents. Compatible with M
 
 - **AI Agent** (one of the following):
   - **GitHub Copilot** (default): An active GitHub Copilot subscription and a GitHub PAT with Copilot access permissions
-  - **Claude Code**: An Anthropic API key with access to Claude Code
+  - **Claude Code**: An Anthropic API key with access to Claude Code, or a Claude subscription OAuth token generated with `claude setup-token`
 - **Azure DevOps Authentication** (one of the following):
   - **System Access Token (Recommended)**: Use the pipeline's built-in OAuth token for Azure DevOps Services. Must grant permissions to Build Service Identity (see below).
   - **Personal Access Token**: Required for Azure DevOps Server (on-prem) or if you prefer explicit token management. Needs permissions to read pull requests, write comments, and read code.
@@ -83,7 +83,7 @@ steps:
 
 #### Using Claude Code CLI
 
-To use Claude Code instead of GitHub Copilot, enable `useClaudeCode` and provide an Anthropic API key:
+To use Claude Code instead of GitHub Copilot, enable `useClaudeCode` and provide an Anthropic API key (or a Claude Code OAuth token):
 
 ```yaml
 trigger: none
@@ -101,12 +101,14 @@ steps:
     useClaudeCode: true
     anthropicApiKey: '$(ANTHROPIC_API_KEY)'
     useSystemAccessToken: true
-    model: 'claude-sonnet-4-6'
+    model: 'sonnet'
     maxTurns: '50'
     maxBudget: '5.00'
 ```
 
 > **NOTE**: Claude Code CLI is installed automatically via `npm install -g @anthropic-ai/claude-code`. Node.js is available on all Azure DevOps agents. Output is streamed to the pipeline logs in real time.
+
+> **TIP**: To bill reviews against a Claude subscription (Pro/Max/Team/Enterprise) instead of Anthropic API usage, run `claude setup-token` locally to generate a long-lived OAuth token, store it as a secret pipeline variable, and pass it via `claudeCodeOAuthToken` instead of `anthropicApiKey`. Provide one or the other — not both.
 
 #### Set Trigger
 
@@ -175,11 +177,17 @@ steps:
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI (default). |
+| `githubPat` | Conditional | - | GitHub Personal Access Token with Copilot access. Required when using GitHub Copilot CLI with GitHub-hosted models (default). Optional when `useCustomModelProvider` is `true`. |
+| `githubHost` | No | - | GitHub Enterprise hostname (e.g., `subdomain.ghe.com`) for enterprise accounts with data residency (see [GitHub Enterprise Accounts](#github-enterprise-accounts)) |
 | `useClaudeCode` | No | `false` | Use Claude Code CLI (Anthropic) instead of GitHub Copilot CLI |
-| `anthropicApiKey` | Conditional | - | Anthropic API key. Required when `useClaudeCode` is `true`. |
+| `anthropicApiKey` | Conditional | - | Anthropic API key (API usage billing). Provide this **or** `claudeCodeOAuthToken` when `useClaudeCode` is `true`. |
+| `claudeCodeOAuthToken` | Conditional | - | Claude Code OAuth token from `claude setup-token` (subscription billing). Provide this **or** `anthropicApiKey` when `useClaudeCode` is `true`. |
 | `maxTurns` | No | - | Maximum agentic turns for Claude Code CLI |
 | `maxBudget` | No | - | Maximum cost in USD for a Claude Code session |
+| `useCustomModelProvider` | No | `false` | Use a custom model provider (BYOK) with the GitHub Copilot CLI instead of GitHub-hosted models (see [Custom Model Providers](#custom-model-providers)) |
+| `copilotProviderBaseUrl` | Conditional | - | Base URL of the custom provider's API endpoint. Required when `useCustomModelProvider` is `true`. |
+| `copilotProviderType` | Conditional | - | Custom provider type: `openai`, `azure`, or `anthropic`. Required when `useCustomModelProvider` is `true`. |
+| `copilotProviderApiKey` | No | - | API key for the custom provider. Optional for providers that do not require authentication (e.g., a local Ollama instance). |
 | `useSystemAccessToken` | No | `false` | Use pipeline's System.AccessToken instead of a PAT (recommended for Azure DevOps Services) |
 | `azureDevOpsPat` | Conditional | - | Azure DevOps PAT for API access. Required if `useSystemAccessToken` is `false`. |
 | `organization` | No | `$(System.CollectionUri)` (inferred) | Azure DevOps organization name for cloud-hosted teams |
@@ -188,48 +196,102 @@ steps:
 | `repository` | No | `$(Build.Repository.Name)` | Repository name |
 | `pullRequestId` | No | `$(System.PullRequest.PullRequestId)` | PR ID (auto-detected in PR builds) |
 | `timeout` | No | `15` | Timeout in minutes |
-| `model` | No | - | Preferred model to use (see valid options below) |
+| `model` | Conditional | - | Preferred model to use (see valid options below). Required when `useCustomModelProvider` is `true`. |
+| `reasoningEffort` | No | model default | Reasoning effort level to balance review depth against token spend. Copilot: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Claude Code: `low`, `medium`, `high`, `xhigh`, `max`. If the selected model doesn't support the requested level, the CLI fails with a clear error rather than silently ignoring it. |
 | `promptFile` | No | - | Path to custom prompt file |
 | `prompt` | No | - | Inline custom prompt (overrides `promptFile`) |
 | `promptFileRaw` | No | - | _(Advanced)_ Path to custom prompt file that will be passed as-is with no supportive direction. |
 | `promptRaw` | No | - | _(Advanced)_ Inline custom prompt that will be passed as-is with no supportive direction. |
 | `authors` | No | - | Comma-separated list of email addresses to filter reviews (see below) |
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
+| `jiraBaseUrl` | No | - | Jira Cloud site URL (e.g., `https://yourorg.atlassian.net`). With `jiraEmail` + `jiraApiToken`, work items are fetched from Jira instead of Azure Boards (see [Jira Work Items](#jira-work-items)) |
+| `jiraEmail` | Conditional | - | Atlassian account email for the API token. Required when `jiraBaseUrl` is set. |
+| `jiraApiToken` | Conditional | - | Jira Cloud API token. Required when `jiraBaseUrl` is set. |
+| `jiraProjectKeys` | No | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) to restrict issue key lookup |
+| `resolveThreads` | No | `all` | Which existing comment threads the agent may resolve: `all` or `agentOnly` (see [Review Behavior Options](#review-behavior-options)) |
+| `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
+| `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
 ### Copilot Models
 
-As of May 2026, here are the model options supported by the GitHub Copilot CLI:
+As of August 2026 (Copilot CLI 1.0.80), here are the model options supported by the GitHub Copilot CLI:
 
-- `claude-sonnet-4.6` (default)
-- `claude-sonnet-4.5`
+- `auto` — lets Copilot route each request to the most efficient model for the task
+- `claude-sonnet-5` (default when no model is specified)
+- `claude-fable-5`
+- `claude-opus-5`
+- `claude-opus-4.8`
+- `claude-opus-4.8-fast` (preview)
+- `claude-opus-4.7`
+- `claude-sonnet-4.6` †
+- `claude-opus-4.6` †
+- `claude-sonnet-4.5` †
+- `claude-opus-4.5` †
 - `claude-haiku-4.5`
-- `claude-opus-4.5`
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+- `gpt-5.5`
 - `gpt-5.4`
 - `gpt-5.4-mini`
 - `gpt-5.3-codex`
-- `gpt-5.2-codex` 
-- `gpt-5.2`
 - `gpt-5-mini`
-- `gpt-4.1`
-- `gemini-3-pro-preview`
+- `gemini-3.7-flash`
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3.1-pro-preview` † (public preview)
+- `grok-4.5`
+- `kimi-k3`
+- `kimi-k2.7-code`
+- `mai-code-1-flash-picker` (MAI-Code-1-Flash)
+
+† Scheduled for [deprecation on September 1, 2026](https://github.blog/changelog/2026-07-31-upcoming-august-2026-model-deprecations-in-github-copilot/); Claude Sonnet 4.6 remains available to individual Copilot subscribers on annual plans.
+
+Model availability varies by Copilot plan and organization policy, so a model the CLI accepts may still be rejected at runtime if your subscription doesn't include it. See [supported AI models in Copilot](https://docs.github.com/en/copilot/reference/ai-models/supported-ai-models-in-copilot) for the full availability matrix.
+
+### Custom Model Providers
+
+The GitHub Copilot CLI supports bring-your-own-key (BYOK) model providers, letting the review run against any OpenAI-compatible endpoint (including Ollama and vLLM), Azure OpenAI, or Anthropic instead of GitHub-hosted models. Enable it with `useCustomModelProvider` and supply the provider details:
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    useCustomModelProvider: true
+    copilotProviderBaseUrl: 'https://api.openai.com/v1'
+    copilotProviderType: 'openai'
+    copilotProviderApiKey: '$(OPENAI_API_KEY)'
+    model: 'gpt-5.2'
+    useSystemAccessToken: true
+```
+
+Notes:
+
+- `model` is **required** in this mode and must be a model identifier your provider serves.
+- `copilotProviderApiKey` may be omitted for providers that do not require authentication (e.g., a local Ollama instance on a self-hosted agent).
+- `githubPat` is optional in this mode. No GitHub authentication is needed to run the review against your own provider, but supplying a PAT additionally enables GitHub-backed CLI features such as code search.
+- `reasoningEffort` may be rejected for custom-provider models — the Copilot API is known to refuse reasoning parameters for BYOK models. If the review fails with a reasoning-related error, remove the `reasoningEffort` input.
+- The provider's model must support tool calling and streaming; a context window of at least 128k tokens is recommended. See [GitHub's BYOK documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models) for details.
 
 ### Claude Code Models
 
-As of April 2026, here are the model options supported by the Claude Code CLI:
+As of August 2026, here are the model options supported by the Claude Code CLI:
 
 | Alias | Description |
 | --- | ---- |
 | `default` | Recommended model setting, depending on your account type |
-| `sonnet` | Uses the latest Sonnet model (currently Sonnet 4.6) for daily coding tasks |
-| `opus` | Uses the latest Opus model (currently Opus 4.6) for complex reasoning tasks |
+| `best` | Uses Fable 5 where your organization has access to it, otherwise the latest Opus model |
+| `fable` | Uses Claude Fable 5, the most capable model for the hardest and longest-running tasks (requires organization access) |
+| `sonnet` | Uses the latest Sonnet model (currently Sonnet 5) for daily coding tasks |
+| `opus` | Uses the latest Opus model (currently Opus 5) for complex reasoning tasks |
 | `haiku` | Uses the fast and efficient Haiku model for simple tasks |
-| `sonnet[1m]` | Uses Sonnet with a 1 million token context window for long sessions |
+| `sonnet[1m]` | Uses Sonnet with a 1 million token context window for long sessions (no effect when `sonnet` already resolves to Sonnet 5, which has a native 1M window) |
 | `opus[1m]` | Uses Opus with a 1 million token context window for long sessions |
 | `opusplan` | Special mode that uses `opus` during plan mode, then switches to `sonnet` for execution |
 
-Aliases always point to the latest version. To pin to a specific version, use the full model name (for example, `claude-opus-4-6`).
+Aliases always point to the latest version available to your account. To pin to a specific version, use the full model name (for example, `claude-opus-5`).
 
 ### Author Filtering
 
@@ -254,6 +316,56 @@ When configured:
 - If the PR author's email matches any in the list, the review proceeds normally
 - If no match is found, the task completes successfully without running the code review
 - Email comparison is case-insensitive
+
+### Review Behavior Options
+
+Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt — so none of them apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
+
+**`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
+
+- `all` (default) — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers, replying with an explanation before marking the thread fixed. This matches the behavior the extension has had since thread resolution was introduced.
+- `agentOnly` — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
+
+**`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
+
+**`maxMinorIssues`** bounds low-severity noise. The review prompt instructs the agent to triage the full diff first, score every finding by severity (Critical/Major/Minor/Nit) and confidence, and then post: Critical and Major findings always get individual comments and are never capped, while high-confidence Minor findings are consolidated into a single compact "Minor suggestions" comment containing at most this many items (`0` drops Minor feedback entirely). Nits and low-confidence speculation are never posted.
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    resolveThreads: 'agentOnly'
+    suppressPositiveFeedback: true
+```
+
+### Jira Work Items
+
+Teams that track work in Jira but host code in Azure DevOps can pull review context from Jira instead of Azure Boards. When the three Jira inputs are set (and `includeWorkItems` is enabled), the task:
+
+1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`) — the same convention Jira's own development panel uses. Lowercase keys in branch names are recognized.
+2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve (HTTP 404) are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
+3. Writes the issue summary, type, status, priority, and description into the same work-item context file the review prompt already consumes.
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    jiraBaseUrl: 'https://yourorg.atlassian.net'
+    jiraEmail: 'service-account@example.com'
+    jiraApiToken: '$(JIRA_API_TOKEN)'
+    jiraProjectKeys: 'PROJ,CORE'   # optional
+```
+
+Notes:
+
+- **Jira Cloud only.** Authentication uses an [API token](https://id.atlassian.com/manage-profile/security/api-tokens) with Basic auth (`email:token`), which Jira Server/Data Center does not support.
+- The Jira account needs browse access to the referenced projects. Store the token as a secret pipeline variable.
+- Custom fields (such as instance-specific acceptance-criteria fields) are not fetched in this version — the issue description is the primary context source.
+- A failed Jira fetch logs a warning and the review continues without work item context; it never fails the pipeline.
 
 ### Diff-Only Review Mode
 
@@ -347,11 +459,36 @@ Create a personal access token:
 
 > **IMPORTANT**: If your user account is part of a GitHub organization, ensure the organization admin goes to **GitHub Policies** > **Copilot** > **Copilot CLI** and sets the policy to **Enabled everywhere**
 
-### Anthropic API Key (for Claude Code CLI)
+#### GitHub Enterprise Accounts
+
+If your Copilot subscription lives on a GitHub Enterprise account with data residency (`subdomain.ghe.com`), a PAT from that instance will fail validation against github.com with a "Bad credentials" error. Set the `githubHost` input so the Copilot CLI authenticates against your enterprise instance:
+
+```yaml
+- task: CopilotCodeReview@1
+  displayName: 'Copilot Code Review'
+  inputs:
+    githubPat: '$(GITHUB_ENTERPRISE_PAT)'
+    githubHost: 'subdomain.ghe.com'
+    useSystemAccessToken: true
+```
+
+A full URL (e.g., `https://subdomain.ghe.com/`) is also accepted and normalized to the hostname automatically.
+
+### Anthropic Authentication (for Claude Code CLI)
+
+Two options are supported — provide exactly one:
+
+**Option A — API key (billed against Anthropic API usage):**
 
 1. Go to [Anthropic Console](https://console.anthropic.com/)
 2. Create an API key
-3. Store the key as a secret variable in your Azure DevOps pipeline (e.g., `ANTHROPIC_API_KEY`)
+3. Store the key as a secret variable in your Azure DevOps pipeline (e.g., `ANTHROPIC_API_KEY`) and pass it via `anthropicApiKey`
+
+**Option B — OAuth token (billed against a Claude Pro/Max/Team/Enterprise subscription):**
+
+1. On your local machine, run `claude setup-token` and complete the browser authorization
+2. Copy the long-lived token it prints (valid for about a year)
+3. Store it as a secret variable in your Azure DevOps pipeline (e.g., `CLAUDE_CODE_OAUTH_TOKEN`) and pass it via `claudeCodeOAuthToken`
 
 ### Storing Tokens in Azure DevOps
 
@@ -359,7 +496,8 @@ Create a personal access token:
 2. Create a new Variable Group or edit an existing one
 3. Add the relevant variables:
    - `GITHUB_PAT` (mark as secret) — for Copilot CLI
-   - `ANTHROPIC_API_KEY` (mark as secret) — for Claude Code CLI
+   - `ANTHROPIC_API_KEY` (mark as secret) — for Claude Code CLI with API billing
+   - `CLAUDE_CODE_OAUTH_TOKEN` (mark as secret) — for Claude Code CLI with subscription billing
    - `AZURE_DEVOPS_PAT` (mark as secret) — if not using System Access Token
 4. Link the variable group to your pipeline
 
@@ -368,7 +506,7 @@ Alternatively, you can create the pipeline first and then configure the pipeline
 ## How It Works
 
 1. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
-2. **Fetch PR Context**: The task retrieves pull request metadata, existing comments, iteration details, and linked work item details via the Azure DevOps API
+2. **Fetch PR Context**: The task retrieves pull request metadata, existing comments, iteration details, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured)
 3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
 4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
 
@@ -384,11 +522,13 @@ The default prompt instructs Copilot to focus on:
 - **Security**: Potential vulnerabilities
 - **Code Consistency**: Style and pattern consistency
 
+Findings are triaged in two phases: the agent first enumerates every candidate issue across the full diff, then scores each by severity (Critical/Major/Minor/Nit) and confidence before posting. Critical and Major findings always post individually; high-confidence Minor findings are consolidated into a single capped comment (see `maxMinorIssues`); nits and speculation are dropped. On re-reviews, new comments are limited to newly pushed changes plus Critical findings, which keeps review rounds from surfacing endless new commentary on already-reviewed code.
+
 ## Limitations
 
 - **GitHub Copilot CLI**: On Windows, requires `winget` to be available. On Linux, requires `curl` and `bash` (standard on most systems). If using MS-hosted agents, these should be available by default.
-- **Claude Code CLI**: Requires `npm` to be available (pre-installed on all Azure DevOps agents). Requires an Anthropic API key.
-- **General Comments Only**: Posts general PR comments (file-level inline comments not yet supported)
+- **Claude Code CLI**: Requires `npm` to be available (pre-installed on all Azure DevOps agents). Requires an Anthropic API key or a Claude subscription OAuth token.
+- **Inline Comment Fallback**: Review comments are posted inline on the relevant file and lines. If Azure DevOps rejects an inline anchor, the comment is posted as a general PR comment with the file and line reference included in the text instead.
 - **Context Window**: Very large PRs may exceed the agent's context limits
 
 ## Troubleshooting
@@ -431,7 +571,7 @@ For large PRs, increase the `timeout` input value. The default is 15 minutes.
 
 ### No comments posted
 
-Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating the PR looks good when using the default prompt.
+Check the pipeline logs for Copilot's analysis output and determine if the agent experienced connectivity issues when posting comments. Even if Copilot finds no issues, it should still post a single comment indicating the PR looks good when using the default prompt — unless `suppressPositiveFeedback` is enabled, in which case a clean review intentionally posts nothing.
 
 ## Contributing
 

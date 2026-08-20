@@ -79,6 +79,11 @@
     If an inline comment fails (e.g., line no longer exists in the diff), the script will
     automatically fall back to posting a generic PR comment with the file path and line
     information appended to the comment text.
+
+    Exit codes: 0 on success, 1 on any failure. API failures are reported on stdout
+    with ##[error] markers (including the HTTP status and response body) so they are
+    visible in pipeline logs and to the calling agent. Transient failures (HTTP 429,
+    5xx, network errors) are retried with exponential backoff before failing.
 #>
 
 [CmdletBinding()]
@@ -159,58 +164,108 @@ function Invoke-AzureDevOpsApi {
         [string]$Uri,
         [hashtable]$Headers,
         [string]$Method = "Get",
-        [object]$Body = $null
+        [object]$Body = $null,
+        [int]$MaxAttempts = 3,
+        # For non-idempotent requests (POST): a probe that checks whether the
+        # failed request was actually committed server-side. Must return the
+        # created resource (used as the response) or $null if nothing landed.
+        [scriptblock]$VerifyCompleted = $null
     )
-    
-    try {
-        $params = @{
-            Uri         = $Uri
-            Headers     = $Headers
-            Method      = $Method
-            ErrorAction = "Stop"
-        }
-        
-        if ($null -ne $Body) {
-            $params.Body = $Body | ConvertTo-Json -Depth 10
-        }
-        
-        $response = Invoke-RestMethod @params
-        return $response
-    }
-    catch {
-        $statusCode = $null
-        $errorDetail = $null
 
-        if ($_.Exception.Response) {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-        }
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $errorDetail = $_.ErrorDetails.Message
-        }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $params = @{
+                Uri         = $Uri
+                Headers     = $Headers
+                Method      = $Method
+                ErrorAction = "Stop"
+            }
 
-        # Build a descriptive error message with all available context
-        $baseMsg = "Azure DevOps API error"
-        if ($statusCode) {
-            $baseMsg += " (HTTP $statusCode)"
-        }
-        $baseMsg += " calling $Method $Uri"
+            if ($null -ne $Body) {
+                $params.Body = $Body | ConvertTo-Json -Depth 10
+            }
 
-        if ($statusCode -eq 401) {
-            Write-Error "$baseMsg — Authentication failed. Please verify your token is valid and has appropriate permissions. API response: $errorDetail"
+            $response = Invoke-RestMethod @params
+            return $response
         }
-        elseif ($statusCode -eq 404) {
-            Write-Error "$baseMsg — Resource not found. Please verify the organization, project, repository, and PR ID. API response: $errorDetail"
+        catch {
+            $statusCode = $null
+            $responseBody = $null
+
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $responseBody = $_.ErrorDetails.Message
+            }
+
+            # Throttling, server errors, and network failures are worth retrying;
+            # other 4xx responses are deterministic and fail immediately.
+            $isThrottled = $statusCode -eq 429
+            $isTransient = (-not $statusCode) -or $isThrottled -or $statusCode -ge 500
+
+            # POST is not idempotent: a 5xx or network error can occur AFTER the
+            # server committed the write, so blindly replaying the request could
+            # create a duplicate comment. Before retrying (and before giving up
+            # on the final attempt), probe whether the write actually landed and
+            # reuse it if so. 429 means the request was rejected unprocessed, so
+            # no probe is needed there.
+            if ($isTransient -and -not $isThrottled -and $Method -eq 'Post' -and $VerifyCompleted) {
+                $committed = $null
+                try {
+                    $committed = & $VerifyCompleted
+                }
+                catch {
+                    # The probe itself failed (likely the same outage). Fall
+                    # through to the normal retry path: a rare duplicate comment
+                    # is preferable to silently dropping review feedback.
+                    Write-Host "Could not verify whether the failed $Method request was committed; proceeding with retry." -ForegroundColor Yellow
+                }
+                if ($null -ne $committed) {
+                    Write-Host "The failed $Method request was committed by the server despite the error; using the existing resource instead of retrying." -ForegroundColor Yellow
+                    return $committed
+                }
+            }
+
+            if ($isTransient -and $attempt -lt $MaxAttempts) {
+                $delaySeconds = [math]::Pow(2, $attempt)
+                $statusText = if ($statusCode) { "HTTP $statusCode" } else { $_.Exception.Message }
+                Write-Host "Transient Azure DevOps API failure ($statusText) on attempt $attempt of $MaxAttempts. Retrying in $delaySeconds seconds..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $delaySeconds
+                continue
+            }
+
+            # Emit full diagnostics on stdout: stderr (Write-Error) is dropped in
+            # several invocation paths, which previously made these failures
+            # impossible to diagnose from the pipeline log (issue #56). The
+            # ##[error] prefix renders red in Azure Pipelines logs.
+            Write-Host "##[error]Azure DevOps API call failed: $Method $Uri"
+            if ($statusCode) {
+                Write-Host "##[error]HTTP status: $statusCode"
+            }
+            if ($responseBody) {
+                Write-Host "##[error]API response: $responseBody"
+            }
+            else {
+                Write-Host "##[error]$($_.Exception.Message)"
+            }
+
+            if ($statusCode -eq 401) {
+                Write-Host "##[error]Authentication failed. Please verify your token is valid and has appropriate permissions."
+            }
+            elseif ($statusCode -eq 403) {
+                Write-Host "##[error]Permission denied. If using the System Access Token, ensure the Build Service identity has 'Contribute to pull requests' on the repository."
+            }
+            elseif ($statusCode -eq 404) {
+                Write-Host "##[error]Resource not found. Please verify the organization, project, repository, and PR ID."
+            }
+
+            # Let the caller decide whether a failure is fatal (e.g. inline
+            # comments fall back to a general comment before giving up)
+            throw
         }
-        elseif ($statusCode -eq 400) {
-            Write-Error "$baseMsg — Bad request. API response: $errorDetail"
-        }
-        elseif ($statusCode) {
-            Write-Error "$baseMsg — API response: $errorDetail"
-        }
-        else {
-            Write-Error "$baseMsg — $($_.Exception.Message)"
-        }
-        return $null
     }
 }
 
@@ -252,10 +307,11 @@ $apiVersion = "api-version=7.1"
 # First, verify the PR exists
 Write-Host "`nVerifying pull request #$Id exists..." -ForegroundColor Cyan
 $prUrl = "$baseUrl`?$apiVersion"
-$pr = Invoke-AzureDevOpsApi -Uri $prUrl -Headers $headers
-
-if ($null -eq $pr) {
-    Write-Error "Could not find pull request #$Id in repository '$Repository'."
+try {
+    $pr = Invoke-AzureDevOpsApi -Uri $prUrl -Headers $headers
+}
+catch {
+    Write-Host "##[error]Could not retrieve pull request #$Id in repository '$Repository'."
     exit 1
 }
 
@@ -267,13 +323,14 @@ if ($ThreadId -gt 0) {
     
     # Verify the thread exists
     $threadUrl = "$baseUrl/threads/$ThreadId`?$apiVersion"
-    $existingThread = Invoke-AzureDevOpsApi -Uri $threadUrl -Headers $headers
-    
-    if ($null -eq $existingThread) {
-        Write-Error "Could not find thread #$ThreadId on pull request #$Id."
+    try {
+        $existingThread = Invoke-AzureDevOpsApi -Uri $threadUrl -Headers $headers
+    }
+    catch {
+        Write-Host "##[error]Could not retrieve thread #$ThreadId on pull request #$Id."
         exit 1
     }
-    
+
     # Post reply to the thread
     $commentsUrl = "$baseUrl/threads/$ThreadId/comments?$apiVersion"
     $body = @{
@@ -281,9 +338,22 @@ if ($ThreadId -gt 0) {
         parentCommentId = 0
         commentType   = 1  # Text comment
     }
-    
-    $result = Invoke-AzureDevOpsApi -Uri $commentsUrl -Headers $headers -Method "Post" -Body $body
-    
+
+    # Duplicate guard for ambiguous POST failures: re-read the thread and treat
+    # a reply with the exact same text as the committed result
+    $verifyReplyCommitted = {
+        $thread = Invoke-AzureDevOpsApi -Uri $threadUrl -Headers $headers
+        @($thread.comments) | Select-Object -Skip 1 | Where-Object { $_.content -eq $Comment } | Select-Object -First 1
+    }
+
+    try {
+        $result = Invoke-AzureDevOpsApi -Uri $commentsUrl -Headers $headers -Method "Post" -Body $body -VerifyCompleted $verifyReplyCommitted
+    }
+    catch {
+        Write-Host "##[error]Failed to post reply to thread #$ThreadId on pull request #$Id."
+        exit 1
+    }
+
     if ($null -ne $result) {
         Write-Host "`n" + ("=" * 60) -ForegroundColor DarkGray
         Write-Host "COMMENT POSTED SUCCESSFULLY" -ForegroundColor Green
@@ -347,28 +417,33 @@ else {
     
     $result = $null
     $inlineCommentFailed = $false
-    
+
+    # Duplicate guard for ambiguous POST failures: list the PR's threads and
+    # treat one whose first comment has the exact same text as the committed
+    # result. Content equality is safe here because the probe only runs seconds
+    # after our own POST failed ambiguously.
+    $verifyThreadCommitted = {
+        $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+        @($threads.value) | Where-Object {
+            $_.comments -and @($_.comments)[0].content -eq $Comment
+        } | Select-Object -First 1
+    }
+
     # Attempt to post the comment
     try {
-        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body
+        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $body -VerifyCompleted $verifyThreadCommitted
     }
     catch {
         if ($isInlineComment) {
             $inlineCommentFailed = $true
-            Write-Warning "Failed to post inline comment: $($_.Exception.Message)"
-            Write-Warning "Falling back to generic PR comment with file/line information appended."
+            Write-Warning "Failed to post inline comment. Falling back to generic PR comment with file/line information appended."
         }
         else {
-            throw
+            Write-Host "##[error]Failed to create comment thread on pull request #$Id."
+            exit 1
         }
     }
-    
-    # Check if inline comment failed (result is null but was inline)
-    if ($null -eq $result -and $isInlineComment -and -not $inlineCommentFailed) {
-        $inlineCommentFailed = $true
-        Write-Warning "Inline comment API returned no result. Falling back to generic PR comment."
-    }
-    
+
     # Fallback to generic comment if inline failed
     if ($inlineCommentFailed) {
         $normalizedPath = Format-AzureDevOpsFilePath -Path $FilePath
@@ -388,8 +463,22 @@ else {
             status   = Get-ThreadStatusValue -StatusName $Status
         }
         
+        # Same duplicate guard as above, matching the fallback comment text
+        $verifyFallbackCommitted = {
+            $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+            @($threads.value) | Where-Object {
+                $_.comments -and @($_.comments)[0].content -eq $fallbackComment
+            } | Select-Object -First 1
+        }
+
         Write-Host "Posting generic comment with file/line information..." -ForegroundColor Yellow
-        $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $fallbackBody
+        try {
+            $result = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers -Method "Post" -Body $fallbackBody -VerifyCompleted $verifyFallbackCommitted
+        }
+        catch {
+            Write-Host "##[error]Fallback generic comment also failed for pull request #$Id."
+            exit 1
+        }
     }
     
     if ($null -ne $result) {
@@ -417,8 +506,18 @@ else {
     }
 }
 
+# Defensive: every failure path above should already have exited, but never
+# report success without a confirmed API result (issue #56)
+if ($null -eq $result) {
+    Write-Host "##[error]The Azure DevOps API returned no result for the comment operation on pull request #$Id."
+    exit 1
+}
+
 # Provide link to the PR
 $webUrl = "$CollectionUri/$Project/_git/$Repository/pullrequest/$Id"
 Write-Host "`nView PR: $webUrl" -ForegroundColor Cyan
+
+# Explicit success exit so callers reading $LASTEXITCODE never see a stale value
+exit 0
 
 #endregion

@@ -10,7 +10,7 @@
     "version": {
         "Major": 1,
         "Minor": 6,
-        "Patch": 0
+        "Patch": 1
     },
     "instanceNameFormat": "Copilot Code Review",
     "minimumAgentVersion": "2.182.1",
@@ -274,7 +274,7 @@
             "required": false,
             "isSecret": true,
             "defaultValue": "",
-            "helpMarkDown": "Optional. Jira Cloud API token created at https://id.atlassian.com/manage-profile/security/api-tokens. Required when 'Jira Base URL' is set.",
+            "helpMarkDown": "Optional. Jira Cloud API token created at https://id.atlassian.com/manage-profile/security/api-tokens. Required when 'Jira Base URL' is set. Both classic and scoped API tokens are supported: scoped tokens (including service-account tokens, which can only be scoped) must include the 'read:jira-work' and 'read:jira-user' scopes and are routed through the Atlassian platform gateway automatically.",
             "visibleRule": "includeWorkItems = true"
         },
         {
@@ -284,6 +284,15 @@
             "required": false,
             "defaultValue": "",
             "helpMarkDown": "Optional. Comma-separated list of Jira project keys (e.g., 'PROJ,CORE') to restrict which issue keys are looked up. Leave empty to try every key-shaped reference found in the PR (unknown keys are skipped automatically).",
+            "visibleRule": "includeWorkItems = true"
+        },
+        {
+            "name": "jiraCustomFields",
+            "type": "string",
+            "label": "Jira Custom Fields",
+            "required": false,
+            "defaultValue": "",
+            "helpMarkDown": "Optional. Comma-separated list of Jira custom fields to include as review context, given as display names (case-insensitive, e.g. 'Acceptance Criteria') or field IDs (e.g. 'customfield_10031'). Names that don't exist on the site are skipped with a warning. A field name containing a comma cannot be expressed here — use its customfield ID instead.",
             "visibleRule": "includeWorkItems = true"
         },
         {

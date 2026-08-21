@@ -350,6 +350,7 @@ async function run(): Promise<void> {
         const jiraEmail = tl.getInput('jiraEmail');
         const jiraApiToken = tl.getInput('jiraApiToken');
         const jiraProjectKeys = tl.getInput('jiraProjectKeys');
+        const jiraCustomFields = tl.getInput('jiraCustomFields');
 
         const missingJiraInputs = [
             ['jiraBaseUrl', jiraBaseUrl],
@@ -525,13 +526,13 @@ async function run(): Promise<void> {
         const prDetailsOutput = path.join(workingDirectory, 'PR_Details.txt');
         
         await runPowerShellScript(prDetailsScript, [
-            `-Token "${azureDevOpsToken}"`,
-            `-AuthType "${azureDevOpsAuthType}"`,
-            `-CollectionUri "${resolvedCollectionUri}"`,
-            `-Project "${project}"`,
-            `-Repository "${repository}"`,
-            `-Id ${pullRequestId}`,
-            `-OutputFile "${prDetailsOutput}"`
+            '-Token', azureDevOpsToken,
+            '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri,
+            '-Project', project,
+            '-Repository', repository,
+            '-Id', pullRequestId,
+            '-OutputFile', prDetailsOutput
         ]);
         console.log(`PR details saved to: ${prDetailsOutput}`);
 
@@ -541,13 +542,13 @@ async function run(): Promise<void> {
         const iterationDetailsOutput = path.join(workingDirectory, 'Iteration_Details.txt');
         
         await runPowerShellScript(prChangesScript, [
-            `-Token "${azureDevOpsToken}"`,
-            `-AuthType "${azureDevOpsAuthType}"`,
-            `-CollectionUri "${resolvedCollectionUri}"`,
-            `-Project "${project}"`,
-            `-Repository "${repository}"`,
-            `-Id ${pullRequestId}`,
-            `-OutputFile "${iterationDetailsOutput}"`
+            '-Token', azureDevOpsToken,
+            '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri,
+            '-Project', project,
+            '-Repository', repository,
+            '-Id', pullRequestId,
+            '-OutputFile', iterationDetailsOutput
         ]);
         console.log(`Iteration details saved to: ${iterationDetailsOutput}`);
 
@@ -629,6 +630,12 @@ async function run(): Promise<void> {
         }
 
         // Step 4: Fetch linked work item details (optional)
+        // Context-fetch failures below are non-fatal (the review proceeds with
+        // less context), but they should not finish the run as a clean green:
+        // this flag downgrades the final result to SucceededWithIssues so the
+        // pipeline surfaces the degradation without anyone reading the logs.
+        let reviewContextWarnings = false;
+
         // Self-hosted agents can reuse the workspace between runs, and the fetch
         // below only (re)creates Work_Item_Details.txt on a successful lookup. A
         // leftover file from an earlier run would silently attach unrelated work
@@ -648,25 +655,30 @@ async function run(): Promise<void> {
                 const jiraScript = path.join(scriptsDir, 'Get-JiraWorkItems.ps1');
                 const workItemDetailsOutput = path.join(workingDirectory, 'Work_Item_Details.txt');
                 const jiraArgs = [
-                    `-BaseUrl "${normalizedJiraBaseUrl}"`,
-                    `-Email "${jiraEmail}"`,
-                    `-ApiToken "${jiraApiToken}"`,
-                    `-PrMetadataFile "${prMetadataFile}"`,
-                    `-OutputFile "${workItemDetailsOutput}"`
+                    '-BaseUrl', normalizedJiraBaseUrl,
+                    '-Email', jiraEmail!,
+                    '-ApiToken', jiraApiToken!,
+                    '-PrMetadataFile', prMetadataFile,
+                    '-OutputFile', workItemDetailsOutput
                 ];
                 if (jiraProjectKeys) {
-                    jiraArgs.push(`-ProjectKeys "${jiraProjectKeys}"`);
+                    jiraArgs.push('-ProjectKeys', jiraProjectKeys);
+                }
+                if (jiraCustomFields) {
+                    jiraArgs.push('-CustomFields', jiraCustomFields);
                 }
 
                 try {
                     await runPowerShellScript(jiraScript, jiraArgs);
                     console.log(`Jira issue details saved to: ${workItemDetailsOutput}`);
                 } catch (err) {
-                    console.log('Warning: Failed to fetch Jira issue details. Continuing without work item context.');
-                    console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                    tl.warning('Failed to fetch Jira issue details. Continuing without work item context. ' +
+                        `Error: ${err instanceof Error ? err.message : String(err)}`);
+                    reviewContextWarnings = true;
                 }
             } else {
-                console.log('PR metadata file not found. Skipping Jira issue detail fetch.');
+                tl.warning('PR metadata file not found. Skipping the Jira issue detail fetch.');
+                reviewContextWarnings = true;
             }
         } else if (includeWorkItems) {
             console.log('\n[Step 4/5] Fetching linked work item details...');
@@ -681,17 +693,18 @@ async function run(): Promise<void> {
 
                     try {
                         await runPowerShellScript(workItemsScript, [
-                            `-Token "${azureDevOpsToken}"`,
-                            `-AuthType "${azureDevOpsAuthType}"`,
-                            `-CollectionUri "${resolvedCollectionUri}"`,
-                            `-Project "${project}"`,
-                            `-WorkItemIds "${workItemIds}"`,
-                            `-OutputFile "${workItemDetailsOutput}"`
+                            '-Token', azureDevOpsToken,
+                            '-AuthType', azureDevOpsAuthType,
+                            '-CollectionUri', resolvedCollectionUri,
+                            '-Project', project,
+                            '-WorkItemIds', workItemIds,
+                            '-OutputFile', workItemDetailsOutput
                         ]);
                         console.log(`Work item details saved to: ${workItemDetailsOutput}`);
                     } catch (err) {
-                        console.log('Warning: Failed to fetch work item details. Continuing without work item context.');
-                        console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                        tl.warning('Failed to fetch work item details. Continuing without work item context. ' +
+                            `Error: ${err instanceof Error ? err.message : String(err)}`);
+                        reviewContextWarnings = true;
                     }
                 } else {
                     console.log('No linked work item IDs found. Skipping work item detail fetch.');
@@ -928,7 +941,14 @@ async function run(): Promise<void> {
         console.log(`${agentName} Code Review completed successfully!`);
         console.log('='.repeat(60));
 
-        tl.setResult(tl.TaskResult.Succeeded, `${agentName} code review completed.`);
+        if (reviewContextWarnings) {
+            // Partially succeeded (orange): the review ran, but some of the
+            // configured context could not be fetched.
+            tl.setResult(tl.TaskResult.SucceededWithIssues,
+                `${agentName} code review completed, but some review context could not be fetched. See warnings in the log.`);
+        } else {
+            tl.setResult(tl.TaskResult.Succeeded, `${agentName} code review completed.`);
+        }
     } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         tl.setResult(tl.TaskResult.Failed, `Task failed: ${errorMessage}`);
@@ -1034,14 +1054,26 @@ async function installCopilotCli(): Promise<void> {
 
 async function runPowerShellScript(scriptPath: string, args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
-        const command = `pwsh -NoProfile -File "${scriptPath}" ${args.join(' ')}`;
+        // Spawn pwsh directly with shell: false and a tokenized argv. Each
+        // element is delivered to the process verbatim, so input values (PR
+        // metadata, Jira field names, tokens) are never parsed by a shell.
+        // Building a shell command string from these instead (shell: true)
+        // would let a value like "$(rm -rf ~)", a backtick expression, or a
+        // Windows "%VAR%" reference be expanded or executed, and would also
+        // silently corrupt legitimate values containing shell metacharacters.
+        // Callers must therefore pass each flag and its value as separate
+        // array elements (e.g. '-Project', project), not '-Project "value"'.
         const envVars = { ...process.env };
-        
-        const psProcess = child_process.spawn(command, [], {
-            shell: true,
-            stdio: 'inherit',
-            env: envVars
-        });
+
+        const psProcess = child_process.spawn(
+            'pwsh',
+            ['-NoProfile', '-File', scriptPath, ...args],
+            {
+                shell: false,
+                stdio: 'inherit',
+                env: envVars
+            }
+        );
 
         psProcess.on('close', (code) => {
             if (code === 0) {

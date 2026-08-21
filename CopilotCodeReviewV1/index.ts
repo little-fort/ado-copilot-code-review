@@ -526,13 +526,13 @@ async function run(): Promise<void> {
         const prDetailsOutput = path.join(workingDirectory, 'PR_Details.txt');
         
         await runPowerShellScript(prDetailsScript, [
-            `-Token "${azureDevOpsToken}"`,
-            `-AuthType "${azureDevOpsAuthType}"`,
-            `-CollectionUri "${resolvedCollectionUri}"`,
-            `-Project "${project}"`,
-            `-Repository "${repository}"`,
-            `-Id ${pullRequestId}`,
-            `-OutputFile "${prDetailsOutput}"`
+            '-Token', azureDevOpsToken,
+            '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri,
+            '-Project', project,
+            '-Repository', repository,
+            '-Id', pullRequestId,
+            '-OutputFile', prDetailsOutput
         ]);
         console.log(`PR details saved to: ${prDetailsOutput}`);
 
@@ -542,13 +542,13 @@ async function run(): Promise<void> {
         const iterationDetailsOutput = path.join(workingDirectory, 'Iteration_Details.txt');
         
         await runPowerShellScript(prChangesScript, [
-            `-Token "${azureDevOpsToken}"`,
-            `-AuthType "${azureDevOpsAuthType}"`,
-            `-CollectionUri "${resolvedCollectionUri}"`,
-            `-Project "${project}"`,
-            `-Repository "${repository}"`,
-            `-Id ${pullRequestId}`,
-            `-OutputFile "${iterationDetailsOutput}"`
+            '-Token', azureDevOpsToken,
+            '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri,
+            '-Project', project,
+            '-Repository', repository,
+            '-Id', pullRequestId,
+            '-OutputFile', iterationDetailsOutput
         ]);
         console.log(`Iteration details saved to: ${iterationDetailsOutput}`);
 
@@ -655,26 +655,17 @@ async function run(): Promise<void> {
                 const jiraScript = path.join(scriptsDir, 'Get-JiraWorkItems.ps1');
                 const workItemDetailsOutput = path.join(workingDirectory, 'Work_Item_Details.txt');
                 const jiraArgs = [
-                    `-BaseUrl "${normalizedJiraBaseUrl}"`,
-                    `-Email "${jiraEmail}"`,
-                    `-ApiToken "${jiraApiToken}"`,
-                    `-PrMetadataFile "${prMetadataFile}"`,
-                    `-OutputFile "${workItemDetailsOutput}"`
+                    '-BaseUrl', normalizedJiraBaseUrl,
+                    '-Email', jiraEmail!,
+                    '-ApiToken', jiraApiToken!,
+                    '-PrMetadataFile', prMetadataFile,
+                    '-OutputFile', workItemDetailsOutput
                 ];
                 if (jiraProjectKeys) {
-                    jiraArgs.push(`-ProjectKeys "${jiraProjectKeys}"`);
+                    jiraArgs.push('-ProjectKeys', jiraProjectKeys);
                 }
                 if (jiraCustomFields) {
-                    // Args are joined into one shell command line, so embedded
-                    // double quotes would break parsing — strip them (field
-                    // names cannot legally require quotes; IDs never do).
-                    const sanitizedCustomFields = jiraCustomFields.replace(/"/g, '');
-                    if (sanitizedCustomFields !== jiraCustomFields) {
-                        console.log('Note: double quotes were removed from the jiraCustomFields value.');
-                    }
-                    if (sanitizedCustomFields.trim()) {
-                        jiraArgs.push(`-CustomFields "${sanitizedCustomFields}"`);
-                    }
+                    jiraArgs.push('-CustomFields', jiraCustomFields);
                 }
 
                 try {
@@ -702,12 +693,12 @@ async function run(): Promise<void> {
 
                     try {
                         await runPowerShellScript(workItemsScript, [
-                            `-Token "${azureDevOpsToken}"`,
-                            `-AuthType "${azureDevOpsAuthType}"`,
-                            `-CollectionUri "${resolvedCollectionUri}"`,
-                            `-Project "${project}"`,
-                            `-WorkItemIds "${workItemIds}"`,
-                            `-OutputFile "${workItemDetailsOutput}"`
+                            '-Token', azureDevOpsToken,
+                            '-AuthType', azureDevOpsAuthType,
+                            '-CollectionUri', resolvedCollectionUri,
+                            '-Project', project,
+                            '-WorkItemIds', workItemIds,
+                            '-OutputFile', workItemDetailsOutput
                         ]);
                         console.log(`Work item details saved to: ${workItemDetailsOutput}`);
                     } catch (err) {
@@ -1063,14 +1054,26 @@ async function installCopilotCli(): Promise<void> {
 
 async function runPowerShellScript(scriptPath: string, args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
-        const command = `pwsh -NoProfile -File "${scriptPath}" ${args.join(' ')}`;
+        // Spawn pwsh directly with shell: false and a tokenized argv. Each
+        // element is delivered to the process verbatim, so input values (PR
+        // metadata, Jira field names, tokens) are never parsed by a shell.
+        // Building a shell command string from these instead (shell: true)
+        // would let a value like "$(rm -rf ~)", a backtick expression, or a
+        // Windows "%VAR%" reference be expanded or executed, and would also
+        // silently corrupt legitimate values containing shell metacharacters.
+        // Callers must therefore pass each flag and its value as separate
+        // array elements (e.g. '-Project', project), not '-Project "value"'.
         const envVars = { ...process.env };
-        
-        const psProcess = child_process.spawn(command, [], {
-            shell: true,
-            stdio: 'inherit',
-            env: envVars
-        });
+
+        const psProcess = child_process.spawn(
+            'pwsh',
+            ['-NoProfile', '-File', scriptPath, ...args],
+            {
+                shell: false,
+                stdio: 'inherit',
+                env: envVars
+            }
+        );
 
         psProcess.on('close', (code) => {
             if (code === 0) {

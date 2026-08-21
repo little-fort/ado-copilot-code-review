@@ -367,7 +367,7 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
 Notes:
 
 - **Jira Cloud only.** Authentication uses an [API token](https://id.atlassian.com/manage-profile/security/api-tokens) with Basic auth (`email:token`), which Jira Server/Data Center does not support.
-- **Both API token types work.** Atlassian offers "Create API token" (classic) and "Create API token with scopes". Classic tokens authenticate against your site URL directly. Scoped tokens — the only kind **service accounts** can create — are detected and routed through the Atlassian platform gateway (`api.atlassian.com`) automatically; they must include the classic scopes `read:jira-work` and `read:jira-user`. If the agent's network restricts outbound traffic, allow `api.atlassian.com` when using scoped tokens.
+- Works with both Classic and Scoped tokens. Classic tokens authenticate against your site URL directly. Scoped tokens must include the classic scopes `read:jira-work` and `read:jira-user`. If using a service account, make sure the account is added to the project as `Viewer`.
 - The Jira account needs browse access to the referenced projects. Store the token as a secret pipeline variable.
 - A custom field whose display name matches a built-in section (e.g. "Description") will produce a duplicate-looking section label; prefer distinct names or the field ID.
 - A failed Jira fetch never blocks the review: the run continues without work item context, and the task finishes as **partially succeeded** (orange) with the fetch error surfaced in the pipeline's warnings.

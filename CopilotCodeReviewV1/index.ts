@@ -350,6 +350,7 @@ async function run(): Promise<void> {
         const jiraEmail = tl.getInput('jiraEmail');
         const jiraApiToken = tl.getInput('jiraApiToken');
         const jiraProjectKeys = tl.getInput('jiraProjectKeys');
+        const jiraCustomFields = tl.getInput('jiraCustomFields');
 
         const missingJiraInputs = [
             ['jiraBaseUrl', jiraBaseUrl],
@@ -656,6 +657,18 @@ async function run(): Promise<void> {
                 ];
                 if (jiraProjectKeys) {
                     jiraArgs.push(`-ProjectKeys "${jiraProjectKeys}"`);
+                }
+                if (jiraCustomFields) {
+                    // Args are joined into one shell command line, so embedded
+                    // double quotes would break parsing — strip them (field
+                    // names cannot legally require quotes; IDs never do).
+                    const sanitizedCustomFields = jiraCustomFields.replace(/"/g, '');
+                    if (sanitizedCustomFields !== jiraCustomFields) {
+                        console.log('Note: double quotes were removed from the jiraCustomFields value.');
+                    }
+                    if (sanitizedCustomFields.trim()) {
+                        jiraArgs.push(`-CustomFields "${sanitizedCustomFields}"`);
+                    }
                 }
 
                 try {

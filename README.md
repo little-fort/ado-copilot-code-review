@@ -208,6 +208,7 @@ steps:
 | `jiraEmail` | Conditional | - | Atlassian account email for the API token. Required when `jiraBaseUrl` is set. |
 | `jiraApiToken` | Conditional | - | Jira Cloud API token. Required when `jiraBaseUrl` is set. |
 | `jiraProjectKeys` | No | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) to restrict issue key lookup |
+| `jiraCustomFields` | No | - | Comma-separated Jira custom fields to include as review context, by display name or ID (see [Jira Work Items](#jira-work-items)) |
 | `resolveThreads` | No | `all` | Which existing comment threads the agent may resolve: `all` or `agentOnly` (see [Review Behavior Options](#review-behavior-options)) |
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
@@ -346,7 +347,7 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
 
 1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`) — the same convention Jira's own development panel uses. Lowercase keys in branch names are recognized.
 2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve (HTTP 404) are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
-3. Writes the issue summary, type, status, priority, and description into the same work-item context file the review prompt already consumes.
+3. Writes the issue details into the same work-item context file the review prompt already consumes: summary, type, status, priority, assignee/reporter, due date, labels, components, fix versions, parent, description, environment, subtasks, linked issues, and the 10 most recent comments. Empty fields are omitted.
 
 ```yaml
 - task: CopilotCodeReview@1
@@ -357,14 +358,18 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
     jiraBaseUrl: 'https://yourorg.atlassian.net'
     jiraEmail: 'service-account@example.com'
     jiraApiToken: '$(JIRA_API_TOKEN)'
-    jiraProjectKeys: 'PROJ,CORE'   # optional
+    jiraProjectKeys: 'PROJ,CORE'                                # optional
+    jiraCustomFields: 'Acceptance Criteria,customfield_10031'   # optional
 ```
+
+**Custom fields.** Fields like acceptance criteria are site-specific custom fields in Jira, so they are opt-in via `jiraCustomFields`: list the fields to include by display name (case-insensitive) or by `customfield_NNNNN` ID. Display names are resolved against the site's field catalog once per run; names that don't resolve are skipped with a warning and never fail the review. Rich-text values are converted to plain text the same way descriptions are. If a field's display name contains a comma, use its ID instead (the Jira admin field list shows IDs, or append `?fields=*all&expand=names` to any issue's REST URL).
 
 Notes:
 
 - **Jira Cloud only.** Authentication uses an [API token](https://id.atlassian.com/manage-profile/security/api-tokens) with Basic auth (`email:token`), which Jira Server/Data Center does not support.
+- **Both API token types work.** Atlassian offers "Create API token" (classic) and "Create API token with scopes". Classic tokens authenticate against your site URL directly. Scoped tokens — the only kind **service accounts** can create — are detected and routed through the Atlassian platform gateway (`api.atlassian.com`) automatically; they must include the classic scopes `read:jira-work` and `read:jira-user`. If the agent's network restricts outbound traffic, allow `api.atlassian.com` when using scoped tokens.
 - The Jira account needs browse access to the referenced projects. Store the token as a secret pipeline variable.
-- Custom fields (such as instance-specific acceptance-criteria fields) are not fetched in this version — the issue description is the primary context source.
+- A custom field whose display name matches a built-in section (e.g. "Description") will produce a duplicate-looking section label; prefer distinct names or the field ID.
 - A failed Jira fetch logs a warning and the review continues without work item context; it never fails the pipeline.
 
 ### Diff-Only Review Mode

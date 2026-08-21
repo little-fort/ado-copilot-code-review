@@ -370,7 +370,7 @@ Notes:
 - **Both API token types work.** Atlassian offers "Create API token" (classic) and "Create API token with scopes". Classic tokens authenticate against your site URL directly. Scoped tokens — the only kind **service accounts** can create — are detected and routed through the Atlassian platform gateway (`api.atlassian.com`) automatically; they must include the classic scopes `read:jira-work` and `read:jira-user`. If the agent's network restricts outbound traffic, allow `api.atlassian.com` when using scoped tokens.
 - The Jira account needs browse access to the referenced projects. Store the token as a secret pipeline variable.
 - A custom field whose display name matches a built-in section (e.g. "Description") will produce a duplicate-looking section label; prefer distinct names or the field ID.
-- A failed Jira fetch logs a warning and the review continues without work item context; it never fails the pipeline.
+- A failed Jira fetch never blocks the review: the run continues without work item context, and the task finishes as **partially succeeded** (orange) with the fetch error surfaced in the pipeline's warnings.
 
 ### Diff-Only Review Mode
 

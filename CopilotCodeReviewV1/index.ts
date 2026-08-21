@@ -630,6 +630,12 @@ async function run(): Promise<void> {
         }
 
         // Step 4: Fetch linked work item details (optional)
+        // Context-fetch failures below are non-fatal (the review proceeds with
+        // less context), but they should not finish the run as a clean green:
+        // this flag downgrades the final result to SucceededWithIssues so the
+        // pipeline surfaces the degradation without anyone reading the logs.
+        let reviewContextWarnings = false;
+
         // Self-hosted agents can reuse the workspace between runs, and the fetch
         // below only (re)creates Work_Item_Details.txt on a successful lookup. A
         // leftover file from an earlier run would silently attach unrelated work
@@ -675,11 +681,13 @@ async function run(): Promise<void> {
                     await runPowerShellScript(jiraScript, jiraArgs);
                     console.log(`Jira issue details saved to: ${workItemDetailsOutput}`);
                 } catch (err) {
-                    console.log('Warning: Failed to fetch Jira issue details. Continuing without work item context.');
-                    console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                    tl.warning('Failed to fetch Jira issue details. Continuing without work item context. ' +
+                        `Error: ${err instanceof Error ? err.message : String(err)}`);
+                    reviewContextWarnings = true;
                 }
             } else {
-                console.log('PR metadata file not found. Skipping Jira issue detail fetch.');
+                tl.warning('PR metadata file not found. Skipping the Jira issue detail fetch.');
+                reviewContextWarnings = true;
             }
         } else if (includeWorkItems) {
             console.log('\n[Step 4/5] Fetching linked work item details...');
@@ -703,8 +711,9 @@ async function run(): Promise<void> {
                         ]);
                         console.log(`Work item details saved to: ${workItemDetailsOutput}`);
                     } catch (err) {
-                        console.log('Warning: Failed to fetch work item details. Continuing without work item context.');
-                        console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                        tl.warning('Failed to fetch work item details. Continuing without work item context. ' +
+                            `Error: ${err instanceof Error ? err.message : String(err)}`);
+                        reviewContextWarnings = true;
                     }
                 } else {
                     console.log('No linked work item IDs found. Skipping work item detail fetch.');
@@ -941,7 +950,14 @@ async function run(): Promise<void> {
         console.log(`${agentName} Code Review completed successfully!`);
         console.log('='.repeat(60));
 
-        tl.setResult(tl.TaskResult.Succeeded, `${agentName} code review completed.`);
+        if (reviewContextWarnings) {
+            // Partially succeeded (orange): the review ran, but some of the
+            // configured context could not be fetched.
+            tl.setResult(tl.TaskResult.SucceededWithIssues,
+                `${agentName} code review completed, but some review context could not be fetched. See warnings in the log.`);
+        } else {
+            tl.setResult(tl.TaskResult.Succeeded, `${agentName} code review completed.`);
+        }
     } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         tl.setResult(tl.TaskResult.Failed, `Task failed: ${errorMessage}`);

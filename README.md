@@ -200,16 +200,17 @@ steps:
 | `reasoningEffort` | No | model default | Reasoning effort level to balance review depth against token spend. Copilot: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Claude Code: `low`, `medium`, `high`, `xhigh`, `max`. If the selected model doesn't support the requested level, the CLI fails with a clear error rather than silently ignoring it. |
 | `promptFile` | No | - | Path to custom prompt file |
 | `prompt` | No | - | Inline custom prompt (overrides `promptFile`) |
-| `promptFileRaw` | No | - | _(Advanced)_ Path to custom prompt file that will be passed as-is with no supportive direction. |
-| `promptRaw` | No | - | _(Advanced)_ Inline custom prompt that will be passed as-is with no supportive direction. |
+| `promptFileRaw` | No | - | _(Advanced)_ Path to custom prompt file passed without review guidance; the external-content security directive is still appended |
+| `promptRaw` | No | - | _(Advanced)_ Inline custom prompt passed without review guidance; the external-content security directive is still appended |
 | `authors` | No | - | Comma-separated list of email addresses to filter reviews (see below) |
 | `includeWorkItems` | No | `true` | Fetch and include linked work item details as review context |
 | `jiraBaseUrl` | No | - | Jira Cloud site URL (e.g., `https://yourorg.atlassian.net`). With `jiraEmail` + `jiraApiToken`, work items are fetched from Jira instead of Azure Boards (see [Jira Work Items](#jira-work-items)) |
 | `jiraEmail` | Conditional | - | Atlassian account email for the API token. Required when `jiraBaseUrl` is set. |
 | `jiraApiToken` | Conditional | - | Jira Cloud API token. Required when `jiraBaseUrl` is set. |
-| `jiraProjectKeys` | No | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) to restrict issue key lookup |
+| `jiraProjectKeys` | Conditional | - | Comma-separated Jira project keys (e.g., `PROJ,CORE`) allowed for issue lookup. Required when Jira integration is configured |
 | `jiraCustomFields` | No | - | Comma-separated Jira custom fields to include as review context, by display name or ID (see [Jira Work Items](#jira-work-items)) |
-| `resolveThreads` | No | `all` | Which existing comment threads the agent may resolve: `all` or `agentOnly` (see [Review Behavior Options](#review-behavior-options)) |
+| `includeJiraComments` | No | `false` | Include the 10 most recent Jira comments as review context |
+| `resolveThreads` | No | `agentOnly` | Which existing comment threads the agent may resolve: `agentOnly` or `all` (see [Review Behavior Options](#review-behavior-options)) |
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
@@ -320,12 +321,12 @@ When configured:
 
 ### Review Behavior Options
 
-Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt — so none of them apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
+Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt, so none of them apply to raw prompt modes (`promptRaw`/`promptFileRaw`). The task always appends its external-content security directive, including in raw prompt modes.
 
 **`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
 
-- `all` (default) — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers, replying with an explanation before marking the thread fixed. This matches the behavior the extension has had since thread resolution was introduced.
-- `agentOnly` — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
+- `agentOnly` (default) — the agent only replies to or resolves threads whose Azure DevOps author is a Build Service identity. Threads opened by human reviewers are never touched. Threads posted through a user PAT cannot be safely distinguished from human threads and remain read-only.
+- `all` — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers, replying with an explanation before marking the thread fixed.
 
 **`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
 
@@ -347,7 +348,7 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
 
 1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`) — the same convention Jira's own development panel uses. Lowercase keys in branch names are recognized.
 2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve (HTTP 404) are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
-3. Writes the issue details into the same work-item context file the review prompt already consumes: summary, type, status, priority, assignee/reporter, due date, labels, components, fix versions, parent, description, environment, subtasks, linked issues, and the 10 most recent comments. Empty fields are omitted.
+3. Writes the issue details into the same work-item context file the review prompt already consumes: summary, type, status, priority, assignee/reporter, due date, labels, components, fix versions, parent, description, environment, subtasks, and linked issues. Empty fields are omitted. Jira comments are excluded unless `includeJiraComments` is enabled.
 
 ```yaml
 - task: CopilotCodeReview@1
@@ -358,11 +359,14 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
     jiraBaseUrl: 'https://yourorg.atlassian.net'
     jiraEmail: 'service-account@example.com'
     jiraApiToken: '$(JIRA_API_TOKEN)'
-    jiraProjectKeys: 'PROJ,CORE'                                # optional
+    jiraProjectKeys: 'PROJ,CORE'
     jiraCustomFields: 'Acceptance Criteria,customfield_10031'   # optional
+    includeJiraComments: false                                  # optional
 ```
 
 **Custom fields.** Fields like acceptance criteria are site-specific custom fields in Jira, so they are opt-in via `jiraCustomFields`: list the fields to include by display name (case-insensitive) or by `customfield_NNNNN` ID. Display names are resolved against the site's field catalog once per run; names that don't resolve are skipped with a warning and never fail the review. Rich-text values are converted to plain text the same way descriptions are. If a field's display name contains a comma, use its ID instead (the Jira admin field list shows IDs, or append `?fields=*all&expand=names` to any issue's REST URL).
+
+**Security.** Jira project keys must be explicitly allowed with `jiraProjectKeys`. Jira content is treated as untrusted review data, not agent instructions. Comments are excluded by default because they are commonly editable by a broader audience; enable `includeJiraComments` only when comment authors are trusted.
 
 Notes:
 
@@ -389,11 +393,11 @@ Enable `diffOnlyReview` to restrict the review to **only** the code changes in t
 
 When enabled:
 - The PR diff is pre-computed via `git diff` (using merge-base / three-dot syntax to match the ADO PR UI) and embedded directly in the prompt along with all PR context (details, iteration info, work items)
-- Built-in file-browsing tools (Read, Glob, Grep) are removed from the agent's tool set; the agent is restricted to PowerShell shell commands only
+- Built-in file-browsing and Git tools are removed from the agent's tool set. The agent can only write `_comment.md` and invoke the bundled comment-posting scripts
 - The prompt explicitly directs the agent to use only the embedded diff and to refrain from reading files or running git commands to explore the repository
 - Token usage becomes proportional to the size of the actual code changes, not the size of the repository
 
-**Limitations:** The agent retains shell access to `pwsh` because it needs to invoke the comment-posting scripts (`Add-CopilotComment.ps1`, `Update-CopilotComment.ps1`). Because `pwsh` is a general-purpose shell, this technically permits arbitrary command execution; the diff-only behavior is enforced by the combination of removed file-browsing tools, embedded context, and explicit prompt instructions rather than by hard tool-level constraints alone.
+**Security boundary:** Shell access is limited to the bundled comment-posting scripts, and file writes are limited to `_comment.md`. Direct comment arguments, content updates, and comment files other than a regular, non-linked `./_comment.md` are rejected during agent-driven reviews so environment secrets and arbitrary files cannot be copied into pull request comments. Thread status changes are limited to server-derived thread IDs permitted by `resolveThreads`. Claude Code runs in restricted, safe mode with explicit tool availability and permission allowlists, so checkout-provided hooks, MCP servers, and other customizations are not loaded.
 
 **Requirements:**
 - The pipeline must use `fetchDepth: 0` (full clone) so that both source and target commits are available for diff computation

@@ -69,6 +69,19 @@ param(
     [string]$Content
 )
 
+if (${env:COPILOT_REVIEW_REQUIRE_COMMENT_FILE} -eq 'true') {
+    if (-not [string]::IsNullOrEmpty($Content)) {
+        Write-Error "Comment content updates are disabled for agent-driven reviews."
+        exit 1
+    }
+
+    $allowedThreadIds = @(${env:COPILOT_REVIEW_ALLOWED_THREAD_IDS} -split ',' | Where-Object { $_ -match '^\d+$' })
+    if ([string]$ThreadId -notin $allowedThreadIds) {
+        Write-Error "Thread #$ThreadId is not authorized for status updates in this review."
+        exit 1
+    }
+}
+
 # Wrap entire script in try/catch for silent failure
 try {
     # Validate that at least one update is requested

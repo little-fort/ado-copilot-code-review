@@ -9,8 +9,8 @@
     "author": "LittleFortSoftware",
     "version": {
         "Major": 0,
-        "Minor": 4,
-        "Patch": 3
+        "Minor": 5,
+        "Patch": 0
     },
     "instanceNameFormat": "Copilot Code Review (Dev)",
     "minimumAgentVersion": "2.182.1",
@@ -219,7 +219,7 @@
             "label": "Raw Prompt",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. A raw prompt to pass directly to the Copilot CLI with no modification. Cannot be combined with other prompt inputs (prompt, promptFile, promptFileRaw).",
+            "helpMarkDown": "Optional. A raw prompt to pass directly to the Copilot CLI without review guidance. The external-content security directive is still appended. Cannot be combined with other prompt inputs (prompt, promptFile, promptFileRaw).",
             "properties": {
                 "rows": "10",
                 "maxLength": "5000"
@@ -231,7 +231,7 @@
             "label": "Raw Prompt File",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. Path to a file containing a raw prompt to pass directly to the Copilot CLI with no modification. Cannot be combined with other prompt inputs (prompt, promptFile, promptRaw)."
+            "helpMarkDown": "Optional. Path to a raw prompt file to pass directly to the Copilot CLI without review guidance. The external-content security directive is still appended. Cannot be combined with other prompt inputs (prompt, promptFile, promptRaw)."
         },
         {
             "name": "authors",
@@ -296,16 +296,25 @@
             "visibleRule": "includeWorkItems = true"
         },
         {
+            "name": "includeJiraComments",
+            "type": "boolean",
+            "label": "Include Jira Comments",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "Include the 10 most recent Jira comments as review context. Disabled by default because comments are a lower-trust source of prompt content.",
+            "visibleRule": "includeWorkItems = true"
+        },
+        {
             "name": "resolveThreads",
             "type": "pickList",
             "label": "Thread Resolution Scope",
             "required": false,
-            "defaultValue": "all",
+            "defaultValue": "agentOnly",
             "options": {
                 "agentOnly": "Agent threads only",
                 "all": "All addressed threads (including human reviewers')"
             },
-            "helpMarkDown": "Controls which existing comment threads the review agent may resolve when their issues have been addressed. 'all' (default): threads created by previous automated reviews, plus threads created by human reviewers when the changes clearly address them. 'agentOnly': only threads created by previous automated reviews — human reviewers' threads are never touched. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
+            "helpMarkDown": "Controls which existing comment threads the review agent may resolve when their issues have been addressed. 'agentOnly' (default): only threads created by previous automated reviews — human reviewers' threads are never touched. 'all': automated-review threads plus threads created by human reviewers when the changes clearly address them. Not applied to raw prompt modes (promptRaw/promptFileRaw)."
         },
         {
             "name": "suppressPositiveFeedback",

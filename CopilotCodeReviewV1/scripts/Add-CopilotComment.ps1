@@ -88,12 +88,55 @@ param(
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Resolve comment text from either -Comment or -CommentFile
+if (${env:COPILOT_REVIEW_REQUIRE_COMMENT_FILE} -eq 'true') {
+    if ($Comment) {
+        Write-Error "Direct comment text is disabled for agent-driven reviews. Use -CommentFile."
+        exit 1
+    }
+
+    if ($ThreadId -gt 0) {
+        $allowedThreadIds = @(${env:COPILOT_REVIEW_ALLOWED_THREAD_IDS} -split ',' | Where-Object { $_ -match '^\d+$' })
+        if ([string]$ThreadId -notin $allowedThreadIds) {
+            Write-Error "Thread #$ThreadId is not authorized for replies in this review."
+            exit 1
+        }
+    }
+
+    if ($CommentFile) {
+        try {
+            $commentFileItem = Get-Item -LiteralPath $CommentFile -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Error "Comment file not found: $CommentFile"
+            exit 1
+        }
+
+        $expectedCommentPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path '_comment.md'))
+        $actualCommentPath = [System.IO.Path]::GetFullPath($commentFileItem.FullName)
+        $pathComparison = if (${env:OS} -eq 'Windows_NT') {
+            [System.StringComparison]::OrdinalIgnoreCase
+        }
+        else {
+            [System.StringComparison]::Ordinal
+        }
+        $isReparsePoint = ($commentFileItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+
+        if ($commentFileItem.PSProvider.Name -ne 'FileSystem' -or
+            $commentFileItem.PSIsContainer -or
+            $isReparsePoint -or
+            -not [string]::Equals($actualCommentPath, $expectedCommentPath, $pathComparison)) {
+            Write-Error "Agent-driven reviews may only read the regular file ./_comment.md."
+            exit 1
+        }
+    }
+}
+
 if ($CommentFile) {
-    if (-not (Test-Path $CommentFile)) {
+    if (-not (Test-Path -LiteralPath $CommentFile -PathType Leaf)) {
         Write-Error "Comment file not found: $CommentFile"
         exit 1
     }
-    $Comment = Get-Content -Path $CommentFile -Raw
+    $Comment = Get-Content -LiteralPath $CommentFile -Raw
 }
 
 if (-not $Comment) {

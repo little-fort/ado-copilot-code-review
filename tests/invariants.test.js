@@ -150,4 +150,12 @@ describe('Dev/prod task definition parity', () => {
         assert.equal(devTask.minimumAgentVersion, prodTask.minimumAgentVersion,
             'minimumAgentVersion differs between dev and prod task.json.');
     });
+
+    it('uses secure defaults for Jira comments and thread resolution', () => {
+        const prodByName = new Map(prodTask.inputs.map(i => [i.name, i]));
+        assert.equal(prodByName.get('includeJiraComments').defaultValue, false,
+            'Jira comments must remain opt-in because they are untrusted prompt content.');
+        assert.equal(prodByName.get('resolveThreads').defaultValue, 'agentOnly',
+            'Human review threads must be protected by default.');
+    });
 });

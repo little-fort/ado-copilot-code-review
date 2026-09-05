@@ -95,13 +95,16 @@ $uri = "$baseUrl/git/repositories/$Repository/pullrequests/$Id?api-version=7.1"
 ```
 
 ### Copilot CLI Flags
-The task runs Copilot with specific permissions in [index.ts](CopilotCodeReviewV1/index.ts):
-```bash
-copilot -p "$prompt" --allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'
-```
-- `--allow-all-paths` - Enables file access across the repo
-- `--allow-all-tools` - Permits tool usage (shell commands, file ops)
-- `--deny-tool 'shell(git push)'` - Safety: prevents accidental pushes during review
+The task runs Copilot with an explicit tool allowlist in [index.ts](CopilotCodeReviewV1/index.ts):
+
+- Repository access is limited to the pipeline working directory.
+- File writes are limited to `_comment.md`.
+- Shell access is limited to read-only Git commands and the bundled comment-posting scripts.
+- Diff-only mode removes file-browsing and Git tools.
+- Built-in MCP servers and temporary-directory access are disabled.
+- Claude Code uses restricted, safe, `dontAsk` mode with explicit tool availability.
+- Agent comments must use a regular, non-linked `./_comment.md`; direct content is rejected.
+- Thread status changes require an ID from the trusted server-derived allowlist.
 
 ## Task Configuration
 

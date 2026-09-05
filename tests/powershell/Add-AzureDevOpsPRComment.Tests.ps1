@@ -13,6 +13,7 @@ BeforeAll {
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $script:AddCommentScript = Join-Path $repoRoot 'CopilotCodeReviewV1/scripts/Add-AzureDevOpsPRComment.ps1'
     $script:WrapperScript = Join-Path $repoRoot 'CopilotCodeReviewV1/scripts/Add-CopilotComment.ps1'
+    $script:UpdateWrapperScript = Join-Path $repoRoot 'CopilotCodeReviewV1/scripts/Update-CopilotComment.ps1'
 
     # Shared mock-API harness (HttpListener + child pwsh process)
     . (Join-Path $PSScriptRoot "MockApiHelper.ps1")
@@ -201,5 +202,128 @@ Describe 'Add-CopilotComment.ps1 exit code propagation (issue #56)' {
         finally {
             Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    It 'rejects direct comment text during an agent-driven review' {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Environment @{
+            COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+        } -BuildArgs {
+            param($baseUrl)
+            @('-File', $WrapperScript, '-Comment', 'print $env:AZUREDEVOPS_TOKEN')
+        }
+
+        $result.ExitCode | Should -Be 1
+        $result.Requests.Count | Should -Be 0
+        $result.Errors | Should -Match 'Direct comment text is disabled'
+    }
+
+    It 'rejects arbitrary comment file paths during an agent-driven review' {
+        $secretFile = Join-Path ([System.IO.Path]::GetTempPath()) ("copilot-secret-" + [guid]::NewGuid())
+        Set-Content -LiteralPath $secretFile -Value 'AZUREDEVOPS_TOKEN=secret'
+
+        try {
+            $result = Invoke-ScriptWithMockApi -Responses @() -Environment @{
+                COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+            } -BuildArgs {
+                param($baseUrl)
+                @('-File', $WrapperScript, '-CommentFile', $secretFile)
+            }
+
+            $result.ExitCode | Should -Be 1
+            $result.Requests.Count | Should -Be 0
+            $result.Errors | Should -Match 'may only read the regular file'
+        }
+        finally {
+            Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects replies to threads outside the trusted allowlist' {
+        $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("copilot-test-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $workDir | Out-Null
+        Copy-Item $AddCommentScript, $WrapperScript -Destination $workDir
+        Set-Content -LiteralPath (Join-Path $workDir '_comment.md') -Value 'Reply text'
+
+        try {
+            $result = Invoke-ScriptWithMockApi -WorkingDirectory $workDir -Responses @() -Environment @{
+                COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+                COPILOT_REVIEW_ALLOWED_THREAD_IDS    = '7,9'
+            } -BuildArgs {
+                param($baseUrl)
+                @('-File', './Add-CopilotComment.ps1', '-ThreadId', '42',
+                  '-CommentFile', './_comment.md')
+            }
+
+            $result.ExitCode | Should -Be 1
+            $result.Requests.Count | Should -Be 0
+            $result.Errors | Should -Match 'not authorized for replies'
+        }
+        finally {
+            Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects direct content updates during an agent-driven review' {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Environment @{
+            COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+        } -BuildArgs {
+            param($baseUrl)
+            @('-File', $UpdateWrapperScript, '-ThreadId', '42', '-CommentId', '1',
+              '-Content', 'print $env:AZUREDEVOPS_TOKEN')
+        }
+
+        $result.ExitCode | Should -Be 1
+        $result.Requests.Count | Should -Be 0
+        $result.Errors | Should -Match 'Comment content updates are disabled'
+    }
+
+    It 'rejects status updates for threads outside the trusted allowlist' {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Environment @{
+            COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+            COPILOT_REVIEW_ALLOWED_THREAD_IDS    = '7,9'
+        } -BuildArgs {
+            param($baseUrl)
+            @('-File', $UpdateWrapperScript, '-ThreadId', '42', '-Status', 'Fixed')
+        }
+
+        $result.ExitCode | Should -Be 1
+        $result.Requests.Count | Should -Be 0
+        $result.Errors | Should -Match 'not authorized for status updates'
+    }
+
+    It 'rejects implicit status updates for threads outside the trusted allowlist' {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Environment @{
+            COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+            COPILOT_REVIEW_ALLOWED_THREAD_IDS    = '7,9'
+        } -BuildArgs {
+            param($baseUrl)
+            @('-File', $UpdateWrapperScript, '-ThreadId', '42')
+        }
+
+        $result.ExitCode | Should -Be 1
+        $result.Requests.Count | Should -Be 0
+        $result.Errors | Should -Match 'not authorized for status updates'
+    }
+
+    It 'permits status updates for threads in the trusted allowlist' {
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = '{"id":42,"status":"fixed"}' }
+        ) -Environment @{
+            AZUREDEVOPS_TOKEN                  = 'test-token'
+            AZUREDEVOPS_AUTH_TYPE              = 'Basic'
+            AZUREDEVOPS_COLLECTION_URI         = '__BASEURL__/testorg'
+            PROJECT                            = 'TestProject'
+            REPOSITORY                         = 'TestRepo'
+            PRID                               = '123'
+            COPILOT_REVIEW_REQUIRE_COMMENT_FILE = 'true'
+            COPILOT_REVIEW_ALLOWED_THREAD_IDS   = '42'
+        } -BuildArgs {
+            param($baseUrl)
+            @('-File', $UpdateWrapperScript, '-ThreadId', '42', '-Status', 'Fixed')
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Requests.Count | Should -Be 1
+        $result.Requests[0].Path | Should -Match '/threads/42'
     }
 }

@@ -138,6 +138,17 @@ param(
 
 #region Helper Functions
 
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
+
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -231,7 +242,7 @@ function Invoke-AzureDevOpsApi {
 
             if ($isTransient -and $attempt -lt $MaxAttempts) {
                 $delaySeconds = [math]::Pow(2, $attempt)
-                $statusText = if ($statusCode) { "HTTP $statusCode" } else { $_.Exception.Message }
+                $statusText = if ($statusCode) { "HTTP $statusCode" } else { ConvertTo-SafeLogText $_.Exception.Message }
                 Write-Host "Transient Azure DevOps API failure ($statusText) on attempt $attempt of $MaxAttempts. Retrying in $delaySeconds seconds..." -ForegroundColor Yellow
                 Start-Sleep -Seconds $delaySeconds
                 continue
@@ -245,11 +256,13 @@ function Invoke-AzureDevOpsApi {
             if ($statusCode) {
                 Write-Host "##[error]HTTP status: $statusCode"
             }
+            # External text (response bodies can echo request content) goes
+            # through ConvertTo-SafeLogText; the ##[error] prefix stays intact
             if ($responseBody) {
-                Write-Host "##[error]API response: $responseBody"
+                Write-Host "##[error]API response: $(ConvertTo-SafeLogText $responseBody)"
             }
             else {
-                Write-Host "##[error]$($_.Exception.Message)"
+                Write-Host "##[error]$(ConvertTo-SafeLogText $_.Exception.Message)"
             }
 
             if ($statusCode -eq 401) {
@@ -315,7 +328,7 @@ catch {
     exit 1
 }
 
-Write-Host "Found PR: $($pr.title)" -ForegroundColor Green
+Write-Host "Found PR: $(ConvertTo-SafeLogText $pr.title)" -ForegroundColor Green
 
 if ($ThreadId -gt 0) {
     # Reply to existing thread
@@ -360,10 +373,12 @@ if ($ThreadId -gt 0) {
         Write-Host ("=" * 60) -ForegroundColor DarkGray
         Write-Host "`n  Thread ID:    #$ThreadId"
         Write-Host "  Comment ID:   #$($result.id)"
-        Write-Host "  Author:       $($result.author.displayName)"
+        Write-Host "  Author:       $(ConvertTo-SafeLogText $result.author.displayName)"
         Write-Host "  Posted:       $($result.publishedDate)"
         Write-Host "`n  Content:"
-        Write-Host "  $Comment" -ForegroundColor White
+        # Review comments often quote code, which may itself contain logging
+        # commands (e.g. when reviewing pipeline YAML)
+        Write-Host "  $(ConvertTo-SafeLogText $Comment)" -ForegroundColor White
         Write-Host "`n" + ("=" * 60) -ForegroundColor DarkGray
     }
 }
@@ -388,7 +403,7 @@ else {
         $normalizedPath = Format-AzureDevOpsFilePath -Path $FilePath
         $effectiveEndLine = if ($EndLine -gt 0) { $EndLine } else { $StartLine }
         
-        Write-Host "`nCreating inline comment thread on $normalizedPath (Lines $StartLine-$effectiveEndLine)..." -ForegroundColor Cyan
+        Write-Host "`nCreating inline comment thread on $(ConvertTo-SafeLogText $normalizedPath) (Lines $StartLine-$effectiveEndLine)..." -ForegroundColor Cyan
         
         $body.threadContext = @{
             filePath       = $normalizedPath
@@ -489,17 +504,17 @@ else {
         Write-Host "  Status:       $Status"
         if ($isInlineComment -and -not $inlineCommentFailed) {
             Write-Host "  Type:         Inline comment"
-            Write-Host "  File:         $(Format-AzureDevOpsFilePath -Path $FilePath)"
+            Write-Host "  File:         $(ConvertTo-SafeLogText (Format-AzureDevOpsFilePath -Path $FilePath))"
             $effectiveEndLine = if ($EndLine -gt 0) { $EndLine } else { $StartLine }
             Write-Host "  Lines:        $StartLine-$effectiveEndLine"
         } else {
             Write-Host "  Type:         General comment"
         }
         Write-Host "  Comment ID:   #$($result.comments[0].id)"
-        Write-Host "  Author:       $($result.comments[0].author.displayName)"
+        Write-Host "  Author:       $(ConvertTo-SafeLogText $result.comments[0].author.displayName)"
         Write-Host "  Posted:       $($result.comments[0].publishedDate)"
         Write-Host "`n  Content:"
-        Write-Host "  $Comment" -ForegroundColor White
+        Write-Host "  $(ConvertTo-SafeLogText $Comment)" -ForegroundColor White
         Write-Host "`n" + ("=" * 60) -ForegroundColor DarkGray
         
         Write-Host "`nTip: Use -ThreadId $($result.id) to reply to this thread." -ForegroundColor DarkGray

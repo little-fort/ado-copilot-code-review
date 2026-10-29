@@ -75,6 +75,17 @@ param(
 
 #region Helper Functions
 
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
+
 function Write-Output-Line {
     param(
         [string]$Message = "",
@@ -91,8 +102,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -127,11 +139,28 @@ function Invoke-AzureDevOpsApi {
     param(
         [string]$Uri,
         [hashtable]$Headers,
-        [string]$Method = "Get"
+        [string]$Method = "Get",
+        # Optional: receives the response headers (needed for endpoints that
+        # page via a continuation-token header).
+        [ref]$ResponseHeaders
     )
-    
+
     try {
-        $response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method $Method -ErrorAction Stop
+        $params = @{
+            Uri         = $Uri
+            Headers     = $Headers
+            Method      = $Method
+            ErrorAction = 'Stop'
+        }
+        $captureHeaders = $ResponseHeaders -and $PSVersionTable.PSVersion.Major -ge 6
+        if ($captureHeaders) {
+            $params.ResponseHeadersVariable = 'capturedHeaders'
+        }
+
+        $response = Invoke-RestMethod @params
+        if ($captureHeaders) {
+            $ResponseHeaders.Value = $capturedHeaders
+        }
         return $response
     }
     catch {
@@ -142,7 +171,7 @@ function Invoke-AzureDevOpsApi {
             $statusCode = $_.Exception.Response.StatusCode.value__
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $errorDetail = $_.ErrorDetails.Message
+            $errorDetail = ConvertTo-SafeLogText $_.ErrorDetails.Message
         }
 
         # Build a descriptive error message with all available context
@@ -162,7 +191,7 @@ function Invoke-AzureDevOpsApi {
             Write-Error "$baseMsg — API response: $errorDetail"
         }
         else {
-            Write-Error "$baseMsg — $($_.Exception.Message)"
+            Write-Error "$baseMsg — $(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         return $null
     }
@@ -197,6 +226,128 @@ function Get-ChangeTypeDisplay {
     }
 }
 
+function Get-ContinuationToken {
+    # Returns the x-ms-continuationtoken response header value, or $null when
+    # absent. Header names are matched case-insensitively.
+    param($ResponseHeaders)
+
+    if (-not $ResponseHeaders) {
+        return $null
+    }
+    foreach ($name in $ResponseHeaders.Keys) {
+        if ($name -ieq 'x-ms-continuationtoken') {
+            $value = @($ResponseHeaders[$name])[0]
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return [string]$value
+            }
+        }
+    }
+    return $null
+}
+
+function Get-PullRequestCommits {
+    <#
+        Retrieves every commit in the pull request (issue #64). The commits
+        endpoint pages via a continuation token: when more commits exist, the
+        response carries an x-ms-continuationtoken header to send back as the
+        continuationToken query parameter.
+
+        Returns Items plus Status: 'Complete', 'Partial', or 'Failed'.
+    #>
+    param(
+        [string]$BaseUrl,
+        [hashtable]$Headers,
+        [string]$ApiVersion,
+        [int]$MaxPages = 50
+    )
+
+    $commits = [System.Collections.Generic.List[object]]::new()
+    $seenTokens = [System.Collections.Generic.HashSet[string]]::new()
+    $token = $null
+
+    for ($pageNumber = 1; $pageNumber -le $MaxPages; $pageNumber++) {
+        $uri = "$BaseUrl/commits?$ApiVersion"
+        if ($token) {
+            $uri += "&continuationToken=$([uri]::EscapeDataString($token))"
+        }
+
+        $responseHeaders = $null
+        $page = Invoke-AzureDevOpsApi -Uri $uri -Headers $Headers -ResponseHeaders ([ref]$responseHeaders)
+        if ($null -eq $page) {
+            $status = if ($pageNumber -eq 1) { 'Failed' } else { 'Partial' }
+            return [pscustomobject]@{ Items = $commits; Status = $status }
+        }
+        if ($page.value) {
+            $commits.AddRange([object[]]@($page.value))
+        }
+
+        $token = Get-ContinuationToken -ResponseHeaders $responseHeaders
+        if (-not $token) {
+            return [pscustomobject]@{ Items = $commits; Status = 'Complete' }
+        }
+        if (-not $seenTokens.Add($token)) {
+            # A repeated token would loop forever; keep what was retrieved
+            return [pscustomobject]@{ Items = $commits; Status = 'Partial' }
+        }
+    }
+
+    return [pscustomobject]@{ Items = $commits; Status = 'Partial' }
+}
+
+function Get-IterationChanges {
+    <#
+        Retrieves every changed file in an iteration (see issue #64). The changes
+        endpoint returns 100 entries per page by default (2000 at most) and
+        reports the next page through nextSkip/nextTop, which are 0 on the
+        last page.
+
+        Returns Items plus Status: 'Complete', 'Partial', or 'Failed' (see
+        Get-PullRequestCommits).
+    #>
+    param(
+        [string]$BaseUrl,
+        [hashtable]$Headers,
+        [string]$ApiVersion,
+        [int]$IterationId,
+        [int]$MaxPages = 100
+    )
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $skip = 0
+    $top = 0
+
+    for ($pageNumber = 1; $pageNumber -le $MaxPages; $pageNumber++) {
+        $uri = "$BaseUrl/iterations/$IterationId/changes?$ApiVersion"
+        if ($pageNumber -gt 1) {
+            $uri += "&`$top=$top&`$skip=$skip"
+        }
+
+        $page = Invoke-AzureDevOpsApi -Uri $uri -Headers $Headers
+        if ($null -eq $page) {
+            $status = if ($pageNumber -eq 1) { 'Failed' } else { 'Partial' }
+            return [pscustomobject]@{ Items = $entries; Status = $status }
+        }
+        if ($page.changeEntries) {
+            $entries.AddRange([object[]]@($page.changeEntries))
+        }
+
+        # Missing paging fields cast to 0, which ends the loop
+        $nextSkip = [int]$page.nextSkip
+        $nextTop = [int]$page.nextTop
+        if ($nextTop -le 0) {
+            return [pscustomobject]@{ Items = $entries; Status = 'Complete' }
+        }
+        if ($nextSkip -le $skip) {
+            # A next page that does not advance would loop forever
+            return [pscustomobject]@{ Items = $entries; Status = 'Partial' }
+        }
+        $skip = $nextSkip
+        $top = $nextTop
+    }
+
+    return [pscustomobject]@{ Items = $entries; Status = 'Partial' }
+}
+
 #endregion
 
 #region Main Logic
@@ -219,7 +370,7 @@ if ($null -eq $pr) {
     exit 1
 }
 
-Write-Host "Found PR: $($pr.title)" -ForegroundColor Green
+Write-Host "Found PR: $(ConvertTo-SafeLogText $pr.title)" -ForegroundColor Green
 Write-Host "Status: $($pr.status.ToUpper())" -ForegroundColor $(if ($pr.status -eq "active") { "Green" } else { "Yellow" })
 
 # Get iterations
@@ -237,15 +388,20 @@ $iterationId = $latestIteration.id
 
 Write-Host "Found $($iterations.count) iteration(s). Using latest: Iteration #$iterationId" -ForegroundColor Green
 
-# Get commits for the PR
+# Get all commits for the PR (paged)
 Write-Host "`nRetrieving commits..." -ForegroundColor Cyan
-$commitsUrl = "$baseUrl/commits?$apiVersion"
-$commits = Invoke-AzureDevOpsApi -Uri $commitsUrl -Headers $headers
+$commitResult = Get-PullRequestCommits -BaseUrl $baseUrl -Headers $headers -ApiVersion $apiVersion
+if ($commitResult.Status -eq 'Partial') {
+    Write-Host "##[warning]Only $($commitResult.Items.Count) commit(s) could be retrieved; the commit list for this PR is incomplete."
+}
 
-# Get changes for the latest iteration
+# Get all changed files for the latest iteration (paged)
 Write-Host "Retrieving changes for iteration #$iterationId..." -ForegroundColor Cyan
-$changesUrl = "$baseUrl/iterations/$iterationId/changes?$apiVersion"
-$changes = Invoke-AzureDevOpsApi -Uri $changesUrl -Headers $headers
+$changeResult = Get-IterationChanges -BaseUrl $baseUrl -Headers $headers -ApiVersion $apiVersion -IterationId $iterationId
+if ($changeResult.Status -eq 'Partial') {
+    Write-Host "##[warning]Only $($changeResult.Items.Count) changed file(s) could be retrieved; the changed-file list for this PR is incomplete."
+}
+$changeEntries = $changeResult.Items
 
 # Display results
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
@@ -268,10 +424,15 @@ if ($latestIteration.targetRefCommit) {
 
 # Commits
 Write-Output-Line "`n[Commits in this PR]" -ForegroundColor Yellow
-if ($commits -and $commits.value -and $commits.value.Count -gt 0) {
-    Write-Output-Line "  Total commits: $($commits.value.Count)`n"
-    
-    foreach ($commit in $commits.value) {
+if ($commitResult.Items.Count -gt 0) {
+    if ($commitResult.Status -eq 'Partial') {
+        Write-Output-Line "  Commits retrieved: $($commitResult.Items.Count) (INCOMPLETE: Azure DevOps did not return the full list; more commits exist)`n"
+    }
+    else {
+        Write-Output-Line "  Total commits: $($commitResult.Items.Count)`n"
+    }
+
+    foreach ($commit in $commitResult.Items) {
         $shortId = $commit.commitId.Substring(0, 8)
         $message = $commit.comment -split "`n" | Select-Object -First 1
         if ($message.Length -gt 60) {
@@ -281,20 +442,30 @@ if ($commits -and $commits.value -and $commits.value.Count -gt 0) {
         Write-Output-Line "           Author: $($commit.author.name) | $(Format-DateForDisplay $commit.author.date)" -ForegroundColor DarkGray
     }
 }
+elseif ($commitResult.Status -eq 'Failed') {
+    Write-Output-Line "  Commits could not be retrieved from Azure DevOps."
+}
 else {
     Write-Output-Line "  No commits found."
 }
 
 # Changed Files
 Write-Output-Line "`n[Changed Files]" -ForegroundColor Yellow
-if ($changes -and $changes.changeEntries -and $changes.changeEntries.Count -gt 0) {
+if ($changeEntries.Count -gt 0) {
     # Group by change type for summary
-    $addedCount = ($changes.changeEntries | Where-Object { $_.changeType -eq "add" }).Count
-    $modifiedCount = ($changes.changeEntries | Where-Object { $_.changeType -eq "edit" }).Count
-    $deletedCount = ($changes.changeEntries | Where-Object { $_.changeType -eq "delete" }).Count
-    $otherCount = $changes.changeEntries.Count - $addedCount - $modifiedCount - $deletedCount
-    
-    Write-Output-Line "  Total files changed: $($changes.changeEntries.Count)"
+    $addedCount = ($changeEntries | Where-Object { $_.changeType -eq "add" }).Count
+    $modifiedCount = ($changeEntries | Where-Object { $_.changeType -eq "edit" }).Count
+    $deletedCount = ($changeEntries | Where-Object { $_.changeType -eq "delete" }).Count
+    $otherCount = $changeEntries.Count - $addedCount - $modifiedCount - $deletedCount
+
+    if ($changeResult.Status -eq 'Partial') {
+        # Tell the review agent the list is not authoritative so it falls back
+        # to git for the full set of changes
+        Write-Output-Line "  Files retrieved: $($changeEntries.Count) (INCOMPLETE: Azure DevOps did not return the full list; use git to identify every changed file)"
+    }
+    else {
+        Write-Output-Line "  Total files changed: $($changeEntries.Count)"
+    }
     $summaryLine = "  +$addedCount added | ~$modifiedCount modified | -$deletedCount deleted"
     if ($otherCount -gt 0) {
         $summaryLine += " | $otherCount other"
@@ -303,7 +474,7 @@ if ($changes -and $changes.changeEntries -and $changes.changeEntries.Count -gt 0
     Write-Output-Line ""
     
     # List each file
-    foreach ($change in $changes.changeEntries) {
+    foreach ($change in $changeEntries) {
         $changeDisplay = Get-ChangeTypeDisplay -ChangeType $change.changeType
         $filePath = $change.item.path
         
@@ -314,6 +485,11 @@ if ($changes -and $changes.changeEntries -and $changes.changeEntries.Count -gt 0
             Write-Output-Line "         (from: $($change.originalPath))" -ForegroundColor DarkGray
         }
     }
+}
+elseif ($changeResult.Status -eq 'Failed') {
+    # Previously this case printed "No file changes found", which told the
+    # review agent there was nothing to review
+    Write-Output-Line "  Changed files could not be retrieved from Azure DevOps; use git to identify the changed files."
 }
 else {
     Write-Output-Line "  No file changes found in this iteration."

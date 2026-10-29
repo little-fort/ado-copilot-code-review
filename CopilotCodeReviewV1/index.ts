@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as child_process from 'child_process';
 import * as os from 'os';
+import { Readable, Writable } from 'stream';
 
 /**
  * Check if PowerShell 7 (pwsh) is available on the system
@@ -27,12 +28,131 @@ function isWindows(): boolean {
 }
 
 /**
- * Neutralize Azure Pipelines logging-command markers in untrusted text before logging.
- * Prepends a space to any line starting with `##` so Azure Pipelines won't interpret
- * `##vso[...]` or `##[...]` patterns as logging commands.
+ * Neutralizes Azure Pipelines logging-command markers in text that did not
+ * originate from this task (PR content, work items, review-agent output), so
+ * the agent prints it instead of acting on it (see issues #47, #69).
  */
 function sanitizePipelineLog(text: string): string {
-    return text.replace(/^##/gm, ' ##');
+    return text.replace(/##(?=(?:vso)?\[)/gi, '# #');
+}
+
+/**
+ * Narrower variant for output from this task's own PowerShell scripts. Breaks
+ * only `##vso[` and leaves `##[error]`/`##[warning]` lines
+ * intact, because the scripts print those deliberately as diagnostics.
+ */
+function neutralizeLoggingCommands(text: string): string {
+    return text.replace(/##(?=vso\[)/gi, '# #');
+}
+
+type LogSanitizer = (text: string) => string;
+
+/**
+ * A trailing fragment that could be the start of a logging-command marker
+ * ("#", "##", "##v", "##vs", "##vso"). Matched leftmost-first, so it captures
+ * the longest such suffix.
+ */
+const PARTIAL_MARKER_SUFFIX = /#(?:#(?:v(?:s(?:o)?)?)?)?$/i;
+
+/** Longest partial line held back before it is forwarded in pieces. */
+const MAX_PENDING_LINE_CHARS = 64 * 1024;
+
+/**
+ * Copies a child-process output stream to `target`, sanitizing it as it goes.
+ */
+function forwardSanitizedStream(source: Readable, target: Writable, sanitize: LogSanitizer): Promise<void> {
+    return new Promise(resolve => {
+        let pending = '';
+        let finished = false;
+        let waitingForDrain = false;
+
+        const emit = (text: string) => {
+            if (!text) {
+                return;
+            }
+            const accepted = target.write(sanitize(text), 'latin1');
+            if (!accepted && !waitingForDrain && !finished) {
+                waitingForDrain = true;
+                source.pause();
+                target.once('drain', () => {
+                    waitingForDrain = false;
+                    source.resume();
+                });
+            }
+        };
+
+        const finish = () => {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            emit(pending);
+            pending = '';
+            resolve();
+        };
+
+        source.setEncoding('latin1');
+        source.on('data', (chunk: string) => {
+            // Only the new chunk is searched, keeping the scan linear overall
+            const newlineInChunk = chunk.lastIndexOf('\n');
+            pending += chunk;
+
+            let cut: number;
+            if (newlineInChunk >= 0) {
+                cut = pending.length - chunk.length + newlineInChunk + 1;
+            } else if (pending.length > MAX_PENDING_LINE_CHARS) {
+                const partialMarker = PARTIAL_MARKER_SUFFIX.exec(pending);
+                cut = partialMarker ? partialMarker.index : pending.length;
+            } else {
+                return;
+            }
+
+            emit(pending.slice(0, cut));
+            pending = pending.slice(cut);
+        });
+        source.once('end', finish);
+        source.once('close', finish);
+        source.once('error', finish);
+    });
+}
+
+/**
+ * Routes a spawned child's stdout and stderr through `sanitize` into this
+ * process's own streams. This is the single choke point through which all
+ * script and review-agent output reaches the pipeline log (issue #69).
+ */
+function forwardSanitizedOutput(
+    child: child_process.ChildProcess,
+    sanitize: LogSanitizer,
+    options: { stdout?: Writable; stderr?: Writable; drainGraceMs?: number } = {}
+): Promise<number | null> {
+    const { stdout = process.stdout, stderr = process.stderr, drainGraceMs = 5000 } = options;
+
+    const drained: Promise<void>[] = [];
+    if (child.stdout) {
+        drained.push(forwardSanitizedStream(child.stdout, stdout, sanitize));
+    }
+    if (child.stderr) {
+        drained.push(forwardSanitizedStream(child.stderr, stderr, sanitize));
+    }
+
+    return new Promise(resolve => {
+        child.once('exit', (code: number | null) => {
+            let graceTimer: NodeJS.Timeout | undefined;
+            const graceElapsed = new Promise<void>(r => { graceTimer = setTimeout(r, drainGraceMs); });
+            Promise.race([Promise.all(drained), graceElapsed])
+                .then(() => {
+                    clearTimeout(graceTimer);
+                    // No-op for streams that already ended. For pipes still held
+                    // open by a lingering grandchild, destroy() releases the
+                    // handle and fires 'close', which flushes any partial line.
+                    child.stdout?.destroy();
+                    child.stderr?.destroy();
+                    return Promise.all(drained);
+                })
+                .then(() => resolve(code));
+        });
+    });
 }
 
 /**
@@ -1070,12 +1190,16 @@ async function runPowerShellScript(scriptPath: string, args: string[]): Promise<
             ['-NoProfile', '-File', scriptPath, ...args],
             {
                 shell: false,
-                stdio: 'inherit',
+                // Output is piped (not inherited) so every line passes the
+                // logging-command filter before reaching the pipeline log
+                stdio: ['inherit', 'pipe', 'pipe'],
                 env: envVars
             }
         );
 
-        psProcess.on('close', (code) => {
+        // The scripts print PR and work item content; break any ##vso[
+        // command in it, keeping the scripts' own ##[error] diagnostics
+        forwardSanitizedOutput(psProcess, neutralizeLoggingCommands).then((code) => {
             if (code === 0) {
                 resolve();
             } else {
@@ -1104,23 +1228,25 @@ async function runCopilotCli(promptFilePath: string, model: string | undefined, 
         // Users can inspect the full prompt via publishPromptArtifacts.
         const printPrompt = diffOnlyActive
             ? `Write-Host '[Diff-only mode] Prompt suppressed; enable publishPromptArtifacts to inspect the full prompt.';`
-            : `Write-Host ========== START PROMPT ==========; Write-Host ($prompt -replace '(?m)^##', ' ##'); Write-Host ========== END PROMPT ==========;`;
+            : `Write-Host ========== START PROMPT ==========; Write-Host $prompt; Write-Host ========== END PROMPT ==========;`;
         const envRefresh = `$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User");`
         // Pipe the prompt via stdin — avoids Windows command-line length limits and
-        // eliminates double-quote escaping issues in prompt content.
+        // eliminates double-quote escaping issues in prompt content. Output is not
+        // filtered here: forwardSanitizedOutput below sanitizes everything this
+        // process (and Copilot under it) writes to stdout or stderr.
         const copilotInvocation = `$prompt | copilot ${copilotFlags}`;
-        const sanitizedCopilotCmd = `$ErrorActionPreference = 'Stop'; try { ${copilotInvocation} | ForEach-Object { Write-Host ($_ -replace '(?m)^##', ' ##') }; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host "Error running Copilot CLI: $_"; exit 1 }`;
-        const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${sanitizedCopilotCmd}`;
+        const copilotCmd = `$ErrorActionPreference = 'Stop'; try { ${copilotInvocation}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host "Error running Copilot CLI: $_"; exit 1 }`;
+        const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${copilotCmd}`;
         console.log(`Running Powershell: ${psCommand}`);
-        
+
         const envVars = { ...process.env };
-        
+
         const copilotProcess = child_process.spawn(
             'pwsh',
             ['-NoProfile', '-Command', psCommand],
             {
                 shell: false,
-                stdio: 'inherit',
+                stdio: ['inherit', 'pipe', 'pipe'],
                 cwd: workingDirectory,
                 env: envVars
             }
@@ -1133,7 +1259,9 @@ async function runCopilotCli(promptFilePath: string, model: string | undefined, 
             reject(new Error(`Copilot review timed out after ${timeoutMs / 60000} minutes`));
         }, timeoutMs);
 
-        copilotProcess.on('close', (code) => {
+        // Review-agent output can quote PR content verbatim, and nothing in it is
+        // a deliberate logging command, so every marker is neutralized
+        forwardSanitizedOutput(copilotProcess, sanitizePipelineLog).then((code) => {
             clearTimeout(timeoutId);
             if (code === 0) {
                 resolve();
@@ -1224,6 +1352,9 @@ async function runClaudeCodeCli(
         // Tool use events arrive as: content_block_start (tool name) → input_json_delta fragments → content_block_stop.
         // We accumulate input fragments with $script:-scoped state and print the tool name + input on block stop.
         // $ErrorActionPreference = 'Stop' ensures process startup failures are catchable.
+        // Printed text is not filtered here: forwardSanitizedOutput below sanitizes
+        // everything this process writes, including tool inputs that carry comment
+        // markdown and unparseable lines echoed by the catch block.
         const streamParser = [
             `$ErrorActionPreference = 'Stop';`,
             `$script:toolNames = @{};`,
@@ -1235,7 +1366,7 @@ async function runClaudeCodeCli(
             `    if ($ev.type -ne 'stream_event') { return }`,
             `    $se = $ev.event;`,
             `    if ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'text_delta') {`,
-            `      Write-Host ($se.delta.text -replace '(?m)^##', ' ##')`,
+            `      Write-Host $se.delta.text`,
             `    }`,
             `    elseif ($se.type -eq 'content_block_start' -and $se.content_block.type -eq 'tool_use') {`,
             `      $idx = [string]$se.index;`,
@@ -1252,7 +1383,7 @@ async function runClaudeCodeCli(
             `      $raw = $script:toolInputs[$idx];`,
             `      try { $inp = ($raw | ConvertFrom-Json -ErrorAction Stop); $display = ($inp | ConvertTo-Json -Compress) } catch { $display = $raw };`,
             `      Write-Host '';`,
-            `      Write-Host ("    [$name] $display" -replace '(?m)^##', ' ##');`,
+            `      Write-Host "    [$name] $display";`,
             `      $script:toolNames.Remove($idx);`,
             `      $script:toolInputs.Remove($idx)`,
             `    }`,
@@ -1267,7 +1398,7 @@ async function runClaudeCodeCli(
         // Users can inspect the full prompt via publishPromptArtifacts.
         const printPrompt = diffOnlyActive
             ? `Write-Host '[Diff-only mode] Prompt suppressed; enable publishPromptArtifacts to inspect the full prompt.';`
-            : `Write-Host ========== START PROMPT ==========; Write-Host ($prompt -replace '(?m)^##', ' ##'); Write-Host ========== END PROMPT ==========;`;
+            : `Write-Host ========== START PROMPT ==========; Write-Host $prompt; Write-Host ========== END PROMPT ==========;`;
         const envRefresh = isWindows()
             ? `$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User");`
             : '';
@@ -1281,7 +1412,7 @@ async function runClaudeCodeCli(
             ['-NoProfile', '-Command', psCommand],
             {
                 shell: false,
-                stdio: 'inherit',
+                stdio: ['inherit', 'pipe', 'pipe'],
                 cwd: workingDirectory,
                 env: envVars
             }
@@ -1294,7 +1425,8 @@ async function runClaudeCodeCli(
             reject(new Error(`Claude Code review timed out after ${timeoutMs / 60000} minutes`));
         }, timeoutMs);
 
-        claudeProcess.on('close', (code) => {
+        // Same full neutralization as the Copilot path — see runCopilotCli
+        forwardSanitizedOutput(claudeProcess, sanitizePipelineLog).then((code) => {
             clearTimeout(timeoutId);
             if (code === 0) {
                 resolve();
@@ -1317,4 +1449,13 @@ if (require.main === module) {
 }
 
 // Exported for tests
-export { runInstallerWithRetry, normalizeGitHubHost, buildReviewDirectives, applyMinorIssueLimit };
+export {
+    runInstallerWithRetry,
+    normalizeGitHubHost,
+    buildReviewDirectives,
+    applyMinorIssueLimit,
+    sanitizePipelineLog,
+    neutralizeLoggingCommands,
+    forwardSanitizedStream,
+    forwardSanitizedOutput
+};

@@ -12,8 +12,10 @@ function Invoke-ScriptWithMockApi {
         # Receives the mock API base URL (e.g. http://localhost:51234),
         # returns the argument array for pwsh
         [Parameter(Mandatory)] [scriptblock]$BuildArgs,
-        # Ordered responses: @{ Status = <int>; Body = <string> }. An empty
-        # array is valid for tests asserting the script makes no API calls.
+        # Ordered responses: @{ Status = <int>; Body = <string> }, plus an
+        # optional Headers = @{ Name = 'value' } for response headers (e.g.
+        # continuation tokens). An empty array is valid for tests asserting
+        # the script makes no API calls.
         [Parameter(Mandatory)] [AllowEmptyCollection()] [hashtable[]]$Responses,
         # Extra environment variables for the child process only. The token
         # __BASEURL__ in a value is replaced with the mock API base URL,
@@ -78,6 +80,11 @@ function Invoke-ScriptWithMockApi {
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$resp.Body)
                 $ctx.Response.StatusCode = [int]$resp.Status
                 $ctx.Response.ContentType = 'application/json'
+                if ($resp.Headers) {
+                    foreach ($headerName in $resp.Headers.Keys) {
+                        $ctx.Response.AddHeader($headerName, [string]$resp.Headers[$headerName])
+                    }
+                }
                 $ctx.Response.ContentLength64 = $bytes.Length
                 $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
                 $ctx.Response.Close()

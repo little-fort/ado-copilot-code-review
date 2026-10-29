@@ -69,6 +69,17 @@ param(
 
 #region Helper Functions
 
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
+
 function Write-Output-Line {
     param(
         [string]$Message = "",
@@ -85,8 +96,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -136,7 +148,7 @@ function Invoke-AzureDevOpsApi {
             $statusCode = $_.Exception.Response.StatusCode.value__
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $errorDetail = $_.ErrorDetails.Message
+            $errorDetail = ConvertTo-SafeLogText $_.ErrorDetails.Message
         }
 
         # Build a descriptive error message with all available context
@@ -156,7 +168,7 @@ function Invoke-AzureDevOpsApi {
             Write-Error "$baseMsg — API response: $errorDetail"
         }
         else {
-            Write-Error "$baseMsg — $($_.Exception.Message)"
+            Write-Error "$baseMsg — $(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         return $null
     }

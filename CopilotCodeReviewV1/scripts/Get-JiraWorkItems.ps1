@@ -112,6 +112,17 @@ param(
 
 #region Helper Functions
 
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
+
 function Write-Output-Line {
     param(
         [string]$Message = "",
@@ -128,8 +139,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -204,10 +216,10 @@ function Invoke-JiraApi {
             Write-Host "##[error]HTTP status: $statusCode"
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            Write-Host "##[error]API response: $($_.ErrorDetails.Message)"
+            Write-Host "##[error]API response: $(ConvertTo-SafeLogText $_.ErrorDetails.Message)"
         }
         else {
-            Write-Host "##[error]$($_.Exception.Message)"
+            Write-Host "##[error]$(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         if ($statusCode -eq 401) {
             Write-Host "##[error]Authentication failed. Verify the Jira email and API token (created at https://id.atlassian.com/manage-profile/security/api-tokens)."
@@ -281,7 +293,7 @@ function Resolve-JiraApiRoot {
     # type mismatch, so it fails without a fallback attempt.
     $siteAuth = Test-JiraAuth -Root $BaseUrl -Headers $Headers
     if ($siteAuth.Ok) {
-        Write-Host "Authenticated to Jira as: $($siteAuth.DisplayName)" -ForegroundColor Green
+        Write-Host "Authenticated to Jira as: $(ConvertTo-SafeLogText $siteAuth.DisplayName)" -ForegroundColor Green
         return $BaseUrl
     }
 
@@ -307,7 +319,7 @@ function Resolve-JiraApiRoot {
     $gatewayRoot = "$GatewayBaseUrl/ex/jira/$cloudId"
     $gatewayAuth = Test-JiraAuth -Root $gatewayRoot -Headers $Headers
     if ($gatewayAuth.Ok) {
-        Write-Host "Authenticated to Jira as: $($gatewayAuth.DisplayName)" -ForegroundColor Green
+        Write-Host "Authenticated to Jira as: $(ConvertTo-SafeLogText $gatewayAuth.DisplayName)" -ForegroundColor Green
         Write-Host "Scoped API token detected — using the Atlassian platform gateway ($gatewayRoot)." -ForegroundColor Cyan
         return $gatewayRoot
     }
@@ -361,7 +373,7 @@ function Resolve-JiraCustomFields {
             $catalog = Invoke-RestMethod -Uri "$ApiRoot/rest/api/3/field" -Headers $Headers -Method Get -ErrorAction Stop
         }
         catch {
-            Write-Host "##[warning]Could not retrieve the Jira field catalog to resolve custom field names ($($_.Exception.Message)); skipping: $($pendingNames -join ', ')"
+            Write-Host "##[warning]Could not retrieve the Jira field catalog to resolve custom field names ($(ConvertTo-SafeLogText $_.Exception.Message)); skipping: $($pendingNames -join ', ')"
         }
 
         if ($catalog) {
@@ -490,7 +502,7 @@ function Get-JiraCommentWindow {
     catch {
         # Comments are supplemental — degrade to the oldest available page
         # rather than failing the run.
-        Write-Host "##[warning]Could not fetch the most recent comments for ${Key}: $($_.Exception.Message). Showing older comments instead."
+        Write-Host "##[warning]Could not fetch the most recent comments for ${Key}: $(ConvertTo-SafeLogText $_.Exception.Message). Showing older comments instead."
         $rendered = @($Issue.renderedFields.comment.comments)
         $tailStart = [Math]::Max(0, $embedded.Count - $windowSize)
         $window = for ($i = $tailStart; $i -lt $embedded.Count; $i++) {
@@ -587,7 +599,7 @@ try {
     $prMetadata = Get-Content -Path $PrMetadataFile -Raw | ConvertFrom-Json
 }
 catch {
-    Write-Host "##[error]Failed to parse PR metadata file: $_"
+    Write-Host "##[error]Failed to parse PR metadata file: $(ConvertTo-SafeLogText "$_")"
     exit 1
 }
 
@@ -648,7 +660,7 @@ try {
         }
 
         $issues += $issue
-        Write-Host "  $key — found: $($issue.fields.summary)" -ForegroundColor Green
+        Write-Host "  $key — found: $(ConvertTo-SafeLogText $issue.fields.summary)" -ForegroundColor Green
     }
 }
 catch {

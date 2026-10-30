@@ -1307,6 +1307,73 @@ async function installClaudeCodeCli(): Promise<void> {
     }
 }
 
+/**
+ * Builds the PowerShell script that runs `claudeInvocation` (a `claude -p ...
+ * --output-format stream-json --include-partial-messages` command) and turns
+ * its JSON event stream into readable log output in real time.
+ */
+function buildClaudeStreamParser(claudeInvocation: string): string {
+    return [
+        `$ErrorActionPreference = 'Stop';`,
+        `$script:toolNames = @{};`,
+        `$script:toolInputs = @{};`,
+        `$script:atLineStart = $true;`,
+        `try {`,
+        `${claudeInvocation} | ForEach-Object {`,
+        `  $line = [string]$_;`,
+        `  if ([string]::IsNullOrWhiteSpace($line)) { return };`,
+        `  try { $ev = ($line | ConvertFrom-Json -ErrorAction Stop) } catch { $ev = $null };`,
+        `  if ($null -eq $ev) {`,
+        `    if (-not $script:atLineStart) { Write-Host '' };`,
+        `    Write-Host $line;`,
+        `    $script:atLineStart = $true;`,
+        `    return`,
+        `  };`,
+        `  try {`,
+        `    if ($ev.type -ne 'stream_event') { return }`,
+        `    $se = $ev.event;`,
+        `    if ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'text_delta') {`,
+        `      $text = [string]$se.delta.text;`,
+        `      if ($text) { Write-Host $text -NoNewline; $script:atLineStart = $text.EndsWith([char]10) }`,
+        `    }`,
+        `    elseif ($se.type -eq 'content_block_start' -and $se.content_block.type -eq 'tool_use') {`,
+        `      $idx = [string]$se.index;`,
+        `      $script:toolNames[$idx] = $se.content_block.name;`,
+        `      $script:toolInputs[$idx] = ''`,
+        `    }`,
+        `    elseif ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'input_json_delta') {`,
+        `      $idx = [string]$se.index;`,
+        `      $script:toolInputs[$idx] += $se.delta.partial_json`,
+        `    }`,
+        `    elseif ($se.type -eq 'content_block_stop' -and $script:toolNames.ContainsKey([string]$se.index)) {`,
+        `      $idx = [string]$se.index;`,
+        `      $name = $script:toolNames[$idx];`,
+        `      $raw = $script:toolInputs[$idx];`,
+        `      try { $inp = ($raw | ConvertFrom-Json -ErrorAction Stop); $display = ($inp | ConvertTo-Json -Compress) } catch { $display = $raw };`,
+        `      if (-not $script:atLineStart) { Write-Host '' };`,
+        `      Write-Host '';`,
+        `      Write-Host "    [$name] $display";`,
+        `      $script:atLineStart = $true;`,
+        `      $script:toolNames.Remove($idx);`,
+        `      $script:toolInputs.Remove($idx)`,
+        `    }`,
+        `    elseif ($se.type -eq 'content_block_stop' -and -not $script:atLineStart) {`,
+        `      Write-Host '';`,
+        `      $script:atLineStart = $true`,
+        `    }`,
+        `  } catch {`,
+        `    if (-not $script:atLineStart) { Write-Host '' };`,
+        `    Write-Host "Could not process a Claude Code stream event: $_";`,
+        `    $script:atLineStart = $true`,
+        `  }`,
+        `};`,
+        `if (-not $script:atLineStart) { Write-Host '' };`,
+        `Write-Host '';`,
+        `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+        `} catch { if (-not $script:atLineStart) { Write-Host '' }; Write-Host "Error running Claude Code CLI: $_"; exit 1 }`
+    ].join(' ');
+}
+
 async function runClaudeCodeCli(
     promptFilePath: string,
     model: string | undefined,
@@ -1348,51 +1415,7 @@ async function runClaudeCodeCli(
             ? `$prompt | claude -p ${claudeFlags}`
             : `claude -p "$prompt" ${claudeFlags}`;
 
-        // PowerShell pipeline: stream JSON from Claude Code, extract text deltas and tool calls in real time.
-        // Tool use events arrive as: content_block_start (tool name) → input_json_delta fragments → content_block_stop.
-        // We accumulate input fragments with $script:-scoped state and print the tool name + input on block stop.
-        // $ErrorActionPreference = 'Stop' ensures process startup failures are catchable.
-        // Printed text is not filtered here: forwardSanitizedOutput below sanitizes
-        // everything this process writes, including tool inputs that carry comment
-        // markdown and unparseable lines echoed by the catch block.
-        const streamParser = [
-            `$ErrorActionPreference = 'Stop';`,
-            `$script:toolNames = @{};`,
-            `$script:toolInputs = @{};`,
-            `try {`,
-            `${claudeInvocation} | ForEach-Object {`,
-            `  try {`,
-            `    $ev = ($_ | ConvertFrom-Json -ErrorAction Stop);`,
-            `    if ($ev.type -ne 'stream_event') { return }`,
-            `    $se = $ev.event;`,
-            `    if ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'text_delta') {`,
-            `      Write-Host $se.delta.text`,
-            `    }`,
-            `    elseif ($se.type -eq 'content_block_start' -and $se.content_block.type -eq 'tool_use') {`,
-            `      $idx = [string]$se.index;`,
-            `      $script:toolNames[$idx] = $se.content_block.name;`,
-            `      $script:toolInputs[$idx] = ''`,
-            `    }`,
-            `    elseif ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'input_json_delta') {`,
-            `      $idx = [string]$se.index;`,
-            `      $script:toolInputs[$idx] += $se.delta.partial_json`,
-            `    }`,
-            `    elseif ($se.type -eq 'content_block_stop' -and $script:toolNames.ContainsKey([string]$se.index)) {`,
-            `      $idx = [string]$se.index;`,
-            `      $name = $script:toolNames[$idx];`,
-            `      $raw = $script:toolInputs[$idx];`,
-            `      try { $inp = ($raw | ConvertFrom-Json -ErrorAction Stop); $display = ($inp | ConvertTo-Json -Compress) } catch { $display = $raw };`,
-            `      Write-Host '';`,
-            `      Write-Host "    [$name] $display";`,
-            `      $script:toolNames.Remove($idx);`,
-            `      $script:toolInputs.Remove($idx)`,
-            `    }`,
-            `  } catch { Write-Host $_ }`,
-            `};`,
-            `Write-Host '';`,
-            `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
-            `} catch { Write-Host "Error running Claude Code CLI: $_"; exit 1 }`
-        ].join(' ');
+        const streamParser = buildClaudeStreamParser(claudeInvocation);
 
         // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
         // Users can inspect the full prompt via publishPromptArtifacts.
@@ -1457,5 +1480,6 @@ export {
     sanitizePipelineLog,
     neutralizeLoggingCommands,
     forwardSanitizedStream,
-    forwardSanitizedOutput
+    forwardSanitizedOutput,
+    buildClaudeStreamParser
 };

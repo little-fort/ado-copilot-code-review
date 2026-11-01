@@ -19,7 +19,8 @@ BeforeDiscovery {
         'Get-AzureDevOpsPR.ps1',
         'Get-AzureDevOpsPRChanges.ps1',
         'Get-AzureDevOpsWorkItems.ps1',
-        'Get-JiraWorkItems.ps1'
+        'Get-JiraWorkItems.ps1',
+        'Set-AzureDevOpsPRReviewState.ps1'
     )
 }
 

@@ -546,3 +546,74 @@ Describe 'Get-JiraWorkItems.ps1 expanded fields' {
         $result.Output | Should -Match '\[PROJ-1 - Story\]'
     }
 }
+
+Describe 'Get-JiraWorkItems.ps1 context degradation markers (issue #67)' {
+
+    # A transient fetch failure the script tolerates still leaves the review
+    # with less context, so the task must not record the run as reviewed. A
+    # configuration problem (a field name that does not exist) is not marked:
+    # it would block recording on every run.
+
+    BeforeEach {
+        $script:metadataFile = New-PrMetadataFile -Metadata @{
+            sourceRefName = 'refs/heads/feature/PROJ-1-login'
+            title         = 'Add login'
+            description   = $null
+        }
+        $script:stateDir = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:stateDir | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item (Split-Path -Parent $script:metadataFile) -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'marks the context degraded when the field catalog cannot be read' {
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = $MyselfJson },
+            @{ Status = 500; Body = '{"errorMessages":["boom"]}' },
+            @{ Status = 200; Body = $RichIssueJson }
+        ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+            param($baseUrl)
+            @('-File', $JiraScript,
+              '-BaseUrl', $baseUrl, '-Email', 'me@example.com', '-ApiToken', 'test-token',
+              '-PrMetadataFile', $metadataFile, '-CustomFields', 'acceptance criteria')
+        }
+
+        $result.ExitCode | Should -Be 0
+        Test-Path (Join-Path $stateDir 'context/jira-field-catalog.degraded') | Should -BeTrue
+    }
+
+    It 'marks the context degraded when the most recent comments cannot be fetched' {
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = $MyselfJson },
+            @{ Status = 200; Body = $CappedCommentIssueJson },
+            @{ Status = 500; Body = '{"errorMessages":["boom"]}' }
+        ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+            param($baseUrl)
+            @('-File', $JiraScript,
+              '-BaseUrl', $baseUrl, '-Email', 'me@example.com', '-ApiToken', 'test-token',
+              '-PrMetadataFile', $metadataFile)
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'Showing older comments instead'
+        Test-Path (Join-Path $stateDir 'context/jira-comments-PROJ-1.degraded') | Should -BeTrue
+    }
+
+    It 'does not mark an unresolvable custom field name as degraded' {
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = $MyselfJson },
+            @{ Status = 200; Body = $FieldCatalogJson },
+            @{ Status = 200; Body = $IssueJson }
+        ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+            param($baseUrl)
+            @('-File', $JiraScript,
+              '-BaseUrl', $baseUrl, '-Email', 'me@example.com', '-ApiToken', 'test-token',
+              '-PrMetadataFile', $metadataFile, '-CustomFields', 'Nope Field')
+        }
+
+        $result.ExitCode | Should -Be 0
+        Test-Path (Join-Path $stateDir 'context') | Should -BeFalse
+    }
+}

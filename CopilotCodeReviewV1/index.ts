@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as child_process from 'child_process';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { Readable, Writable } from 'stream';
 
 /**
@@ -231,6 +232,348 @@ function applyMinorIssueLimit(promptContent: string, maxMinorIssues: string): st
     return normalized.replace(/%MINORLIMIT%/g, maxMinorIssues);
 }
 
+// ---------------------------------------------------------------------------
+// Incremental re-reviews (issue #67)
+//
+// After a review, the task records the reviewed iteration as a pull request
+// property (Set-AzureDevOpsPRReviewState.ps1). On later runs,
+// Get-AzureDevOpsPRChanges.ps1 reads those records into Review_State.json so the
+// task can skip an iteration that was already reviewed, or point the agent at
+// what changed since the last review. The helpers below make those decisions;
+// they are pure so the rules can be tested without a pipeline.
+// ---------------------------------------------------------------------------
+
+/** Settings that change what a review looks at or how it reports. */
+interface ReviewConfiguration {
+    agent: 'copilot' | 'claude';
+    model: string;
+    reasoningEffort: string;
+    maxTurns: string;
+    maxBudget: string;
+    providerType: string;
+    providerBaseUrl: string;
+    diffOnly: boolean;
+    promptMode: 'default' | 'prompt' | 'promptFile' | 'promptRaw' | 'promptFileRaw';
+    /** User-supplied prompt text or prompt-file content ('' for the default prompt) */
+    promptText: string;
+    /** Bundled template the prompt is merged into ('' for raw prompts) */
+    templateText: string;
+    resolveThreads: string;
+    suppressPositiveFeedback: boolean;
+    maxMinorIssues: string;
+    /** 'none', 'azureBoards', or the Jira site/project keys/custom fields */
+    workItemSource: string;
+}
+
+/**
+ * Property-name prefix under which this review configuration's records are
+ * stored. Hashing every review-affecting, non-secret setting keeps different
+ * reviews of one PR (say, a Copilot review plus a Claude security review) from
+ * skipping each other, while identical configurations deliberately share state
+ * so the same review never runs twice for the same code.
+ */
+function computeReviewStateKeyPrefix(config: ReviewConfiguration): string {
+    const normalizeText = (text: string) => text.replace(/\r\n?/g, '\n').trim();
+    // An array keeps the canonical form independent of property order
+    const canonical = JSON.stringify([
+        config.agent,
+        config.model,
+        config.reasoningEffort,
+        config.maxTurns,
+        config.maxBudget,
+        config.providerType.toLowerCase(),
+        config.providerBaseUrl,
+        config.diffOnly,
+        config.promptMode,
+        normalizeText(config.promptText),
+        normalizeText(config.templateText),
+        config.resolveThreads,
+        config.suppressPositiveFeedback,
+        config.maxMinorIssues,
+        config.workItemSource
+    ]);
+    const hash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 16);
+    return `CopilotCodeReview.v1.${hash}`;
+}
+
+interface ReviewDeltaFile {
+    path: string;
+    changeType: string;
+    originalPath?: string | null;
+}
+
+/** Contents of Review_State.json (written by Get-AzureDevOpsPRChanges.ps1). */
+interface ReviewState {
+    currentIteration: number;
+    currentSourceCommit: string;
+    fullChangesStatus: string;
+    stateReadStatus: string;
+    lastReviewedIteration: number | null;
+    lastReviewedSourceCommit: string | null;
+    delta: {
+        status: string;
+        reason: string | null;
+        files: ReviewDeltaFile[];
+    };
+}
+
+/** Reads Review_State.json; null when it is missing or not usable. */
+function readReviewState(filePath: string): ReviewState | null {
+    try {
+        if (!fs.existsSync(filePath)) {
+            return null;
+        }
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^﻿/, ''));
+        if (!parsed || typeof parsed.currentIteration !== 'number' || typeof parsed.currentSourceCommit !== 'string') {
+            return null;
+        }
+        const delta = parsed.delta && typeof parsed.delta === 'object' ? parsed.delta : {};
+        const files: ReviewDeltaFile[] = Array.isArray(delta.files)
+            ? delta.files.filter((file: any) => file && typeof file.path === 'string' && file.path.length > 0)
+            : [];
+        return {
+            currentIteration: parsed.currentIteration,
+            currentSourceCommit: parsed.currentSourceCommit,
+            fullChangesStatus: String(parsed.fullChangesStatus ?? ''),
+            stateReadStatus: String(parsed.stateReadStatus ?? ''),
+            lastReviewedIteration: typeof parsed.lastReviewedIteration === 'number' ? parsed.lastReviewedIteration : null,
+            lastReviewedSourceCommit: typeof parsed.lastReviewedSourceCommit === 'string' ? parsed.lastReviewedSourceCommit : null,
+            delta: {
+                status: String(delta.status ?? 'NotApplicable'),
+                reason: typeof delta.reason === 'string' ? delta.reason : null,
+                files
+            }
+        };
+    } catch {
+        return null;
+    }
+}
+
+/** True when this configuration already reviewed the current iteration's exact commit. */
+function isIterationAlreadyReviewed(state: ReviewState | null): boolean {
+    return !!state &&
+        state.stateReadStatus === 'Found' &&
+        state.currentIteration > 0 &&
+        state.lastReviewedIteration === state.currentIteration &&
+        state.currentSourceCommit.length > 0 &&
+        (state.lastReviewedSourceCommit || '').toLowerCase() === state.currentSourceCommit.toLowerCase();
+}
+
+/** Posting activity reported by the comment scripts during the agent run. */
+interface ReviewActivitySummary {
+    /** False when the activity folder could not be read (no evidence either way) */
+    readable: boolean;
+    /** Completed new threads, replies, and thread updates */
+    completedPosts: number;
+    /** Attempts that started but never reported success */
+    unfinishedAttempts: number;
+    /** Error results reported by the review agent itself */
+    agentErrors: number;
+}
+
+/**
+ * Summarizes the activity folder written by the comment scripts: each attempt
+ * writes "<id>.started" when it begins and "<id>.done" (containing its action)
+ * when it succeeds, so a started attempt without a done marker failed — however
+ * it exited. The wrapper script's own attempts count as failures when they
+ * break off early, but not as posts (the script it calls reports those).
+ */
+function summarizeReviewActivity(stateDir: string): ReviewActivitySummary {
+    const activityDir = path.join(stateDir, 'activity');
+    const summary: ReviewActivitySummary = { readable: true, completedPosts: 0, unfinishedAttempts: 0, agentErrors: 0 };
+
+    let entries: string[];
+    try {
+        entries = fs.existsSync(activityDir) ? fs.readdirSync(activityDir) : [];
+    } catch {
+        return { ...summary, readable: false };
+    }
+
+    const started = new Set<string>();
+    const completed = new Map<string, string>();
+    for (const name of entries) {
+        const attempt = /^([0-9a-f]{32})\.(started|done)$/i.exec(name);
+        if (attempt) {
+            if (attempt[2].toLowerCase() === 'started') {
+                started.add(attempt[1]);
+            } else {
+                let action = '';
+                try {
+                    action = fs.readFileSync(path.join(activityDir, name), 'utf8').trim();
+                } catch {
+                    return { ...summary, readable: false };
+                }
+                completed.set(attempt[1], action);
+            }
+        } else if (name.endsWith('.agent-error')) {
+            summary.agentErrors++;
+        }
+    }
+
+    for (const id of started) {
+        if (!completed.has(id)) {
+            summary.unfinishedAttempts++;
+        }
+    }
+    // Only a done marker with a matching started marker is evidence of a post
+    for (const [id, action] of completed) {
+        if (started.has(id) && (action === 'thread' || action === 'reply' || action === 'update')) {
+            summary.completedPosts++;
+        }
+    }
+    return summary;
+}
+
+/**
+ * Creates the per-run state subfolders and confirms they accept writes. The
+ * scripts' markers are best-effort, so a folder that cannot be written would
+ * silently hide failed attempts; recording then must not happen.
+ */
+function prepareReviewStateFolders(stateDir: string): boolean {
+    try {
+        for (const subfolder of ['activity', 'context']) {
+            const dir = path.join(stateDir, subfolder);
+            fs.mkdirSync(dir, { recursive: true });
+            const probe = path.join(dir, `.probe-${process.pid}`);
+            fs.writeFileSync(probe, 'ok');
+            fs.unlinkSync(probe);
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** Context the fetch scripts reported as missing although they succeeded. */
+function collectContextDegradations(stateDir: string): string[] {
+    const contextDir = path.join(stateDir, 'context');
+    try {
+        if (!fs.existsSync(contextDir)) {
+            return [];
+        }
+        return fs.readdirSync(contextDir)
+            .filter(name => name.endsWith('.degraded'))
+            .sort()
+            .map(name => {
+                const detail = fs.readFileSync(path.join(contextDir, name), 'utf8').trim();
+                return detail || name.replace(/\.degraded$/, '');
+            });
+    } catch {
+        return ['The review context status could not be read.'];
+    }
+}
+
+/**
+ * Whether the code the agent reviewed is known to be the iteration about to be
+ * recorded. A diff-only review diffed that exact commit itself. Otherwise the
+ * agent read the checked-out files: a PR validation build exposes the reviewed
+ * commit as System.PullRequest.SourceCommitId; other runs must have the commit
+ * checked out (HEAD) or merged into the checkout (HEAD^2, the PR side of a
+ * merge commit). A commit that merely exists locally is not enough — the
+ * manual-trigger setup can check out a different branch.
+ */
+function isSnapshotBound(options: {
+    currentSourceCommit: string;
+    diffOnlyActive: boolean;
+    pullRequestSourceCommitId?: string;
+    headCommit?: string;
+    headSecondParent?: string;
+}): boolean {
+    const target = options.currentSourceCommit.trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(target)) {
+        return false;
+    }
+    if (options.diffOnlyActive) {
+        return true;
+    }
+    const sameCommit = (sha?: string) => !!sha && sha.trim().toLowerCase() === target;
+    if (options.pullRequestSourceCommitId && options.pullRequestSourceCommitId.trim()) {
+        return sameCommit(options.pullRequestSourceCommitId);
+    }
+    return sameCommit(options.headCommit) || sameCommit(options.headSecondParent);
+}
+
+/**
+ * Decides whether a finished review run may be recorded as having reviewed
+ * the current iteration. Every condition guards against marking code as
+ * reviewed when it was not — the cost of a false "no" is only a fuller review
+ * next time, while a false "yes" would let later runs skip or narrow past code
+ * nobody reviewed. Call only after the agent exited successfully.
+ */
+function shouldRecordReviewState(input: {
+    state: ReviewState | null;
+    activity: ReviewActivitySummary;
+    reviewContextWarnings: boolean;
+    contextDegradations: string[];
+    snapshotBound: boolean;
+    suppressPositiveFeedback: boolean;
+}): { record: boolean; reason: string } {
+    const { state, activity } = input;
+    if (!state || state.currentIteration < 1 || !/^[0-9a-f]{40}$/i.test(state.currentSourceCommit)) {
+        return { record: false, reason: 'the review state for this run is unavailable' };
+    }
+    if (!activity.readable) {
+        return { record: false, reason: 'the comment posting activity could not be read' };
+    }
+    if (activity.agentErrors > 0) {
+        return { record: false, reason: 'the review agent reported an error result' };
+    }
+    if (activity.unfinishedAttempts > 0) {
+        return { record: false, reason: `${activity.unfinishedAttempts} comment posting attempt(s) did not complete` };
+    }
+    if (input.reviewContextWarnings || input.contextDegradations.length > 0) {
+        return { record: false, reason: 'some review context could not be fetched' };
+    }
+    if (state.fullChangesStatus !== 'Complete') {
+        return { record: false, reason: 'the list of changed files was incomplete' };
+    }
+    if (!input.snapshotBound) {
+        return { record: false, reason: `the reviewed code could not be confirmed to be iteration #${state.currentIteration}` };
+    }
+    // With positive feedback suppressed, a clean review legitimately posts nothing
+    if (activity.completedPosts === 0 && !input.suppressPositiveFeedback) {
+        return { record: false, reason: 'no comments, replies, or thread updates were posted' };
+    }
+    return { record: true, reason: `iteration #${state.currentIteration} was reviewed` };
+}
+
+/**
+ * git pathspecs limiting a diff to the given files. ADO paths carry a leading
+ * slash; ':(literal)' stops git from treating characters in file names as
+ * wildcards. Returns null when there are no files or the list would be too
+ * long for a command line (the caller then omits the incremental diff).
+ */
+function buildDeltaPathspecs(
+    files: ReviewDeltaFile[],
+    limits: { maxPaths: number; maxChars: number } = { maxPaths: 500, maxChars: 20000 }
+): string[] | null {
+    const specs = new Set<string>();
+    for (const file of files) {
+        for (const filePath of [file.path, file.originalPath]) {
+            if (filePath) {
+                specs.add(':(literal)' + filePath.replace(/^\/+/, ''));
+            }
+        }
+    }
+    const list = [...specs];
+    if (list.length === 0 || list.length > limits.maxPaths || list.join(' ').length > limits.maxChars) {
+        return null;
+    }
+    return list;
+}
+
+/** Resolves a revision (e.g. HEAD^2) to a commit SHA, or undefined if it does not exist. */
+function gitRevParse(cwd: string, revision: string): string | undefined {
+    try {
+        // No shell: '^' would be an escape character in cmd.exe
+        const result = child_process.spawnSync('git', ['rev-parse', '--verify', '--quiet', `${revision}^{commit}`],
+            { encoding: 'utf8', cwd });
+        return result.status === 0 ? result.stdout.trim() : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 async function run(): Promise<void> {
     try {
         // Check prerequisites first
@@ -450,6 +793,10 @@ async function run(): Promise<void> {
         const resolveThreads = tl.getInput('resolveThreads') || 'all';
         const suppressPositiveFeedback = tl.getBoolInput('suppressPositiveFeedback', false);
         const maxMinorIssues = tl.getInput('maxMinorIssues') || '5';
+        // Default true (issue #67): skip an iteration this review configuration
+        // already reviewed; false forces a fresh review. Read as a string so an
+        // unset input (e.g. local runs) keeps the documented default.
+        const skipReviewedIterations = (tl.getInput('skipReviewedIterations') || 'true').toLowerCase() !== 'false';
 
         // Fail fast on a typo'd value — falling back silently would change
         // which PR threads the agent is allowed to resolve
@@ -623,29 +970,149 @@ async function run(): Promise<void> {
             }
         }
 
-        // Step 1: Install CLI agent if not present
-        if (useClaudeCode) {
-            console.log('\n[Step 1/5] Checking Claude Code CLI installation...');
-            const claudeInstalled = await checkClaudeCodeCli();
-            if (!claudeInstalled) {
-                console.log('Claude Code CLI not found. Installing...');
-                await installClaudeCodeCli();
-            } else {
-                console.log('Claude Code CLI is already installed.');
+        // Validate the prompt inputs before anything is fetched: an invalid
+        // configuration must fail as such, never be masked by an
+        // already-reviewed skip, and the review-state key below depends on
+        // which single prompt input is in use.
+        const activePromptInputs: string[] = [];
+        if (prompt) activePromptInputs.push('prompt');
+        if (isPromptFileSet) activePromptInputs.push('promptFile');
+        if (promptRaw) activePromptInputs.push('promptRaw');
+        if (isPromptFileRawSet) activePromptInputs.push('promptFileRaw');
+
+        if (activePromptInputs.length > 1) {
+            tl.setResult(tl.TaskResult.Failed,
+                `Multiple prompt inputs are set (${activePromptInputs.join(', ')}). Only one prompt input should be provided. ` +
+                'Please use only one of: prompt, promptFile, promptRaw, or promptFileRaw.');
+            return;
+        }
+        if (isPromptFileRawSet && !fs.readFileSync(promptFileRaw!, 'utf8').trim()) {
+            tl.setResult(tl.TaskResult.Failed, `Raw prompt file is empty: ${promptFileRaw}`);
+            return;
+        }
+        if (isPromptFileSet && !fs.readFileSync(promptFile!, 'utf8').trim()) {
+            tl.setResult(tl.TaskResult.Failed, `Prompt file is empty: ${promptFile}`);
+            return;
+        }
+
+        // Context-fetch failures from here on are non-fatal (the review proceeds
+        // with less context), but they should not finish the run as a clean
+        // green: this flag downgrades the final result to SucceededWithIssues so
+        // the pipeline surfaces the degradation without anyone reading the logs.
+        // It also keeps the run from being recorded as reviewed.
+        let reviewContextWarnings = false;
+
+        // Incremental re-review state (issue #67). The prefix identifies this
+        // review configuration; the per-run folder collects what the scripts
+        // report (Review_State.json, posting activity, missing context). The
+        // folder is unique per run, so reused workspaces and other review tasks
+        // in the same job never see each other's files.
+        const promptMode: ReviewConfiguration['promptMode'] = promptRaw ? 'promptRaw'
+            : isPromptFileRawSet ? 'promptFileRaw'
+            : prompt ? 'prompt'
+            : isPromptFileSet ? 'promptFile'
+            : 'default';
+        const readTextFile = (filePath: string): string => {
+            try {
+                return fs.readFileSync(filePath, 'utf8');
+            } catch {
+                return '';
             }
-        } else {
-            console.log('\n[Step 1/5] Checking GitHub Copilot CLI installation...');
-            const copilotInstalled = await checkCopilotCli();
-            if (!copilotInstalled) {
-                console.log('GitHub Copilot CLI not found. Installing...');
-                await installCopilotCli();
-            } else {
-                console.log('GitHub Copilot CLI is already installed.');
+        };
+        const reviewStateKeyPrefix = computeReviewStateKeyPrefix({
+            agent: useClaudeCode ? 'claude' : 'copilot',
+            model: model || '',
+            reasoningEffort: reasoningEffort || '',
+            maxTurns: useClaudeCode ? (maxTurns || '') : '',
+            maxBudget: useClaudeCode ? (maxBudget || '') : '',
+            providerType: useCustomModelProvider ? (copilotProviderType || '') : '',
+            providerBaseUrl: useCustomModelProvider ? (copilotProviderBaseUrl || '') : '',
+            diffOnly: diffOnlyReview,
+            promptMode,
+            promptText: promptMode === 'promptRaw' ? promptRaw!
+                : promptMode === 'promptFileRaw' ? readTextFile(promptFileRaw!)
+                : promptMode === 'prompt' ? prompt!
+                : promptMode === 'promptFile' ? readTextFile(promptFile!)
+                : '',
+            templateText: promptMode === 'default' ? readTextFile(path.join(scriptsDir, 'prompt.txt'))
+                : (promptMode === 'prompt' || promptMode === 'promptFile') ? readTextFile(path.join(scriptsDir, 'prompt-custom.txt'))
+                : '',
+            resolveThreads,
+            suppressPositiveFeedback,
+            maxMinorIssues,
+            workItemSource: !includeWorkItems ? 'none'
+                : useJiraWorkItems ? `jira:${normalizedJiraBaseUrl}|${jiraProjectKeys || ''}|${jiraCustomFields || ''}`
+                : 'azureBoards'
+        });
+        const reviewStateDir = fs.mkdtempSync(path.join(tl.getVariable('Agent.TempDirectory') || os.tmpdir(), 'copilot-review-'));
+        const reviewStateFile = path.join(reviewStateDir, 'Review_State.json');
+        process.env['COPILOT_REVIEW_STATE_DIR'] = reviewStateDir;
+        let reviewBookkeepingWritable = prepareReviewStateFolders(reviewStateDir);
+        if (!reviewBookkeepingWritable) {
+            console.log(`Note: the review state folder ${reviewStateDir} is not writable; this run will not be recorded as reviewed.`);
+        }
+
+        // Self-hosted agents can reuse the workspace, and the fetch scripts only
+        // rewrite these files when their fetch succeeds — a leftover from an
+        // earlier run (possibly another PR) must not be read as this run's
+        for (const staleFile of ['PR_Details.txt', 'Iteration_Details.txt', 'Iteration_Id.txt', 'Source_Commit.txt',
+            'Target_Commit.txt', 'Work_Item_Ids.txt', 'PR_Metadata.json']) {
+            const stalePath = path.join(workingDirectory, staleFile);
+            if (fs.existsSync(stalePath)) {
+                fs.unlinkSync(stalePath);
             }
         }
 
+        // Step 1: Fetch PR changes (iteration details) and the review state.
+        // This runs first so an already-reviewed iteration is skipped before
+        // anything else is fetched or the CLI is installed.
+        console.log('\n[Step 1/6] Fetching pull request changes...');
+        const prChangesScript = path.join(scriptsDir, 'Get-AzureDevOpsPRChanges.ps1');
+        const iterationDetailsOutput = path.join(workingDirectory, 'Iteration_Details.txt');
+
+        await runPowerShellScript(prChangesScript, [
+            '-Token', azureDevOpsToken,
+            '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri,
+            '-Project', project,
+            '-Repository', repository,
+            '-Id', pullRequestId,
+            '-OutputFile', iterationDetailsOutput,
+            '-ReviewStateKeyPrefix', reviewStateKeyPrefix,
+            '-ReviewStateFile', reviewStateFile
+        ]);
+        // The script exits successfully without writing the file in some cases
+        // (e.g. no iterations); stale copies were removed above, so a missing
+        // file means this context is unavailable
+        if (fs.existsSync(iterationDetailsOutput)) {
+            console.log(`Iteration details saved to: ${iterationDetailsOutput}`);
+        } else {
+            tl.warning('Iteration details could not be retrieved. Continuing with less review context.');
+            reviewContextWarnings = true;
+        }
+
+        // Read the iteration ID from the file written by Get-AzureDevOpsPRChanges.ps1
+        const iterationIdFile = path.join(workingDirectory, 'Iteration_Id.txt');
+        if (fs.existsSync(iterationIdFile)) {
+            const iterationId = fs.readFileSync(iterationIdFile, 'utf8').trim();
+            if (iterationId) {
+                process.env['ITERATION_ID'] = iterationId;
+                console.log(`Iteration ID set to: ${iterationId}`);
+            }
+        }
+
+        const reviewState = readReviewState(reviewStateFile);
+        if (skipReviewedIterations && isIterationAlreadyReviewed(reviewState)) {
+            const reviewedIteration = `iteration #${reviewState!.currentIteration} (${reviewState!.currentSourceCommit.substring(0, 8)})`;
+            console.log(`\nThis review configuration already reviewed ${reviewedIteration}; skipping the review.`);
+            console.log('Set skipReviewedIterations to false to review it again.');
+            tl.setResult(tl.TaskResult.Succeeded,
+                `Skipped: ${reviewedIteration} was already reviewed. Set skipReviewedIterations: false to review it again.`);
+            return;
+        }
+
         // Step 2: Fetch PR details
-        console.log('\n[Step 2/5] Fetching pull request details...');
+        console.log('\n[Step 2/6] Fetching pull request details...');
         const prDetailsScript = path.join(scriptsDir, 'Get-AzureDevOpsPR.ps1');
         const prDetailsOutput = path.join(workingDirectory, 'PR_Details.txt');
         
@@ -665,32 +1132,13 @@ async function run(): Promise<void> {
             prDetailsArgs.push('-IncludeHumanThreads');
         }
         await runPowerShellScript(prDetailsScript, prDetailsArgs);
-        console.log(`PR details saved to: ${prDetailsOutput}`);
-
-        // Step 3: Fetch PR changes (iteration details)
-        console.log('\n[Step 3/5] Fetching pull request changes...');
-        const prChangesScript = path.join(scriptsDir, 'Get-AzureDevOpsPRChanges.ps1');
-        const iterationDetailsOutput = path.join(workingDirectory, 'Iteration_Details.txt');
-        
-        await runPowerShellScript(prChangesScript, [
-            '-Token', azureDevOpsToken,
-            '-AuthType', azureDevOpsAuthType,
-            '-CollectionUri', resolvedCollectionUri,
-            '-Project', project,
-            '-Repository', repository,
-            '-Id', pullRequestId,
-            '-OutputFile', iterationDetailsOutput
-        ]);
-        console.log(`Iteration details saved to: ${iterationDetailsOutput}`);
-
-        // Read the iteration ID from the file written by Get-AzureDevOpsPRChanges.ps1
-        const iterationIdFile = path.join(workingDirectory, 'Iteration_Id.txt');
-        if (fs.existsSync(iterationIdFile)) {
-            const iterationId = fs.readFileSync(iterationIdFile, 'utf8').trim();
-            if (iterationId) {
-                process.env['ITERATION_ID'] = iterationId;
-                console.log(`Iteration ID set to: ${iterationId}`);
-            }
+        // Same as the iteration details: the script exits successfully without
+        // writing the file when the pull request cannot be retrieved
+        if (fs.existsSync(prDetailsOutput)) {
+            console.log(`PR details saved to: ${prDetailsOutput}`);
+        } else {
+            tl.warning('Pull request details could not be retrieved. Continuing with less review context.');
+            reviewContextWarnings = true;
         }
 
         // Diff-only mode: pre-compute the git diff from commit SHAs
@@ -760,12 +1208,44 @@ async function run(): Promise<void> {
             }
         }
 
-        // Step 4: Fetch linked work item details (optional)
-        // Context-fetch failures below are non-fatal (the review proceeds with
-        // less context), but they should not finish the run as a clean green:
-        // this flag downgrades the final result to SucceededWithIssues so the
-        // pipeline surfaces the degradation without anyone reading the logs.
-        let reviewContextWarnings = false;
+        // Diff-only mode with a usable review state: also embed the diff of just
+        // what changed since the last review, so the agent can focus on it
+        // without git. Every failure here only means it is left out (the
+        // changed-file list in the iteration details still says what is new).
+        let deltaDiffContent: string | null = null;
+        if (diffContent && reviewState && reviewState.delta.status === 'Complete' &&
+            reviewState.delta.files.length > 0 && reviewState.lastReviewedSourceCommit) {
+            const previousCommit = reviewState.lastReviewedSourceCommit;
+            const currentCommit = reviewState.currentSourceCommit;
+            const pathspecs = buildDeltaPathspecs(reviewState.delta.files);
+            try {
+                if (!pathspecs) {
+                    console.log('  Too many files changed since the last review to embed them separately; using the full diff only.');
+                } else if (child_process.spawnSync('git', ['cat-file', '-e', `${previousCommit}^{commit}`], { cwd: workingDirectory }).status !== 0) {
+                    console.log(`  The last reviewed commit (${previousCommit.substring(0, 8)}) is not available locally; using the changed-file list instead.`);
+                } else {
+                    const deltaResult = child_process.spawnSync(
+                        'git',
+                        ['diff', previousCommit, currentCommit, '--', ...pathspecs],
+                        { encoding: 'utf8', cwd: workingDirectory, maxBuffer: 50 * 1024 * 1024 }
+                    );
+                    if (deltaResult.status !== 0 || !deltaResult.stdout.trim()) {
+                        console.log('  Could not compute the diff since the last review; using the changed-file list instead.');
+                    } else if (deltaResult.stdout.length > diffContent.length / 2) {
+                        // At that size it adds tokens without adding much focus
+                        console.log('  The diff since the last review is over half the size of the full diff; using the full diff only.');
+                    } else {
+                        deltaDiffContent = deltaResult.stdout;
+                        console.log(`  Diff since the last review computed (${deltaDiffContent.length} characters).`);
+                    }
+                }
+            } catch (err) {
+                console.log(`  Could not compute the diff since the last review: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+
+        // Step 3: Fetch linked work item details (optional; failures set
+        // reviewContextWarnings, declared before Step 1)
 
         // Self-hosted agents can reuse the workspace between runs, and the fetch
         // below only (re)creates Work_Item_Details.txt on a successful lookup. A
@@ -779,7 +1259,7 @@ async function run(): Promise<void> {
 
         if (includeWorkItems && useJiraWorkItems) {
             // Jira replaces Azure Boards as the work item source (issue #53)
-            console.log('\n[Step 4/5] Fetching linked Jira issue details...');
+            console.log('\n[Step 3/6] Fetching linked Jira issue details...');
             const prMetadataFile = path.join(workingDirectory, 'PR_Metadata.json');
 
             if (fs.existsSync(prMetadataFile)) {
@@ -812,7 +1292,7 @@ async function run(): Promise<void> {
                 reviewContextWarnings = true;
             }
         } else if (includeWorkItems) {
-            console.log('\n[Step 4/5] Fetching linked work item details...');
+            console.log('\n[Step 3/6] Fetching linked work item details...');
             const workItemIdsFile = path.join(workingDirectory, 'Work_Item_Ids.txt');
 
             if (fs.existsSync(workItemIdsFile)) {
@@ -844,29 +1324,24 @@ async function run(): Promise<void> {
                 console.log('No linked work items for this PR. Skipping work item detail fetch.');
             }
         } else {
-            console.log('\n[Step 4/5] Skipping work item details (disabled).');
+            console.log('\n[Step 3/6] Skipping work item details (disabled).');
         }
 
-        // Step 5: Run CLI agent for code review
-        console.log(`\n[Step 5/5] Running ${agentName} code review...`);
-        
-        // Determine the prompt file to use
+        // Context the fetch scripts could not retrieve although they succeeded
+        // (e.g. existing comment threads) leaves the review incomplete: surface
+        // it like the failures above, and it also blocks recording this run
+        for (const degradation of collectContextDegradations(reviewStateDir)) {
+            tl.warning(`${degradation} Continuing with less review context.`);
+            reviewContextWarnings = true;
+        }
+
+        // Step 4: Prepare the review prompt
+        console.log('\n[Step 4/6] Preparing the review prompt...');
+
+        // Determine the prompt file to use (the prompt inputs were validated
+        // before Step 1)
         let promptFilePath: string = '';
         let customPromptText: string | null = null;
-
-        // Validate that only one prompt input is provided
-        const activePromptInputs: string[] = [];
-        if (prompt) activePromptInputs.push('prompt');
-        if (isPromptFileSet) activePromptInputs.push('promptFile');
-        if (promptRaw) activePromptInputs.push('promptRaw');
-        if (isPromptFileRawSet) activePromptInputs.push('promptFileRaw');
-
-        if (activePromptInputs.length > 1) {
-            tl.setResult(tl.TaskResult.Failed,
-                `Multiple prompt inputs are set (${activePromptInputs.join(', ')}). Only one prompt input should be provided. ` +
-                'Please use only one of: prompt, promptFile, promptRaw, or promptFileRaw.');
-            return;
-        }
 
         if (promptRaw) {
             // Raw prompt: pass directly to CLI with no modification
@@ -878,10 +1353,6 @@ async function run(): Promise<void> {
             // Raw prompt file: use file contents as-is with no modification
             console.log(`Using raw prompt from file: ${promptFileRaw}`);
             const fileContent = fs.readFileSync(promptFileRaw!, 'utf8');
-            if (!fileContent.trim()) {
-                tl.setResult(tl.TaskResult.Failed, `Raw prompt file is empty: ${promptFileRaw}`);
-                return;
-            }
             promptFilePath = path.join(workingDirectory, '_copilot_prompt.txt');
             fs.writeFileSync(promptFilePath, fileContent, 'utf8');
             console.log('\nRAW PROMPT:\n' + sanitizePipelineLog(fileContent) + '\n\n');
@@ -892,12 +1363,7 @@ async function run(): Promise<void> {
         } else if (isPromptFileSet) {
             // Read from prompt file: merge with template
             console.log(`Using custom prompt from file: ${promptFile}`);
-            const fileContent = fs.readFileSync(promptFile!, 'utf8').trim();
-            if (!fileContent) {
-                tl.setResult(tl.TaskResult.Failed, `Prompt file is empty: ${promptFile}`);
-                return;
-            }
-            customPromptText = fileContent;
+            customPromptText = fs.readFileSync(promptFile!, 'utf8').trim();
         }
 
         if (customPromptText) {
@@ -989,6 +1455,13 @@ async function run(): Promise<void> {
 
             contextSections += '\n\n# Code Changes (git diff)\n\nThe following unified diff shows all code changes in this pull request:\n\n```diff\n' + diffContent + '\n```\n';
 
+            if (deltaDiffContent && reviewState) {
+                contextSections += '\n\n# Changes Since Last Review (git diff)\n\n' +
+                    `The following diff shows only what changed in this pull request since the last automated review (iteration #${reviewState.lastReviewedIteration}). ` +
+                    'Use it to identify the new changes the re-review guidance refers to; the full diff above remains the reference for the pull request as a whole.\n\n' +
+                    '```diff\n' + deltaDiffContent + '\n```\n';
+            }
+
             // For non-raw prompts, append a strong override directive.
             // Raw prompt users provide their own diff-only instructions.
             if (!isRawPrompt) {
@@ -997,6 +1470,7 @@ async function run(): Promise<void> {
                     '- Use ONLY the embedded diff and PR details for your review\n' +
                     '- DO NOT attempt to read files from disk or run git commands to explore the repository\n' +
                     '- DO NOT use shell commands for browsing or inspecting source files\n' +
+                    (deltaDiffContent ? '- Use the embedded Changes Since Last Review section instead of running git to see what changed since the last review\n' : '') +
                     '- Use only the pwsh-based comment scripts (Add-CopilotComment.ps1, Update-CopilotComment.ps1) to post your feedback\n\n' +
                     'Any earlier instructions in this prompt that conflict with the above are superseded by this section.\n';
                 contextSections += overrideBlock;
@@ -1046,6 +1520,7 @@ async function run(): Promise<void> {
                 path.join(workingDirectory, 'Work_Item_Ids.txt'),
                 path.join(workingDirectory, 'Work_Item_Details.txt'),
                 path.join(workingDirectory, 'PR_Metadata.json'),
+                reviewStateFile,
                 promptFilePath,
             ];
 
@@ -1060,7 +1535,31 @@ async function run(): Promise<void> {
             }
         }
 
-        // Run CLI agent with timeout
+        // Step 5: Install the CLI agent if not present. Done this late so a
+        // skipped run, a failed fetch, or a prompt configuration error never
+        // pays for the install.
+        if (useClaudeCode) {
+            console.log('\n[Step 5/6] Checking Claude Code CLI installation...');
+            const claudeInstalled = await checkClaudeCodeCli();
+            if (!claudeInstalled) {
+                console.log('Claude Code CLI not found. Installing...');
+                await installClaudeCodeCli();
+            } else {
+                console.log('Claude Code CLI is already installed.');
+            }
+        } else {
+            console.log('\n[Step 5/6] Checking GitHub Copilot CLI installation...');
+            const copilotInstalled = await checkCopilotCli();
+            if (!copilotInstalled) {
+                console.log('GitHub Copilot CLI not found. Installing...');
+                await installCopilotCli();
+            } else {
+                console.log('GitHub Copilot CLI is already installed.');
+            }
+        }
+
+        // Step 6: Run the CLI agent with a timeout
+        console.log(`\n[Step 6/6] Running ${agentName} code review...`);
         const timeoutMs = timeoutMinutes * 60 * 1000;
         if (useClaudeCode) {
             await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
@@ -1071,6 +1570,60 @@ async function run(): Promise<void> {
         console.log('\n' + '='.repeat(60));
         console.log(`${agentName} Code Review completed successfully!`);
         console.log('='.repeat(60));
+
+        // Record this iteration as reviewed (issue #67) only when the run
+        // provably reviewed it; otherwise the next run reviews it again.
+        // Recording never affects the task result.
+        const activity = summarizeReviewActivity(reviewStateDir);
+        // Re-check after the run: if the folder stopped accepting writes, a
+        // failed attempt may have left no marker at all
+        reviewBookkeepingWritable = reviewBookkeepingWritable && prepareReviewStateFolders(reviewStateDir);
+        if (!reviewBookkeepingWritable) {
+            activity.readable = false;
+        }
+        let snapshotBound = false;
+        if (reviewState) {
+            const pullRequestSourceCommitId = tl.getVariable('System.PullRequest.SourceCommitId');
+            const needsCheckout = !diffOnlyActive && !pullRequestSourceCommitId;
+            snapshotBound = isSnapshotBound({
+                currentSourceCommit: reviewState.currentSourceCommit,
+                diffOnlyActive,
+                pullRequestSourceCommitId,
+                headCommit: needsCheckout ? gitRevParse(workingDirectory, 'HEAD') : undefined,
+                headSecondParent: needsCheckout ? gitRevParse(workingDirectory, 'HEAD^2') : undefined
+            });
+        }
+        const recordDecision = shouldRecordReviewState({
+            state: reviewState,
+            activity,
+            reviewContextWarnings,
+            contextDegradations: collectContextDegradations(reviewStateDir),
+            snapshotBound,
+            suppressPositiveFeedback
+        });
+        if (recordDecision.record) {
+            try {
+                await runPowerShellScript(path.join(scriptsDir, 'Set-AzureDevOpsPRReviewState.ps1'), [
+                    '-Token', azureDevOpsToken,
+                    '-AuthType', azureDevOpsAuthType,
+                    '-CollectionUri', resolvedCollectionUri,
+                    '-Project', project,
+                    '-Repository', repository,
+                    '-Id', pullRequestId,
+                    '-StateKeyPrefix', reviewStateKeyPrefix,
+                    '-Iteration', String(reviewState!.currentIteration),
+                    '-SourceCommit', reviewState!.currentSourceCommit
+                ]);
+            } catch (err) {
+                tl.warning(`Could not record iteration #${reviewState!.currentIteration} as reviewed, so the next run will review it again. ` +
+                    `Error: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        } else if (activity.unfinishedAttempts > 0 || activity.agentErrors > 0) {
+            // Likely lost feedback: make it visible in the run summary
+            tl.warning(`Not recording this iteration as reviewed: ${recordDecision.reason}. The next run will review it again.`);
+        } else {
+            console.log(`Not recording this iteration as reviewed: ${recordDecision.reason}. The next run will review it again.`);
+        }
 
         if (reviewContextWarnings) {
             // Partially succeeded (orange): the review ran, but some of the
@@ -1321,7 +1874,11 @@ async function installClaudeCodeCli(): Promise<void> {
 /**
  * Builds the PowerShell script that runs `claudeInvocation` (a `claude -p ...
  * --output-format stream-json --include-partial-messages` command) and turns
- * its JSON event stream into readable log output in real time.
+ * its JSON event stream into readable log output in real time. An error
+ * `result` event (e.g. turn or budget limit hit) leaves an agent-error marker
+ * so the run is not recorded as reviewed (#67). Claude Code 2.1.316 already
+ * exits 1 in those cases (verified), which fails the task; the marker is
+ * defense in depth in case a CLI version reports an error result with exit 0.
  */
 function buildClaudeStreamParser(claudeInvocation: string): string {
     return [
@@ -1341,6 +1898,9 @@ function buildClaudeStreamParser(claudeInvocation: string): string {
         `    return`,
         `  };`,
         `  try {`,
+        `    if ($ev.type -eq 'result' -and ($ev.is_error -or ($ev.subtype -and $ev.subtype -ne 'success')) -and $env:COPILOT_REVIEW_STATE_DIR) {`,
+        `      try { $errDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'activity'; [void][System.IO.Directory]::CreateDirectory($errDir); [System.IO.File]::WriteAllText((Join-Path $errDir 'claude-result.agent-error'), [string]$ev.subtype) } catch { }`,
+        `    }`,
         `    if ($ev.type -ne 'stream_event') { return }`,
         `    $se = $ev.event;`,
         `    if ($se.type -eq 'content_block_delta' -and $se.delta.type -eq 'text_delta') {`,
@@ -1492,5 +2052,14 @@ export {
     neutralizeLoggingCommands,
     forwardSanitizedStream,
     forwardSanitizedOutput,
-    buildClaudeStreamParser
+    buildClaudeStreamParser,
+    computeReviewStateKeyPrefix,
+    readReviewState,
+    isIterationAlreadyReviewed,
+    summarizeReviewActivity,
+    prepareReviewStateFolders,
+    collectContextDegradations,
+    isSnapshotBound,
+    shouldRecordReviewState,
+    buildDeltaPathspecs
 };

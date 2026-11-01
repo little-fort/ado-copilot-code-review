@@ -65,9 +65,10 @@ function Invoke-ScriptWithMockApi {
                 $ctx = $ctxTask.Result
                 $reader = [System.IO.StreamReader]::new($ctx.Request.InputStream)
                 $requests.Add([pscustomobject]@{
-                    Method = $ctx.Request.HttpMethod
-                    Path   = $ctx.Request.Url.PathAndQuery
-                    Body   = $reader.ReadToEnd()
+                    Method      = $ctx.Request.HttpMethod
+                    Path        = $ctx.Request.Url.PathAndQuery
+                    ContentType = $ctx.Request.ContentType
+                    Body        = $reader.ReadToEnd()
                 })
 
                 $resp = if ($responseIndex -lt $Responses.Count) {

@@ -93,6 +93,22 @@ describe('Prompt template lockstep', () => {
         }
     });
 
+    it('the re-review paragraph is identical in both templates (issue #67)', () => {
+        const paragraph = text => text.split(/\r?\n/).find(line => line.startsWith('This is a re-review if'));
+        assert.ok(paragraph(promptDefault), 'prompt.txt has no re-review paragraph starting "This is a re-review if"');
+        assert.equal(paragraph(promptCustom), paragraph(promptDefault),
+            'the re-review paragraph differs between prompt.txt and prompt-custom.txt');
+    });
+
+    it('the [Changes Since Last Review] section name matches between the templates and the script that writes it', () => {
+        const section = '[Changes Since Last Review]';
+        const script = readText('CopilotCodeReviewV1/scripts/Get-AzureDevOpsPRChanges.ps1');
+        assert.ok(script.includes(section), 'Get-AzureDevOpsPRChanges.ps1 no longer writes the [Changes Since Last Review] section');
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.ok(text.includes(section), `${name} no longer refers to the [Changes Since Last Review] section`);
+        }
+    });
+
     it('originalGuidelines matches the Guidelines sentence in prompt.txt', () => {
         const guidelines = extractStringConstant(indexTs, 'originalGuidelines');
         assert.ok(promptDefault.includes(guidelines),
@@ -157,5 +173,13 @@ describe('Dev/prod task definition parity', () => {
             'Restrictions block differs between dev and prod task.json.');
         assert.equal(devTask.minimumAgentVersion, prodTask.minimumAgentVersion,
             'minimumAgentVersion differs between dev and prod task.json.');
+    });
+
+    it('skips already-reviewed iterations by default (issue #67)', () => {
+        // index.ts falls back to true when the input is unset; the task
+        // definition must agree so the documented default is what ships
+        const input = prodTask.inputs.find(i => i.name === 'skipReviewedIterations');
+        assert.ok(input, 'skipReviewedIterations input is missing from task.json');
+        assert.equal(input.defaultValue, true);
     });
 });

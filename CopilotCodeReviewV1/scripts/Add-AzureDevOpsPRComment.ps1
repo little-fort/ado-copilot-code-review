@@ -149,6 +149,33 @@ function ConvertTo-SafeLogText {
     return $Text -replace '##(?=(?:vso)?\[)', '# #'
 }
 
+function Write-ReviewActivity {
+    <#
+        Records review-agent posting activity for the task (issue #67): an
+        "<id>.started" file when an attempt begins and "<id>.done" when it
+        succeeds. The task records an iteration as reviewed only if every
+        started attempt finished, so any exit before "done" counts as a failed
+        attempt without instrumenting each failure path. Best-effort: never
+        throws, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Id,
+        [string]$Phase,
+        [string]$Action
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $activityDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'activity'
+        [void][System.IO.Directory]::CreateDirectory($activityDir)
+        [System.IO.File]::WriteAllText((Join-Path $activityDir "$Id.$Phase"), [string]$Action)
+    }
+    catch {
+        # Bookkeeping must never fail a comment post
+    }
+}
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -312,6 +339,10 @@ function Format-AzureDevOpsFilePath {
 #endregion
 
 #region Main Logic
+
+# Posting-activity evidence for the task (see Write-ReviewActivity)
+$activityId = [guid]::NewGuid().ToString('N')
+Write-ReviewActivity -Id $activityId -Phase 'started' -Action $(if ($ThreadId -gt 0) { 'reply' } else { 'thread' })
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
 $baseUrl = "$CollectionUri/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
@@ -531,6 +562,8 @@ if ($null -eq $result) {
 # Provide link to the PR
 $webUrl = "$CollectionUri/$Project/_git/$Repository/pullrequest/$Id"
 Write-Host "`nView PR: $webUrl" -ForegroundColor Cyan
+
+Write-ReviewActivity -Id $activityId -Phase 'done' -Action $(if ($ThreadId -gt 0) { 'reply' } else { 'thread' })
 
 # Explicit success exit so callers reading $LASTEXITCODE never see a stale value
 exit 0

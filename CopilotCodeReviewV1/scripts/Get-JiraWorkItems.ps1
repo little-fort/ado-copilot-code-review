@@ -151,6 +151,32 @@ function Write-Output-Line {
     }
 }
 
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
+
 function Get-JiraIssueKeys {
     param(
         [string]$Text,
@@ -374,6 +400,7 @@ function Resolve-JiraCustomFields {
         }
         catch {
             Write-Host "##[warning]Could not retrieve the Jira field catalog to resolve custom field names ($(ConvertTo-SafeLogText $_.Exception.Message)); skipping: $($pendingNames -join ', ')"
+            Write-ContextDegradation -Name 'jira-field-catalog' -Detail 'Configured Jira custom fields could not be resolved (the Jira field catalog request failed).'
         }
 
         if ($catalog) {
@@ -503,6 +530,7 @@ function Get-JiraCommentWindow {
         # Comments are supplemental — degrade to the oldest available page
         # rather than failing the run.
         Write-Host "##[warning]Could not fetch the most recent comments for ${Key}: $(ConvertTo-SafeLogText $_.Exception.Message). Showing older comments instead."
+        Write-ContextDegradation -Name "jira-comments-$Key" -Detail "The most recent comments on Jira issue $Key could not be retrieved."
         $rendered = @($Issue.renderedFields.comment.comments)
         $tailStart = [Math]::Max(0, $embedded.Count - $windowSize)
         $window = for ($i = $tailStart; $i -lt $embedded.Count; $i++) {

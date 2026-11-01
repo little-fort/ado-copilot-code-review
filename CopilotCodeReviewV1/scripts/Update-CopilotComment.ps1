@@ -54,23 +54,76 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Thread ID to update")]
-    [ValidateRange(1, [int]::MaxValue)]
-    [int]$ThreadId,
+    # The ID parameters are strings validated in the script body (like Status
+    # below): a binding failure would stop the script before it can record the
+    # failed attempt
+    [Parameter(Mandatory = $false, HelpMessage = "Thread ID to update")]
+    [string]$ThreadId,
 
+    # Validated in the script body rather than with [ValidateSet]: a binding
+    # failure would stop the script before it can record the failed attempt
     [Parameter(Mandatory = $false, HelpMessage = "New status for the thread")]
-    [ValidateSet("Active", "Fixed", "WontFix", "Closed", "Pending")]
     [string]$Status,
 
     [Parameter(Mandatory = $false, HelpMessage = "Comment ID to update (for content updates)")]
-    [int]$CommentId,
+    [string]$CommentId,
 
     [Parameter(Mandatory = $false, HelpMessage = "New content for the comment")]
     [string]$Content
 )
 
+function Write-ReviewActivity {
+    <#
+        Records review-agent posting activity for the task (issue #67): an
+        "<id>.started" file when an attempt begins and "<id>.done" when it
+        succeeds. The task records an iteration as reviewed only if every
+        started attempt finished, so any exit before "done" counts as a failed
+        attempt without instrumenting each failure path. Best-effort: never
+        throws, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Id,
+        [string]$Phase,
+        [string]$Action
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $activityDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'activity'
+        [void][System.IO.Directory]::CreateDirectory($activityDir)
+        [System.IO.File]::WriteAllText((Join-Path $activityDir "$Id.$Phase"), [string]$Action)
+    }
+    catch {
+        # Bookkeeping must never fail a comment post
+    }
+}
+
+# Posting-activity evidence for the task. Every exit before the 'done' marker
+# below — including the non-blocking failure paths — counts as a failed update.
+$activityId = [guid]::NewGuid().ToString('N')
+Write-ReviewActivity -Id $activityId -Phase 'started' -Action 'update'
+
 # Wrap entire script in try/catch for silent failure
 try {
+    if (-not [string]::IsNullOrEmpty($Status) -and $Status -notin @('Active', 'Fixed', 'WontFix', 'Closed', 'Pending')) {
+        Write-Warning "Update-CopilotComment: Invalid -Status '$Status' for thread #$ThreadId. Valid values: Active, Fixed, WontFix, Closed, Pending."
+        exit 0
+    }
+
+    $threadIdNumber = 0
+    if (-not [int]::TryParse(([string]$ThreadId).Trim(), [ref]$threadIdNumber) -or $threadIdNumber -lt 1) {
+        Write-Warning "Update-CopilotComment: -ThreadId must be a whole number of 1 or more (got '$ThreadId')."
+        exit 0
+    }
+    $commentIdNumber = 0
+    if (-not [string]::IsNullOrWhiteSpace($CommentId) -and
+        (-not [int]::TryParse($CommentId.Trim(), [ref]$commentIdNumber) -or $commentIdNumber -lt 1)) {
+        Write-Warning "Update-CopilotComment: -CommentId must be a whole number of 1 or more (got '$CommentId')."
+        exit 0
+    }
+
     # Validate that at least one update is requested
     if ([string]::IsNullOrEmpty($Status) -and [string]::IsNullOrEmpty($Content)) {
         # Default to Fixed status if nothing specified
@@ -78,7 +131,7 @@ try {
     }
 
     # Validate that Content requires CommentId
-    if (-not [string]::IsNullOrEmpty($Content) -and $CommentId -le 0) {
+    if (-not [string]::IsNullOrEmpty($Content) -and $commentIdNumber -le 0) {
         Write-Host "Note: Content update requires CommentId parameter" -ForegroundColor DarkGray
         exit 0
     }
@@ -104,7 +157,7 @@ try {
         if ([string]::IsNullOrEmpty($project)) { $missing += 'PROJECT' }
         if ([string]::IsNullOrEmpty($repository)) { $missing += 'REPOSITORY' }
         if ([string]::IsNullOrEmpty($prId)) { $missing += 'PRID' }
-        Write-Warning "Update-CopilotComment: Skipping update of thread #$ThreadId — required environment variable(s) not set: $($missing -join ', ')"
+        Write-Warning "Update-CopilotComment: Skipping update of thread #$threadIdNumber — required environment variable(s) not set: $($missing -join ', ')"
         exit 0
     }
 
@@ -142,21 +195,23 @@ try {
         }
         $apiStatus = $statusMap[$Status]
 
-        $threadUri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$ThreadId`?api-version=7.1"
+        $threadUri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$threadIdNumber`?api-version=7.1"
         $threadBody = @{ status = $apiStatus } | ConvertTo-Json
 
         $response = Invoke-RestMethod -Uri $threadUri -Headers $headers -Method Patch -Body $threadBody -ErrorAction Stop
-        Write-Host "Thread #$ThreadId status updated to '$Status'" -ForegroundColor Green
+        Write-Host "Thread #$threadIdNumber status updated to '$Status'" -ForegroundColor Green
     }
 
     # Update comment content if specified
-    if (-not [string]::IsNullOrEmpty($Content) -and $CommentId -gt 0) {
-        $commentUri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$ThreadId/comments/$CommentId`?api-version=7.1"
+    if (-not [string]::IsNullOrEmpty($Content) -and $commentIdNumber -gt 0) {
+        $commentUri = "$baseUrl/git/repositories/$repository/pullrequests/$prId/threads/$threadIdNumber/comments/$commentIdNumber`?api-version=7.1"
         $commentBody = @{ content = $Content } | ConvertTo-Json
 
         $response = Invoke-RestMethod -Uri $commentUri -Headers $headers -Method Patch -Body $commentBody -ErrorAction Stop
-        Write-Host "Comment #$CommentId in thread #$ThreadId content updated" -ForegroundColor Green
+        Write-Host "Comment #$commentIdNumber in thread #$threadIdNumber content updated" -ForegroundColor Green
     }
+
+    Write-ReviewActivity -Id $activityId -Phase 'done' -Action 'update'
 }
 catch {
     # Non-blocking failure - log detailed error info but don't fail the pipeline

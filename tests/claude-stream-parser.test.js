@@ -46,12 +46,13 @@ describe('buildClaudeStreamParser', function () {
     });
 
     /** Replays the given stream-json lines through the parser; returns its stdout. */
-    function runParser(lines) {
+    function runParser(lines, env = {}) {
         const fixture = path.join(tmpDir, `stream-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`);
         fs.writeFileSync(fixture, lines.join('\n') + '\n', 'utf8');
 
         const script = buildClaudeStreamParser(`Get-Content -LiteralPath '${fixture}'`);
-        const result = child_process.spawnSync('pwsh', ['-NoProfile', '-Command', script], { encoding: 'utf8' });
+        const result = child_process.spawnSync('pwsh', ['-NoProfile', '-Command', script],
+            { encoding: 'utf8', env: { ...process.env, ...env } });
         assert.equal(result.status, 0, `parser exited ${result.status}: ${result.stderr}`);
         // Write-Host emits CRLF on Windows; compare platform-independently
         return result.stdout.replace(/\r\n/g, '\n');
@@ -99,5 +100,33 @@ describe('buildClaudeStreamParser', function () {
             'Error: plain-text message from the CLI\n' +
             ' done.\n' +
             '\n');
+    });
+
+    describe('error results (issue #67)', () => {
+        // The final result event says whether the review stopped early (e.g. at
+        // --max-turns or --max-budget-usd). Claude Code 2.1.316 also exits 1 in
+        // those cases (verified), but the parser leaves a marker that blocks
+        // recording the run regardless of the exit code, as defense in depth.
+        function markerPath(stateDir) {
+            return path.join(stateDir, 'activity', 'claude-result.agent-error');
+        }
+
+        it('leaves an agent-error marker for an error result without changing the output', () => {
+            const stateDir = fs.mkdtempSync(path.join(tmpDir, 'state-'));
+            const output = runParser([
+                textDelta(0, 'Partial review'),
+                JSON.stringify({ type: 'result', subtype: 'error_max_turns', is_error: false })
+            ], { COPILOT_REVIEW_STATE_DIR: stateDir });
+
+            assert.ok(fs.existsSync(markerPath(stateDir)), 'expected an agent-error marker');
+            assert.equal(fs.readFileSync(markerPath(stateDir), 'utf8'), 'error_max_turns');
+            assert.equal(output, 'Partial review\n\n');
+        });
+
+        it('leaves no marker for a successful result', () => {
+            const stateDir = fs.mkdtempSync(path.join(tmpDir, 'state-'));
+            runParser([JSON.stringify({ type: 'result', subtype: 'success', is_error: false })], { COPILOT_REVIEW_STATE_DIR: stateDir });
+            assert.equal(fs.existsSync(markerPath(stateDir)), false);
+        });
     });
 });

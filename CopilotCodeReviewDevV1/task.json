@@ -332,6 +332,14 @@
             "helpMarkDown": "When enabled, the review is restricted to ONLY the PR diff. The diff is pre-computed and embedded in the prompt, and CLI tool access is limited to posting comments only. This dramatically reduces token usage for large repositories. Compatible with all prompt modes — when using raw prompts, the diff context is appended to the end of the prompt."
         },
         {
+            "name": "skipReviewedIterations",
+            "type": "boolean",
+            "label": "Skip Already-Reviewed Iterations",
+            "required": false,
+            "defaultValue": true,
+            "helpMarkDown": "After a review, the task records the reviewed PR iteration as a pull request property (scoped to this review configuration: agent, model, prompt, and review settings). When enabled (default), a run for an iteration that was already reviewed (e.g. re-queued build, policy re-run) finishes immediately without running the agent. Disable to force a fresh review every time."
+        },
+        {
             "name": "publishPromptArtifacts",
             "type": "boolean",
             "label": "Publish Prompt Artifacts",

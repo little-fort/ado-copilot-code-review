@@ -213,6 +213,7 @@ steps:
 | `suppressPositiveFeedback` | No | `false` | Skip praise/"looks good" comments — post nothing when no issues are found (see [Review Behavior Options](#review-behavior-options)) |
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
+| `skipReviewedIterations` | No | `true` | Finish immediately when this review configuration already reviewed the PR's current iteration; set `false` to force a fresh review (see [Incremental Re-Reviews](#incremental-re-reviews)) |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
 ### Copilot Models
@@ -403,6 +404,26 @@ When enabled:
 
 If the diff cannot be computed (e.g., missing commits due to a shallow clone), the task will fail with a descriptive error rather than silently consuming excessive tokens.
 
+### Incremental Re-Reviews
+
+After a review, the task records which pull request iteration it reviewed, so later runs don't spend tokens repeating work:
+
+- **Already-reviewed iterations are skipped.** When a run finds that the PR's current iteration was already reviewed — for example a re-queued build, or a branch policy re-running the build after the target branch moved — it finishes immediately, before installing the CLI or running the agent. Set `skipReviewedIterations: false` to force a fresh review.
+- **Re-reviews focus on what changed.** When new commits were pushed since the last review, `Iteration_Details.txt` gains a `[Changes Since Last Review]` section listing the files changed since then, with the `git diff` command that shows exactly those changes. In [diff-only mode](#diff-only-review-mode) that smaller diff is also embedded in the prompt. The review prompt limits new non-Critical findings to those changes.
+
+**How it works:** the record is a pull request property (`CopilotCodeReview.v1.<hash>.Iteration.<n>`, holding the iteration's source commit). The hash covers the review configuration — agent, model, prompt, and review settings such as `resolveThreads`, `maxMinorIssues`, and the work item source — so two differently configured reviews of the same PR (say, a Copilot review and a Claude Code security review) never skip each other, while two identical ones share the record.
+
+**When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through, all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration (in a PR validation build, `System.PullRequest.SourceCommitId` must match; otherwise the iteration must be checked out). A review that posted nothing is only recorded when `suppressPositiveFeedback` is on, since a clean review then legitimately posts nothing. Anything else simply means the next run reviews the iteration again.
+
+**When the "changes since last review" section is omitted** (and the whole PR is reviewed as usual): after a rebase or a merge from the target branch (the merge base changed, so the commit-to-commit diff would mix in target-branch changes), after the PR is retargeted, or when the change lists could not be fully retrieved. In diff-only mode the extra diff is also left out when the last reviewed commit isn't in the local clone (e.g. after a force push) or when it would be more than half the size of the full diff.
+
+**Notes:**
+- Recording uses the same "Contribute to pull requests" permission as posting comments. If it fails, the task logs a warning and keeps working as before (every run reviews the whole PR).
+- A re-queued build skips even if someone replied to a review comment in the meantime; set `skipReviewedIterations: false` (or push a commit) to have the agent respond.
+- Without a record for the current configuration — for example the first review after upgrading, or a token that cannot write PR properties — the prompt falls back to treating any earlier automated review threads as a sign of a re-review. That fallback cannot tell which configuration wrote those threads, so a second, differently configured review of a PR is also treated as a re-review on its first run.
+- Raw prompt modes are skipped and recorded too, as long as their prompt posts comments through `Add-CopilotComment.ps1`.
+- A comment-script call that PowerShell rejects before the script starts (for example a misspelled parameter name) leaves no trace for the task to detect. If the agent then gives up on that comment instead of retrying, the iteration can still be recorded.
+
 ### Publishing Prompt Artifacts
 
 Enable `publishPromptArtifacts` to publish all generated context files and the final assembled prompt as pipeline artifacts. This is useful for debugging prompt construction, verifying what context the CLI agent received, or inspecting the diff content in diff-only mode.
@@ -510,10 +531,11 @@ Alternatively, you can create the pipeline first and then configure the pipeline
 
 ## How It Works
 
-1. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
-2. **Fetch PR Context**: The task retrieves pull request metadata, existing comments, iteration details, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured)
+1. **Fetch PR Context**: The task retrieves the PR's iteration details and its review record, then pull request metadata, existing comments, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured). If this review configuration already reviewed the current iteration, the run ends here (see [Incremental Re-Reviews](#incremental-re-reviews)).
+2. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
 3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
 4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
+5. **Record the Review**: When the run provably reviewed the iteration, the task records it on the pull request so later runs can skip it or focus on what changed
 
 ## Default Review Focus Areas
 

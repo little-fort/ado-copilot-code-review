@@ -108,6 +108,31 @@ function Write-Output-Line {
     }
 }
 
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -238,6 +263,9 @@ Write-Host "`nRetrieving details for work item(s): $idsParam..." -ForegroundColo
 $workItemsUrl = "$CollectionUri/$Project/_apis/wit/workitems?ids=$idsParam&`$expand=all&$apiVersion"
 $response = Invoke-AzureDevOpsApi -Uri $workItemsUrl -Headers $headers
 
+if ($null -eq $response) {
+    Write-ContextDegradation -Name 'work-item-details' -Detail 'Linked work item details could not be retrieved.'
+}
 if ($null -eq $response -or $null -eq $response.value -or $response.value.Count -eq 0) {
     Write-Warning "No work item details could be retrieved."
     exit 0

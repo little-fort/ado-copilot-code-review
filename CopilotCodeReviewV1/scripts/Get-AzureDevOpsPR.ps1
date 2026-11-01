@@ -135,6 +135,31 @@ function Write-Output-Line {
     }
 }
 
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -470,6 +495,18 @@ if ($Id -gt 0) {
     # Get PR threads (comments)
     $threadsUrl = "$baseUrl/git/repositories/$Repository/pullrequests/$Id/threads?$apiVersion"
     $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+
+    # The script still produces PR details when these fail, but the review
+    # would then be missing context it relies on
+    if ($null -eq $workItems) {
+        Write-ContextDegradation -Name 'pr-work-items' -Detail 'Linked work items could not be retrieved.'
+    }
+    if ($null -eq $iterations) {
+        Write-ContextDegradation -Name 'pr-iterations' -Detail 'Pull request iterations could not be retrieved.'
+    }
+    if ($null -eq $threads) {
+        Write-ContextDegradation -Name 'pr-threads' -Detail 'Existing comment threads could not be retrieved.'
+    }
     
     # Display detailed information
     Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
@@ -633,6 +670,11 @@ if ($Id -gt 0) {
             }
         }
     }
+    elseif ($null -eq $threads) {
+        # Saying "No comments" here would tell the review agent there is no
+        # existing feedback to respect or resolve
+        Write-Output-Line "  Existing comment threads could not be retrieved from Azure DevOps."
+    }
     else {
         Write-Output-Line "  No comments"
     }
@@ -642,6 +684,9 @@ if ($Id -gt 0) {
         foreach ($wi in $workItems.value) {
             Write-Output-Line "  - #$($wi.id): $($wi.url)"
         }
+    }
+    elseif ($null -eq $workItems) {
+        Write-Output-Line "  Linked work items could not be retrieved from Azure DevOps."
     }
     else {
         Write-Output-Line "  No linked work items"

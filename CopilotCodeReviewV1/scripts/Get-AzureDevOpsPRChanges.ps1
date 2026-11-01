@@ -25,6 +25,16 @@
 .PARAMETER Id
     Required. The pull request ID to retrieve changes for.
 
+.PARAMETER ReviewStateKeyPrefix
+    Optional (pass together with -ReviewStateFile). Enables incremental re-reviews (issue #67): the
+    pull request properties named <prefix>.Iteration.<n> record which iterations this review
+    configuration has already reviewed (written by Set-AzureDevOpsPRReviewState.ps1). When a usable
+    record exists, a [Changes Since Last Review] section is added to the output.
+
+.PARAMETER ReviewStateFile
+    Optional (pass together with -ReviewStateKeyPrefix). Path of the JSON file that receives the
+    current iteration, the last reviewed iteration, and the changes since then, for the task to act on.
+
 .EXAMPLE
     .\Get-AzureDevOpsPRChanges.ps1 -Token "your-pat" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject" -Repository "myrepo" -Id 123
     Retrieves the commits and changed files from the most recent iteration of PR #123.
@@ -70,7 +80,14 @@ param(
     [int]$Id,
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Pull request property prefix identifying the review configuration")]
+    [ValidatePattern('^[A-Za-z0-9._-]{1,200}$')]
+    [string]$ReviewStateKeyPrefix,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path of the review state JSON file to write")]
+    [string]$ReviewStateFile
 )
 
 #region Helper Functions
@@ -309,6 +326,9 @@ function Get-IterationChanges {
         [hashtable]$Headers,
         [string]$ApiVersion,
         [int]$IterationId,
+        # When above 0, return only the changes since this earlier iteration
+        # ($compareTo; the default compares against the merge base)
+        [int]$CompareTo = 0,
         [int]$MaxPages = 100
     )
 
@@ -318,6 +338,9 @@ function Get-IterationChanges {
 
     for ($pageNumber = 1; $pageNumber -le $MaxPages; $pageNumber++) {
         $uri = "$BaseUrl/iterations/$IterationId/changes?$ApiVersion"
+        if ($CompareTo -gt 0) {
+            $uri += "&`$compareTo=$CompareTo"
+        }
         if ($pageNumber -gt 1) {
             $uri += "&`$top=$top&`$skip=$skip"
         }
@@ -348,6 +371,201 @@ function Get-IterationChanges {
     return [pscustomobject]@{ Items = $entries; Status = 'Partial' }
 }
 
+function Get-PullRequestProperties {
+    <#
+        Reads the pull request's property bag. The review state it holds is
+        optional, so a failure prints a warning and the review simply falls back
+        to a full review (Invoke-AzureDevOpsApi's Write-Error would paint a red
+        error for a non-fatal condition). 404 means there are no properties.
+        Returns Status ('Ok' or 'Failed'), the property Names, and the raw Value.
+    #>
+    param(
+        [string]$BaseUrl,
+        [hashtable]$Headers,
+        [string]$ApiVersion
+    )
+
+    try {
+        $response = Invoke-RestMethod -Uri "$BaseUrl/properties?$ApiVersion" -Headers $Headers -Method Get -ErrorAction Stop
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        if ($statusCode -eq 404) {
+            return [pscustomobject]@{ Status = 'Ok'; Names = @(); Value = $null }
+        }
+        $reason = if ($statusCode) { "HTTP $statusCode" } else { ConvertTo-SafeLogText $_.Exception.Message }
+        Write-Host "##[warning]Could not read the incremental review state from the pull request properties ($reason); the whole pull request will be reviewed."
+        return [pscustomobject]@{ Status = 'Failed'; Names = @(); Value = $null }
+    }
+
+    $names = @()
+    if ($response -and $response.value) {
+        $names = @($response.value.PSObject.Properties | ForEach-Object { $_.Name })
+    }
+    return [pscustomobject]@{ Status = 'Ok'; Names = $names; Value = $response.value }
+}
+
+function Get-PropertyValue {
+    # Returns the value of one property from the bag, or $null. Each entry is
+    # an object with "$type" and "$value" members (single quotes matter: in
+    # double quotes "$value" would expand a variable).
+    param(
+        $Properties,
+        [string]$Name
+    )
+
+    if ($null -eq $Properties) {
+        return $null
+    }
+    $entry = $Properties.PSObject.Properties[$Name]
+    if (-not $entry -or $null -eq $entry.Value) {
+        return $null
+    }
+    $valueMember = $entry.Value.PSObject.Properties['$value']
+    if ($valueMember) {
+        return $valueMember.Value
+    }
+    return $entry.Value
+}
+
+function Get-ReviewState {
+    <#
+        Works out what this review configuration has already reviewed (issue #67).
+
+        Each reviewed iteration is recorded as its own property,
+        <prefix>.Iteration.<n> = <source commit SHA>. The last reviewed iteration
+        is the highest n up to the current one whose recorded SHA still matches
+        that iteration's source commit; anything else is ignored.
+
+        When that iteration is older than the current one, the changes since then
+        are fetched ($compareTo) — but only when the result is trustworthy:
+          - same merge base (commonRefCommit) in both iterations, so a rebase or a
+            merge from the target branch cannot pass target-branch changes off as
+            the pull request's own;
+          - no retarget in between (the diff base changed);
+          - the full change list is complete (needed to filter the result).
+        The result is narrowed to files that are still part of the pull request.
+        In every other case the delta is omitted and the whole PR is reviewed.
+    #>
+    param(
+        [string]$BaseUrl,
+        [hashtable]$Headers,
+        [string]$ApiVersion,
+        [string]$KeyPrefix,
+        [object[]]$Iterations,
+        $CurrentIteration,
+        $FullChanges
+    )
+
+    $currentId = [int]$CurrentIteration.id
+    $state = [ordered]@{
+        stateReadStatus          = 'NotFound'
+        lastReviewedIteration    = $null
+        lastReviewedSourceCommit = $null
+        delta                    = [ordered]@{ status = 'NotApplicable'; reason = $null; files = @() }
+    }
+
+    $properties = Get-PullRequestProperties -BaseUrl $BaseUrl -Headers $Headers -ApiVersion $ApiVersion
+    if ($properties.Status -ne 'Ok') {
+        $state.stateReadStatus = 'Failed'
+        $state.delta.reason = 'The review state could not be read.'
+        return $state
+    }
+
+    $iterationsById = @{}
+    foreach ($iteration in $Iterations) {
+        $iterationsById[[int]$iteration.id] = $iteration
+    }
+
+    $keyPattern = '^' + [regex]::Escape($KeyPrefix) + '\.Iteration\.(\d{1,9})$'
+    $lastId = 0
+    $lastSha = $null
+    foreach ($name in $properties.Names) {
+        $match = [regex]::Match($name, $keyPattern)
+        if (-not $match.Success) {
+            continue
+        }
+        $recordedId = [int]$match.Groups[1].Value
+        if ($recordedId -lt 1 -or $recordedId -gt $currentId -or $recordedId -le $lastId) {
+            continue
+        }
+        $recordedSha = [string](Get-PropertyValue -Properties $properties.Value -Name $name)
+        $iteration = $iterationsById[$recordedId]
+        if (-not $iteration -or -not $iteration.sourceRefCommit -or
+            [string]::IsNullOrWhiteSpace($recordedSha) -or
+            $recordedSha.Trim() -ine [string]$iteration.sourceRefCommit.commitId) {
+            continue
+        }
+        $lastId = $recordedId
+        $lastSha = [string]$iteration.sourceRefCommit.commitId
+    }
+
+    if ($lastId -eq 0) {
+        return $state
+    }
+
+    $state.stateReadStatus = 'Found'
+    $state.lastReviewedIteration = $lastId
+    $state.lastReviewedSourceCommit = $lastSha
+
+    if ($lastId -eq $currentId) {
+        $state.delta.reason = 'The current iteration was already reviewed.'
+        return $state
+    }
+
+    $lastBase = [string]$iterationsById[$lastId].commonRefCommit.commitId
+    $currentBase = [string]$CurrentIteration.commonRefCommit.commitId
+    if ([string]::IsNullOrWhiteSpace($lastBase) -or $lastBase -ine $currentBase) {
+        $state.delta.reason = 'The merge base changed since the last review (for example a rebase or a merge from the target branch).'
+        return $state
+    }
+
+    $retargeted = @($Iterations | Where-Object {
+        [int]$_.id -gt $lastId -and [int]$_.id -le $currentId -and $_.reason -eq 'retarget'
+    })
+    if ($retargeted.Count -gt 0) {
+        $state.delta.reason = 'The pull request was retargeted since the last review.'
+        return $state
+    }
+
+    if ($FullChanges.Status -ne 'Complete') {
+        $state.delta.reason = 'The full change list is incomplete.'
+        return $state
+    }
+
+    Write-Host "Retrieving changes since reviewed iteration #$lastId..." -ForegroundColor Cyan
+    $deltaResult = Get-IterationChanges -BaseUrl $BaseUrl -Headers $Headers -ApiVersion $ApiVersion `
+        -IterationId $currentId -CompareTo $lastId
+    if ($deltaResult.Status -ne 'Complete') {
+        $state.delta.status = $deltaResult.Status
+        $state.delta.reason = 'The changes since the last review could not be fully retrieved.'
+        return $state
+    }
+
+    # Keep only files still in the pull request's changes (drops files the
+    # pull request later reverted to their target-branch content)
+    $prPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($change in $FullChanges.Items) {
+        if ($change.item -and $change.item.path) {
+            [void]$prPaths.Add([string]$change.item.path)
+        }
+    }
+    $state.delta.status = 'Complete'
+    $state.delta.files = @($deltaResult.Items | Where-Object {
+        $_.item -and $_.item.path -and $prPaths.Contains([string]$_.item.path)
+    } | ForEach-Object {
+        [ordered]@{
+            path         = [string]$_.item.path
+            changeType   = [string]$_.changeType
+            originalPath = $_.originalPath
+        }
+    })
+    return $state
+}
+
 #endregion
 
 #region Main Logic
@@ -355,6 +573,11 @@ function Get-IterationChanges {
 # Initialize output handling
 $script:OutputToFile = -not [string]::IsNullOrEmpty($OutputFile)
 $script:OutputBuilder = [System.Text.StringBuilder]::new()
+
+if ([string]::IsNullOrEmpty($ReviewStateKeyPrefix) -ne [string]::IsNullOrEmpty($ReviewStateFile)) {
+    Write-Error "-ReviewStateKeyPrefix and -ReviewStateFile must be passed together."
+    exit 1
+}
 
 $headers = Get-AuthorizationHeader -Token $Token -AuthType $AuthType
 $baseUrl = "$CollectionUri/$Project/_apis/git/repositories/$Repository/pullrequests/$Id"
@@ -402,6 +625,21 @@ if ($changeResult.Status -eq 'Partial') {
     Write-Host "##[warning]Only $($changeResult.Items.Count) changed file(s) could be retrieved; the changed-file list for this PR is incomplete."
 }
 $changeEntries = $changeResult.Items
+
+# Incremental re-review state (issue #67), only when the task asks for it
+$reviewState = $null
+if ($ReviewStateKeyPrefix) {
+    Write-Host "Reading incremental review state..." -ForegroundColor Cyan
+    $reviewState = Get-ReviewState -BaseUrl $baseUrl -Headers $headers -ApiVersion $apiVersion `
+        -KeyPrefix $ReviewStateKeyPrefix -Iterations @($iterations.value) `
+        -CurrentIteration $latestIteration -FullChanges $changeResult
+    if ($reviewState.lastReviewedIteration) {
+        Write-Host "Last reviewed iteration: #$($reviewState.lastReviewedIteration)" -ForegroundColor Green
+    }
+    if ($reviewState.delta.reason) {
+        Write-Host "  $($reviewState.delta.reason)" -ForegroundColor DarkGray
+    }
+}
 
 # Display results
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
@@ -495,6 +733,33 @@ else {
     Write-Output-Line "  No file changes found in this iteration."
 }
 
+# Changes since the last review by this configuration. The section name is
+# referenced by the prompt templates' re-review guidance (keep in lockstep).
+if ($reviewState -and $reviewState.delta.status -eq 'Complete') {
+    $lastId = $reviewState.lastReviewedIteration
+    $lastSha = $reviewState.lastReviewedSourceCommit
+    $currentSha = [string]$latestIteration.sourceRefCommit.commitId
+    $deltaFiles = @($reviewState.delta.files)
+
+    Write-Output-Line "`n[Changes Since Last Review]" -ForegroundColor Yellow
+    Write-Output-Line "  Last reviewed iteration: #$lastId (source commit $lastSha)"
+    if ($deltaFiles.Count -eq 0) {
+        Write-Output-Line "  No files in this pull request changed since that review."
+    }
+    else {
+        Write-Output-Line "  Files in this pull request changed since that review: $($deltaFiles.Count)"
+        foreach ($file in $deltaFiles) {
+            $changeDisplay = Get-ChangeTypeDisplay -ChangeType $file.changeType
+            Write-Output-Line "    [$($changeDisplay.Text)] $($file.path)" -ForegroundColor $changeDisplay.Color
+            if ($file.originalPath) {
+                Write-Output-Line "           (from: $($file.originalPath))" -ForegroundColor DarkGray
+            }
+        }
+        Write-Output-Line "  To see exactly what changed since that review: git diff $lastSha $currentSha"
+        Write-Output-Line "  If that commit is not available locally (for example after a force push or with a shallow clone), use this file list together with the full pull request diff."
+    }
+}
+
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
 
 # Provide link to the PR
@@ -533,6 +798,37 @@ if ($script:OutputToFile) {
     }
     catch {
         Write-Error "Failed to write output file: $_"
+    }
+}
+
+# Review state for the task: what was fetched now plus what was already
+# reviewed. Written whenever requested, even without a usable record, so the
+# task always knows the current iteration and commit this run captured.
+if ($ReviewStateFile) {
+    $stateDocument = [ordered]@{
+        schemaVersion            = 1
+        stateKeyPrefix           = $ReviewStateKeyPrefix
+        currentIteration         = [int]$iterationId
+        currentSourceCommit      = [string]$latestIteration.sourceRefCommit.commitId
+        fullChangesStatus        = [string]$changeResult.Status
+        stateReadStatus          = $reviewState.stateReadStatus
+        lastReviewedIteration    = $reviewState.lastReviewedIteration
+        lastReviewedSourceCommit = $reviewState.lastReviewedSourceCommit
+        delta                    = $reviewState.delta
+    }
+    try {
+        $stateDir = Split-Path -Parent $ReviewStateFile
+        if (-not [string]::IsNullOrEmpty($stateDir) -and -not (Test-Path $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+        }
+        $stateJson = ConvertTo-Json -InputObject $stateDocument -Depth 6
+        [System.IO.File]::WriteAllText($ReviewStateFile, $stateJson, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "Review state written to: $ReviewStateFile" -ForegroundColor Green
+    }
+    catch {
+        # The review itself does not depend on this file; without it the task
+        # neither skips nor records this run
+        Write-Host "##[warning]Could not write the review state file: $(ConvertTo-SafeLogText "$_")"
     }
 }
 

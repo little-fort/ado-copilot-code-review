@@ -68,24 +68,82 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = "Path to a file containing the comment text")]
     [string]$CommentFile,
 
+    # Validated in the script body rather than with [ValidateSet]: a binding
+    # failure would stop the script before it can record the failed attempt
     [Parameter(Mandatory = $false, HelpMessage = "Status for the new thread: Active or Closed")]
-    [ValidateSet("Active", "Closed")]
     [string]$Status = 'Active',
 
     [Parameter(Mandatory = $false, HelpMessage = "File path for inline comment (e.g., '/src/MyProject/Program.cs')")]
     [string]$FilePath,
 
+    # The numbers below are strings parsed in the script body for the same
+    # reason: a non-numeric value would otherwise fail during binding
     [Parameter(Mandatory = $false, HelpMessage = "Starting line number for inline comment")]
-    [int]$StartLine,
+    [string]$StartLine,
 
     [Parameter(Mandatory = $false, HelpMessage = "Ending line number for inline comment (defaults to StartLine)")]
-    [int]$EndLine,
+    [string]$EndLine,
 
     [Parameter(Mandatory = $false, HelpMessage = "Existing thread ID to reply to instead of creating a new thread")]
-    [int]$ThreadId
+    [string]$ThreadId
 )
 
+function Write-ReviewActivity {
+    <#
+        Records review-agent posting activity for the task (issue #67): an
+        "<id>.started" file when an attempt begins and "<id>.done" when it
+        succeeds. The task records an iteration as reviewed only if every
+        started attempt finished, so any exit before "done" counts as a failed
+        attempt without instrumenting each failure path. Best-effort: never
+        throws, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Id,
+        [string]$Phase,
+        [string]$Action
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $activityDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'activity'
+        [void][System.IO.Directory]::CreateDirectory($activityDir)
+        [System.IO.File]::WriteAllText((Join-Path $activityDir "$Id.$Phase"), [string]$Action)
+    }
+    catch {
+        # Bookkeeping must never fail a comment post
+    }
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Posting-activity evidence for the task. Recorded before any validation so
+# that every early exit below leaves a started attempt without a done marker.
+$wrapperActivityId = [guid]::NewGuid().ToString('N')
+Write-ReviewActivity -Id $wrapperActivityId -Phase 'started' -Action 'wrapper'
+
+if ($Status -notin @('Active', 'Closed')) {
+    Write-Error "Invalid -Status '$Status'. Valid values: Active, Closed."
+    exit 1
+}
+
+# Parse the numeric arguments (0 = not provided). New variable names: assigning
+# a number back to a [string] parameter would make later comparisons string-based.
+$numbers = @{}
+foreach ($name in 'StartLine', 'EndLine', 'ThreadId') {
+    $raw = [string](Get-Variable -Name $name -ValueOnly)
+    $parsed = 0
+    if (-not [string]::IsNullOrWhiteSpace($raw) -and
+        (-not [int]::TryParse($raw.Trim(), [ref]$parsed) -or $parsed -lt 1)) {
+        Write-Error "Invalid -$name '$raw'. Provide a whole number of 1 or more."
+        exit 1
+    }
+    $numbers[$name] = $parsed
+}
+$startLineNumber = $numbers.StartLine
+$endLineNumber = $numbers.EndLine
+$threadIdNumber = $numbers.ThreadId
 
 # Resolve comment text from either -Comment or -CommentFile
 if ($CommentFile) {
@@ -117,23 +175,23 @@ $params = @{
 }
 
 # Add thread ID for replies to existing threads
-if ($ThreadId -gt 0) {
-    $params.ThreadId = $ThreadId
-    Write-Host "Replying to thread #$ThreadId" -ForegroundColor DarkGray
+if ($threadIdNumber -gt 0) {
+    $params.ThreadId = $threadIdNumber
+    Write-Host "Replying to thread #$threadIdNumber" -ForegroundColor DarkGray
 }
 
 # Add inline comment parameters if file path is provided
 if ($FilePath) {
     $params.FilePath = $FilePath
-    
-    if ($StartLine -gt 0) {
-        $params.StartLine = $StartLine
-        
+
+    if ($startLineNumber -gt 0) {
+        $params.StartLine = $startLineNumber
+
         # Default EndLine to StartLine if not provided
-        if ($EndLine -gt 0) {
-            $params.EndLine = $EndLine
+        if ($endLineNumber -gt 0) {
+            $params.EndLine = $endLineNumber
         } else {
-            $params.EndLine = $StartLine
+            $params.EndLine = $startLineNumber
         }
     }
     
@@ -153,3 +211,5 @@ if ($FilePath) {
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
+
+Write-ReviewActivity -Id $wrapperActivityId -Phase 'done' -Action 'wrapper'

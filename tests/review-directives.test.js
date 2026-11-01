@@ -41,6 +41,13 @@ describe('buildReviewDirectives (issues #55, #28)', () => {
         assert.doesNotMatch(section, /NEVER resolve/);
     });
 
+    it('only all points the agent at the human reviewer threads section (issue #67)', () => {
+        // Get-AzureDevOpsPR.ps1 emits that section only when resolveThreads is all
+        assert.match(buildReviewDirectives('all', false), /HUMAN REVIEWER THREADS \(JSON\)/);
+        assert.match(buildReviewDirectives('all', false), /read the replies first/);
+        assert.doesNotMatch(buildReviewDirectives('agentOnly', false), /HUMAN REVIEWER THREADS/);
+    });
+
     it('includes the positive feedback directive only when suppression is enabled', () => {
         const withSuppression = buildReviewDirectives('agentOnly', true);
         assert.match(withSuppression, /Do NOT post positive, congratulatory/);

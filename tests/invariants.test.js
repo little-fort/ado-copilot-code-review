@@ -85,6 +85,14 @@ describe('Prompt template lockstep', () => {
             'originalOverview in index.ts no longer appears verbatim in prompt-custom.txt — update them together.');
     });
 
+    it('no template refers to the AZUREDEVOPSPAT environment variable (issue #67)', () => {
+        // Renamed to AZUREDEVOPS_TOKEN in ace6049 and never set since; a prompt
+        // pointing at it sends the agent exploring the API with no credential
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.ok(!text.includes('AZUREDEVOPSPAT'), `${name} still refers to the AZUREDEVOPSPAT environment variable`);
+        }
+    });
+
     it('originalGuidelines matches the Guidelines sentence in prompt.txt', () => {
         const guidelines = extractStringConstant(indexTs, 'originalGuidelines');
         assert.ok(promptDefault.includes(guidelines),

@@ -178,8 +178,12 @@ function buildReviewDirectives(resolveThreads: string, suppressPositiveFeedback:
             'Thread resolution scope: In addition to the automated-review threads listed in the ' +
             'COPILOT COMMENT THREADS (JSON) section of PR_Details.txt, you may resolve threads created by ' +
             'human reviewers when the changes in the current iteration clearly and completely address their ' +
-            'concern. Follow the same two-step process: first reply to the thread explaining what change ' +
-            "addressed it, then mark the thread as fixed. If in doubt, leave human reviewers' threads untouched.");
+            'concern. Active human threads are listed with their full text, author, and replies in the ' +
+            'HUMAN REVIEWER THREADS (JSON) section of PR_Details.txt; use the threadId from that section, and ' +
+            'read the replies first: if the author or reviewer disputed the concern or asked to keep the ' +
+            'thread open, leave it alone. Follow the same two-step process: first reply to the thread ' +
+            'explaining what change addressed it, then mark the thread as fixed. If in doubt, leave human ' +
+            "reviewers' threads untouched.");
     } else {
         directives.push(
             'Thread resolution scope: Only resolve or change the status of comment threads that appear in ' +
@@ -645,7 +649,7 @@ async function run(): Promise<void> {
         const prDetailsScript = path.join(scriptsDir, 'Get-AzureDevOpsPR.ps1');
         const prDetailsOutput = path.join(workingDirectory, 'PR_Details.txt');
         
-        await runPowerShellScript(prDetailsScript, [
+        const prDetailsArgs = [
             '-Token', azureDevOpsToken,
             '-AuthType', azureDevOpsAuthType,
             '-CollectionUri', resolvedCollectionUri,
@@ -653,7 +657,14 @@ async function run(): Promise<void> {
             '-Repository', repository,
             '-Id', pullRequestId,
             '-OutputFile', prDetailsOutput
-        ]);
+        ];
+        // Human reviewers' threads (full text + replies) are only useful when the
+        // agent may resolve them. Raw prompts never receive the directive that
+        // explains the section, so their PR_Details.txt stays unchanged.
+        if (resolveThreads === 'all' && !promptRaw && !isPromptFileRawSet) {
+            prDetailsArgs.push('-IncludeHumanThreads');
+        }
+        await runPowerShellScript(prDetailsScript, prDetailsArgs);
         console.log(`PR details saved to: ${prDetailsOutput}`);
 
         // Step 3: Fetch PR changes (iteration details)
@@ -950,7 +961,7 @@ async function run(): Promise<void> {
                     currentPrompt = currentPrompt.replace(originalGuidelines, replacedGuidelines);
                 }
 
-                const originalOverview = 'The details of the PR for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for further context. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. The Iteration_Details.txt file also lists the full commit SHAs for the latest iteration: the Source Commit contains the pull request\'s changes (the new code), and the Target Commit is the tip of the base branch it will merge into (the old code). When using git to inspect the changes, always diff from base to PR branch using the merge-base form—git diff <target-commit>...<source-commit>—so that additions in the output represent code introduced by this pull request and deletions represent code it removes. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed. If network conditions permit, you may pull more information directly from the Azure DevOps API using the PAT configured in the AZUREDEVOPSPAT environment variable if it would be useful.';
+                const originalOverview = 'The details of the PR for the repo in the working directory have been saved to the PR_Details.txt file—please review this file for further context. Additionally, details on the specific commits and files associated with the pull request\'s most recent iteration have been saved to the Iteration_Details.txt file—these will serve as the focus for the current code review. The Iteration_Details.txt file also lists the full commit SHAs for the latest iteration: the Source Commit contains the pull request\'s changes (the new code), and the Target Commit is the tip of the base branch it will merge into (the old code). When using git to inspect the changes, always diff from base to PR branch using the merge-base form—git diff <target-commit>...<source-commit>—so that additions in the output represent code introduced by this pull request and deletions represent code it removes. If a Work_Item_Details.txt file exists in the working directory, it contains the full details of work items linked to this pull request, including their type, title, description, acceptance criteria, and repro steps. Use this information to better understand the intent and requirements behind the code changes being reviewed.';
                 const replacedOverview = 'The PR details, iteration information, and code diff are all provided inline at the end of this prompt. Use this information to understand the context and review the code changes. Do NOT attempt to read files from disk or run git commands to explore the repository—all relevant context is embedded below.';
                 if (currentPrompt.includes(originalOverview)) {
                     currentPrompt = currentPrompt.replace(originalOverview, replacedOverview);

@@ -34,6 +34,10 @@
     reviewers, with their full text, author, and replies. The task passes this only when the review agent
     is allowed to resolve human threads (resolveThreads = all).
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps text written by PR authors and commenters in untrusted-content markers carrying this id.
+
 .EXAMPLE
     .\Get-AzureDevOpsPR.ps1 -Token "your-pat-token" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject"
     Lists all open pull requests in the project using PAT authentication.
@@ -91,7 +95,11 @@ param(
     [string]$OutputFile,
 
     [Parameter(Mandatory = $false, HelpMessage = "Include active human reviewer threads as JSON")]
-    [switch]$IncludeHumanThreads
+    [switch]$IncludeHumanThreads,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
@@ -160,6 +168,37 @@ function Write-ContextDegradation {
         # Bookkeeping must never fail the context fetch
     }
 }
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
+}
+
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -512,7 +551,11 @@ if ($Id -gt 0) {
     Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
     Write-Output-Line "PULL REQUEST DETAILS" -ForegroundColor Green
     Write-Output-Line ("=" * 80) -ForegroundColor DarkGray
-    
+
+    # Everything from here to [Links] is PR-author and commenter text (title,
+    # branch names, display names, description, comments, file paths)
+    Write-UntrustedContentMarker -Kind Begin -Source 'pull-request'
+
     Write-Output-Line "`n[Basic Information]" -ForegroundColor Yellow
     Write-Output-Line "  ID:              #$($pr.pullRequestId)"
     Write-Output-Line "  Title:           $($pr.title)"
@@ -691,7 +734,9 @@ if ($Id -gt 0) {
     else {
         Write-Output-Line "  No linked work items"
     }
-    
+
+    Write-UntrustedContentMarker -Kind End
+
     Write-Output-Line "`n[Links]" -ForegroundColor Yellow
     $webUrl = "$CollectionUri/$Project/_git/$($pr.repository.name)/pullrequest/$($pr.pullRequestId)"
     Write-Output-Line "  Web URL: $webUrl"
@@ -704,7 +749,10 @@ if ($Id -gt 0) {
     if ($agentThreads.Count -gt 0) {
         Write-Output-Line "`n=== COPILOT COMMENT THREADS (JSON) ===" -ForegroundColor Cyan
         $jsonThreads = @($agentThreads | ForEach-Object { ConvertTo-ThreadJsonObject -Thread $_ })
+        # Replies in these threads come from people
+        Write-UntrustedContentMarker -Kind Begin -Source 'automated-review-threads'
         Write-Output-Line (ConvertTo-Json -InputObject $jsonThreads -Compress -Depth 6)
+        Write-UntrustedContentMarker -Kind End
         Write-Output-Line "=== END COPILOT COMMENT THREADS ===" -ForegroundColor Cyan
     }
 
@@ -714,7 +762,9 @@ if ($Id -gt 0) {
     if ($humanActiveThreads.Count -gt 0) {
         Write-Output-Line "`n=== HUMAN REVIEWER THREADS (JSON) ===" -ForegroundColor Cyan
         $jsonThreads = @($humanActiveThreads | ForEach-Object { ConvertTo-ThreadJsonObject -Thread $_ -IncludeAuthor })
+        Write-UntrustedContentMarker -Kind Begin -Source 'human-reviewer-threads'
         Write-Output-Line (ConvertTo-Json -InputObject $jsonThreads -Compress -Depth 6)
+        Write-UntrustedContentMarker -Kind End
         Write-Output-Line "=== END HUMAN REVIEWER THREADS ===" -ForegroundColor Cyan
     }
 }

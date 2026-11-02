@@ -52,6 +52,10 @@
 .PARAMETER OutputFile
     Optional. Path to write the output to a file. If not specified, output is only written to the console.
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps each Jira issue in untrusted-content markers carrying this id.
+
 .EXAMPLE
     .\Get-JiraWorkItems.ps1 -BaseUrl "https://myorg.atlassian.net" -Email "me@example.com" -ApiToken "token" -PrMetadataFile "./PR_Metadata.json" -OutputFile "./Work_Item_Details.txt"
     Extracts issue keys from the PR metadata and writes the fetched issue details to a file.
@@ -107,7 +111,11 @@ param(
     [string]$GatewayBaseUrl = 'https://api.atlassian.com',
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
@@ -175,6 +183,36 @@ function Write-ContextDegradation {
     catch {
         # Bookkeeping must never fail the context fetch
     }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
 }
 
 function Get-JiraIssueKeys {
@@ -714,6 +752,9 @@ foreach ($issue in $issues) {
     # native format; fall back to nothing if rendering is unavailable
     $description = ConvertFrom-Html $issue.renderedFields.description
 
+    # Issue fields and comments can be written by anyone with access to the
+    # Jira project, including people outside the development team
+    Write-UntrustedContentMarker -Kind Begin -Source "jira-$($issue.key)"
     Write-Output-Line "`n[$($issue.key) - $issueType]" -ForegroundColor Yellow
     Write-Output-Line "  Title:           $summary"
     Write-Output-Line "  Status:          $status"
@@ -845,6 +886,7 @@ foreach ($issue in $issues) {
             }
         }
     }
+    Write-UntrustedContentMarker -Kind End
 }
 
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

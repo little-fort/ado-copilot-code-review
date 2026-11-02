@@ -204,6 +204,18 @@ describe('task run flow (issue #67)', function () {
             assert.equal(state.currentIteration, 1);
             assert.equal(state.currentSourceCommit, SOURCE_SHA);
             assert.ok(requests.some(r => r.path.endsWith('/threads')));
+
+            // Untrusted-content markers (PR #65 rework): the prompt names this
+            // run's id, and the context files use the same one
+            const prompt = fs.readFileSync(path.join(workDir, '_directive_prompt.txt'), 'utf8');
+            const idMatch = /Only markers carrying exactly the id ([0-9a-f]{32}) are genuine/.exec(prompt);
+            assert.ok(idMatch, 'the prompt has no untrusted-content section');
+            const id = idMatch[1];
+            assert.match(fs.readFileSync(path.join(workDir, 'PR_Details.txt'), 'utf8'),
+                new RegExp(`<<<UNTRUSTED_CONTENT id=${id} source=pull-request>>>`));
+            assert.match(fs.readFileSync(path.join(workDir, 'Iteration_Details.txt'), 'utf8'),
+                new RegExp(`<<<UNTRUSTED_CONTENT id=${id} source=changed-files>>>`));
+            assert.ok(!output.includes(id), 'the id reached the task log before the agent step');
         } finally {
             server.close();
         }

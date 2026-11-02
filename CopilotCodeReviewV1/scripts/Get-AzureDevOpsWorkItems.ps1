@@ -27,6 +27,10 @@
 .PARAMETER OutputFile
     Optional. Path to write the output to a file. If not specified, output is only written to the console.
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps each work item in untrusted-content markers carrying this id.
+
 .EXAMPLE
     .\Get-AzureDevOpsWorkItems.ps1 -Token "your-pat" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject" -WorkItemIds "123,456"
     Retrieves details for work items #123 and #456.
@@ -64,7 +68,11 @@ param(
     [string]$WorkItemIds,
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
@@ -132,6 +140,36 @@ function Write-ContextDegradation {
     catch {
         # Bookkeeping must never fail the context fetch
     }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
 }
 function Get-AuthorizationHeader {
     param(
@@ -287,6 +325,8 @@ foreach ($wi in $response.value) {
     $wiAcceptanceCriteria = ConvertFrom-Html $fields.'Microsoft.VSTS.Common.AcceptanceCriteria'
     $wiReproSteps = ConvertFrom-Html $fields.'Microsoft.VSTS.TCM.ReproSteps'
 
+    # Work item text can be written by anyone with access to the work item
+    Write-UntrustedContentMarker -Kind Begin -Source "work-item-$($wi.id)"
     Write-Output-Line "`n[Work Item #$($wi.id) - $wiType]" -ForegroundColor Yellow
     Write-Output-Line "  Title:           $wiTitle"
     Write-Output-Line "  State:           $wiState"
@@ -312,6 +352,7 @@ foreach ($wi in $response.value) {
             Write-Output-Line "    $_"
         }
     }
+    Write-UntrustedContentMarker -Kind End
 }
 
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

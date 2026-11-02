@@ -35,6 +35,10 @@
     Optional (pass together with -ReviewStateKeyPrefix). Path of the JSON file that receives the
     current iteration, the last reviewed iteration, and the changes since then, for the task to act on.
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps the commit list and the changed-file lists (PR-author text) in untrusted-content markers.
+
 .EXAMPLE
     .\Get-AzureDevOpsPRChanges.ps1 -Token "your-pat" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject" -Repository "myrepo" -Id 123
     Retrieves the commits and changed files from the most recent iteration of PR #123.
@@ -87,7 +91,11 @@ param(
     [string]$ReviewStateKeyPrefix,
 
     [Parameter(Mandatory = $false, HelpMessage = "Path of the review state JSON file to write")]
-    [string]$ReviewStateFile
+    [string]$ReviewStateFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
@@ -129,6 +137,36 @@ function Write-Output-Line {
     else {
         Write-Host $sanitized -ForegroundColor $ForegroundColor
     }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
 }
 
 function Get-AuthorizationHeader {
@@ -670,6 +708,8 @@ if ($commitResult.Items.Count -gt 0) {
         Write-Output-Line "  Total commits: $($commitResult.Items.Count)`n"
     }
 
+    # Commit messages and author names are PR-author text
+    Write-UntrustedContentMarker -Kind Begin -Source 'commits'
     foreach ($commit in $commitResult.Items) {
         $shortId = $commit.commitId.Substring(0, 8)
         $message = $commit.comment -split "`n" | Select-Object -First 1
@@ -679,6 +719,7 @@ if ($commitResult.Items.Count -gt 0) {
         Write-Output-Line "  $shortId - $message" -ForegroundColor Cyan
         Write-Output-Line "           Author: $($commit.author.name) | $(Format-DateForDisplay $commit.author.date)" -ForegroundColor DarkGray
     }
+    Write-UntrustedContentMarker -Kind End
 }
 elseif ($commitResult.Status -eq 'Failed') {
     Write-Output-Line "  Commits could not be retrieved from Azure DevOps."
@@ -711,18 +752,21 @@ if ($changeEntries.Count -gt 0) {
     Write-Output-Line $summaryLine
     Write-Output-Line ""
     
-    # List each file
+    # List each file. File names (which may even contain line breaks) and
+    # rename origins are chosen by the PR author.
+    Write-UntrustedContentMarker -Kind Begin -Source 'changed-files'
     foreach ($change in $changeEntries) {
         $changeDisplay = Get-ChangeTypeDisplay -ChangeType $change.changeType
         $filePath = $change.item.path
-        
+
         Write-Output-Line "  [$($changeDisplay.Text)] $filePath" -ForegroundColor $changeDisplay.Color
-        
+
         # Show original path for renames
         if ($change.changeType -eq "rename" -and $change.originalPath) {
             Write-Output-Line "         (from: $($change.originalPath))" -ForegroundColor DarkGray
         }
     }
+    Write-UntrustedContentMarker -Kind End
 }
 elseif ($changeResult.Status -eq 'Failed') {
     # Previously this case printed "No file changes found", which told the
@@ -748,6 +792,7 @@ if ($reviewState -and $reviewState.delta.status -eq 'Complete') {
     }
     else {
         Write-Output-Line "  Files in this pull request changed since that review: $($deltaFiles.Count)"
+        Write-UntrustedContentMarker -Kind Begin -Source 'changed-files-since-last-review'
         foreach ($file in $deltaFiles) {
             $changeDisplay = Get-ChangeTypeDisplay -ChangeType $file.changeType
             Write-Output-Line "    [$($changeDisplay.Text)] $($file.path)" -ForegroundColor $changeDisplay.Color
@@ -755,6 +800,7 @@ if ($reviewState -and $reviewState.delta.status -eq 'Complete') {
                 Write-Output-Line "           (from: $($file.originalPath))" -ForegroundColor DarkGray
             }
         }
+        Write-UntrustedContentMarker -Kind End
         Write-Output-Line "  To see exactly what changed since that review: git diff $lastSha $currentSha"
         Write-Output-Line "  If that commit is not available locally (for example after a force push or with a shallow clone), use this file list together with the full pull request diff."
     }

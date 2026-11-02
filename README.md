@@ -214,6 +214,8 @@ steps:
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
 | `skipReviewedIterations` | No | `true` | Finish immediately when this review configuration already reviewed the PR's current iteration; set `false` to force a fresh review (see [Incremental Re-Reviews](#incremental-re-reviews)) |
+| `ignoreCustomInstructions` | No | `false` | Keep the repository's own instruction files (CLAUDE.md, AGENTS.md, `.github/copilot-instructions.md`, ...) and Copilot repository skills away from the agent (see [Security Model](#security-model)) |
+| `autoUpdateCli` | No | `false` | Run `copilot update` / `claude update` on an already-installed CLI before the review; a failed update only logs a warning |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
 
 ### Copilot Models
@@ -532,7 +534,7 @@ Alternatively, you can create the pipeline first and then configure the pipeline
 ## How It Works
 
 1. **Fetch PR Context**: The task retrieves the PR's iteration details and its review record, then pull request metadata, existing comments, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured). If this review configuration already reviewed the current iteration, the run ends here (see [Incremental Re-Reviews](#incremental-re-reviews)).
-2. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
+2. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`. With `autoUpdateCli: true`, an existing install is updated first. The task logs the CLI version and warns when it is older than the versions it supports (see [Security Model](#security-model)).
 3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
 4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
 5. **Record the Review**: When the run provably reviewed the iteration, the task records it on the pull request so later runs can skip it or focus on what changed
@@ -550,6 +552,25 @@ The default prompt instructs Copilot to focus on:
 - **Code Consistency**: Style and pattern consistency
 
 Findings are triaged in two phases: the agent first enumerates every candidate issue across the full diff, then scores each by severity (Critical/Major/Minor/Nit) and confidence before posting. Critical and Major findings always post individually; high-confidence Minor findings are consolidated into a single capped comment (see `maxMinorIssues`); nits and speculation are dropped. On re-reviews, new comments are limited to newly pushed changes plus Critical findings, which keeps review rounds from surfacing endless new commentary on already-reviewed code.
+
+## Security Model
+
+The review agent runs in your build, inside a checkout of the pull request it reviews. Everything in that checkout — code, instruction files, and CLI configuration files — can be written by the pull request's author, who may not be trusted. The task limits what that content can do:
+
+- **Repository CLI configuration is not loaded.** Claude Code runs with `--setting-sources user`, so a checkout's `.claude/settings.json`, `.claude/settings.local.json`, and `.mcp.json` are ignored: no hooks or helper commands from the repository run, its `env` block doesn't apply, and its MCP servers, skills, and subagents don't load. The build user's own `~/.claude` settings still apply. The Copilot CLI loads a repository's hooks, MCP servers, and plugin settings only from folders it trusts; the task removes the environment variables that grant that trust (`COPILOT_ALLOW_ALL`, `GITHUB_COPILOT_PROMPT_MODE_*`) and warns when the build user's Copilot config already trusts a folder that contains the checkout (trust is inherited by subfolders).
+- **No built-in GitHub MCP servers.** Copilot runs with `--disable-builtin-mcps`.
+- **GitHub credentials stay out of the agent's shell.** Copilot runs with `--secret-env-vars` for `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, and the custom-provider keys: commands the agent runs don't see them, and their values are redacted from output.
+- **Repository instruction files are optional.** By default the agent still reads them: CLAUDE.md for Claude Code; AGENTS.md, CLAUDE.md, `.github/copilot-instructions.md` and related files, plus repository skills, for Copilot. A pull request can edit these files, so set `ignoreCustomInstructions: true` if you don't want the changes under review to shape their own review.
+
+What the task does **not** prevent: the agent has a general-purpose shell, and that shell holds the Azure DevOps token the comment scripts use (and, for Claude Code, the Anthropic API key or OAuth token). A pull request that manages to steer the agent with injected instructions could misuse them. Treat a review of an untrusted pull request like any other build of untrusted code:
+
+- Prefer Microsoft-hosted or other ephemeral agents, so nothing a review does carries over to later runs.
+- On self-hosted agents, never save Copilot folder trust on the agent's work folder or any folder above it, and keep the checkout step's `persistCredentials` off.
+- Give the pipeline identity only the permissions the review needs ("Contribute to pull requests" on the repository).
+
+**CLI versions:** tested with GitHub Copilot CLI 1.0.105 and Claude Code 2.1.316. The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
+
+**Changes in 1.6.2:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server.
 
 ## Limitations
 
@@ -569,6 +590,14 @@ Findings are triaged in two phases: the agent first enumerates every candidate i
 
 - Ensure `npm` is available on the agent and the agent has internet connectivity to install `@anthropic-ai/claude-code` from npm.
 - On self-hosted agents, ensure the agent user has permission to install global npm packages.
+
+### Warning: the CLI "is older than" a supported version
+
+The installed Copilot CLI or Claude Code CLI predates the version that honors the task's isolation of repository configuration (see [Security Model](#security-model)). Update the CLI on the agent, or set `autoUpdateCli: true`. The review still runs.
+
+### Warning: the Copilot CLI "trusts the folder"
+
+The build user's Copilot config (`config.json` in `COPILOT_HOME`, by default `~/.copilot`) lists a trusted folder that contains the checkout, so the CLI will load hooks, MCP servers, and plugin settings committed in the pull request. Remove that folder from `trustedFolders`.
 
 ### Authentication errors
 

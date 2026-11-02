@@ -55,7 +55,8 @@ describe('incremental re-review state (issue #67)', () => {
             resolveThreads: 'all',
             suppressPositiveFeedback: false,
             maxMinorIssues: '5',
-            workItemSource: 'none'
+            workItemSource: 'none',
+            ignoreCustomInstructions: false
         };
     }
 
@@ -83,12 +84,28 @@ describe('incremental re-review state (issue #67)', () => {
                 resolveThreads: 'agentOnly',
                 suppressPositiveFeedback: true,
                 maxMinorIssues: '0',
-                workItemSource: 'azureBoards'
+                workItemSource: 'azureBoards',
+                ignoreCustomInstructions: true
             };
             for (const [setting, value] of Object.entries(changes)) {
                 const changed = task.computeReviewStateKeyPrefix({ ...baseConfiguration(), [setting]: value });
                 assert.notEqual(changed, base, `changing ${setting} must change the key prefix`);
             }
+        });
+
+        it('keeps existing keys when settings added later stay at their defaults', () => {
+            // Records written before ignoreCustomInstructions existed must keep
+            // matching, so the key is the original 15-setting hash
+            const config = baseConfiguration();
+            const original = JSON.stringify([
+                config.agent, config.model, config.reasoningEffort, config.maxTurns, config.maxBudget,
+                config.providerType, config.providerBaseUrl, config.diffOnly, config.promptMode,
+                config.promptText.trim(), config.templateText.trim(), config.resolveThreads,
+                config.suppressPositiveFeedback, config.maxMinorIssues, config.workItemSource
+            ]);
+            const expected = 'CopilotCodeReview.v1.' +
+                require('node:crypto').createHash('sha256').update(original, 'utf8').digest('hex').slice(0, 16);
+            assert.equal(task.computeReviewStateKeyPrefix(config), expected);
         });
 
         it('ignores line-ending and surrounding-whitespace differences in prompt text', () => {

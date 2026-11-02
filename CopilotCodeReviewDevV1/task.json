@@ -337,7 +337,23 @@
             "label": "Skip Already-Reviewed Iterations",
             "required": false,
             "defaultValue": true,
-            "helpMarkDown": "After a review, the task records the reviewed PR iteration as a pull request property (scoped to this review configuration: agent, model, prompt, and review settings). When enabled (default), a run for an iteration that was already reviewed (e.g. re-queued build, policy re-run) finishes immediately without running the agent. Disable to force a fresh review every time."
+            "helpMarkDown": "After a review, the task records the reviewed PR iteration as a pull request property (scoped to this review configuration: agent, model, prompt, and review settings). When enabled (default), a run for an iteration that was already reviewed — for example a re-queued build or a policy re-run after the target branch moved — finishes immediately without running the agent. Disable to force a fresh review. Re-reviews of newer iterations are told what changed since the last review either way. Requires permission to update the pull request (the same 'Contribute to pull requests' permission used for posting comments)."
+        },
+        {
+            "name": "ignoreCustomInstructions",
+            "type": "boolean",
+            "label": "Ignore Repository Custom Instructions",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, the agent does not load instruction files from the repository under review: CLAUDE.md for Claude Code; AGENTS.md, CLAUDE.md, .github/copilot-instructions.md, and related files, plus repository skills, for the Copilot CLI. The pull request under review can edit these files, so enable this if you don't want the changes to shape their own review. Repository settings, hooks, and MCP servers are not loaded either way (see Security Model in the README)."
+        },
+        {
+            "name": "autoUpdateCli",
+            "type": "boolean",
+            "label": "Auto-Update CLI",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled and the Copilot CLI or Claude Code CLI is already installed on the agent, the task runs its update command ('copilot update' or 'claude update') before the review. A failed update logs a warning and the review continues with the installed version. When disabled (default), keeping the CLI current on self-hosted agents is up to the build admin; the task warns when the installed version is older than it supports."
         },
         {
             "name": "publishPromptArtifacts",

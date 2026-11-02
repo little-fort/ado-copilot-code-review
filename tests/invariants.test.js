@@ -182,4 +182,15 @@ describe('Dev/prod task definition parity', () => {
         assert.ok(input, 'skipReviewedIterations input is missing from task.json');
         assert.equal(input.defaultValue, true);
     });
+
+    it('keeps repository instructions and the installed CLI version by default (PR #65 rework)', () => {
+        // index.ts reads both with getBoolInput(name, false); the task
+        // definition must ship the same defaults
+        for (const name of ['ignoreCustomInstructions', 'autoUpdateCli']) {
+            const input = prodTask.inputs.find(i => i.name === name);
+            assert.ok(input, `${name} input is missing from task.json`);
+            assert.equal(input.type, 'boolean', `${name} must be a boolean input`);
+            assert.equal(input.defaultValue, false, `${name} must default to false`);
+        }
+    });
 });

@@ -263,6 +263,8 @@ interface ReviewConfiguration {
     maxMinorIssues: string;
     /** 'none', 'azureBoards', or the Jira site/project keys/custom fields */
     workItemSource: string;
+    /** Whether the repository's own instruction files are kept from the agent */
+    ignoreCustomInstructions: boolean;
 }
 
 /**
@@ -290,7 +292,11 @@ function computeReviewStateKeyPrefix(config: ReviewConfiguration): string {
         config.resolveThreads,
         config.suppressPositiveFeedback,
         config.maxMinorIssues,
-        config.workItemSource
+        config.workItemSource,
+        // Settings added after the first release of review state are appended
+        // only when they differ from their default, so adding one does not
+        // change the key (and discard the records) of existing configurations
+        ...(config.ignoreCustomInstructions ? ['ignoreCustomInstructions'] : [])
     ]);
     const hash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 16);
     return `CopilotCodeReview.v1.${hash}`;
@@ -797,6 +803,13 @@ async function run(): Promise<void> {
         // already reviewed; false forces a fresh review. Read as a string so an
         // unset input (e.g. local runs) keeps the documented default.
         const skipReviewedIterations = (tl.getInput('skipReviewedIterations') || 'true').toLowerCase() !== 'false';
+        // Whether the repository's own instruction files (CLAUDE.md, AGENTS.md,
+        // .github/copilot-instructions.md, ...) and Copilot repo skills reach the
+        // agent. The PR under review can edit them, so some teams turn them off.
+        const ignoreCustomInstructions = tl.getBoolInput('ignoreCustomInstructions', false);
+        // Update an already-installed CLI before the review. Off by default: the
+        // build admin owns the tooling on self-hosted agents.
+        const autoUpdateCli = tl.getBoolInput('autoUpdateCli', false);
 
         // Fail fast on a typo'd value — falling back silently would change
         // which PR threads the agent is allowed to resolve
@@ -895,6 +908,12 @@ async function run(): Promise<void> {
         }
         if (useJiraWorkItems) {
             console.log(`Work Item Source: Jira (${normalizedJiraBaseUrl})`);
+        }
+        if (ignoreCustomInstructions) {
+            console.log('Repository Custom Instructions: ignored');
+        }
+        if (autoUpdateCli) {
+            console.log('CLI Auto-Update: enabled');
         }
         console.log('='.repeat(60));
 
@@ -1042,7 +1061,8 @@ async function run(): Promise<void> {
             maxMinorIssues,
             workItemSource: !includeWorkItems ? 'none'
                 : useJiraWorkItems ? `jira:${normalizedJiraBaseUrl}|${jiraProjectKeys || ''}|${jiraCustomFields || ''}`
-                : 'azureBoards'
+                : 'azureBoards',
+            ignoreCustomInstructions
         });
         const reviewStateDir = fs.mkdtempSync(path.join(tl.getVariable('Agent.TempDirectory') || os.tmpdir(), 'copilot-review-'));
         const reviewStateFile = path.join(reviewStateDir, 'Review_State.json');
@@ -1538,33 +1558,56 @@ async function run(): Promise<void> {
         // Step 5: Install the CLI agent if not present. Done this late so a
         // skipped run, a failed fetch, or a prompt configuration error never
         // pays for the install.
-        if (useClaudeCode) {
-            console.log('\n[Step 5/6] Checking Claude Code CLI installation...');
-            const claudeInstalled = await checkClaudeCodeCli();
-            if (!claudeInstalled) {
-                console.log('Claude Code CLI not found. Installing...');
+        const cliCommand = useClaudeCode ? 'claude' : 'copilot';
+        const cliLabel = useClaudeCode ? 'Claude Code CLI' : 'GitHub Copilot CLI';
+        console.log(`\n[Step 5/6] Checking ${cliLabel} installation...`);
+        const cliInstalled = useClaudeCode ? await checkClaudeCodeCli() : await checkCopilotCli();
+        if (!cliInstalled) {
+            console.log(`${cliLabel} not found. Installing...`);
+            if (useClaudeCode) {
                 await installClaudeCodeCli();
             } else {
-                console.log('Claude Code CLI is already installed.');
+                await installCopilotCli();
             }
         } else {
-            console.log('\n[Step 5/6] Checking GitHub Copilot CLI installation...');
-            const copilotInstalled = await checkCopilotCli();
-            if (!copilotInstalled) {
-                console.log('GitHub Copilot CLI not found. Installing...');
-                await installCopilotCli();
-            } else {
-                console.log('GitHub Copilot CLI is already installed.');
+            console.log(`${cliLabel} is already installed.`);
+            if (autoUpdateCli) {
+                // A fresh install is already the latest, so only an existing
+                // install is updated. Never fatal: the review runs on whatever
+                // version is installed.
+                console.log(`Updating the ${cliLabel} (autoUpdateCli)...`);
+                const update = await updateExistingCli({
+                    label: cliLabel,
+                    getVersion: () => getCliVersion(cliCommand),
+                    command: 'pwsh',
+                    args: ['-NoProfile', '-Command', `${windowsPathRefresh()}${cliCommand} update; exit $LASTEXITCODE`]
+                });
+                if (update.ok) {
+                    console.log(update.message);
+                } else {
+                    tl.warning(update.message);
+                }
             }
         }
+        reportCliVersion(cliLabel, getCliVersion(cliCommand), useClaudeCode ? CLAUDE_CLI_FLOOR : COPILOT_CLI_FLOOR);
 
         // Step 6: Run the CLI agent with a timeout
         console.log(`\n[Step 6/6] Running ${agentName} code review...`);
         const timeoutMs = timeoutMinutes * 60 * 1000;
         if (useClaudeCode) {
-            await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive);
+            await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive, ignoreCustomInstructions);
         } else {
-            await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive);
+            // Folder trust saved in the CLI's own config (it is inherited by
+            // subfolders) makes the CLI load hooks, MCP servers and plugin
+            // settings committed in the PR. The task keeps the build user's
+            // config by design, so it can only point this out.
+            const trustingFolder = findTrustingFolder(workingDirectory, readCopilotTrustedFolders());
+            if (trustingFolder) {
+                tl.warning(`The GitHub Copilot CLI on this agent trusts the folder '${trustingFolder}', which contains this checkout, ` +
+                    'so it will load hooks, MCP servers, and plugin settings committed in the pull request. ' +
+                    "Remove that folder from 'trustedFolders' in the CLI's config.json (in COPILOT_HOME, by default ~/.copilot).");
+            }
+            await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive, ignoreCustomInstructions);
         }
 
         console.log('\n' + '='.repeat(60));
@@ -1639,6 +1682,352 @@ async function run(): Promise<void> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI launch hardening (PR #65 rework). The agent runs inside the PR checkout,
+// so anything a CLI loads from its working directory is controlled by the PR
+// author. These helpers decide the flags and environment each CLI gets, and
+// report outdated CLIs; they are pure where possible so the rules can be
+// tested without launching a CLI.
+// ---------------------------------------------------------------------------
+
+/** Oldest CLI versions known to honor the isolation the launch flags rely on. */
+interface CliVersionFloor {
+    minimum: string;
+    /** What an older version may do, completing "Older versions ..." */
+    risk: string;
+}
+// Copilot 1.0.40/1.0.41 started requiring folder trust before loading a
+// repository's hooks, MCP servers and extensions in non-interactive runs.
+const COPILOT_CLI_FLOOR: CliVersionFloor = {
+    minimum: '1.0.41',
+    risk: 'may run hooks or start MCP servers committed in the pull request'
+};
+// Claude Code 2.1.69 fixed --setting-sources user still loading project skills.
+const CLAUDE_CLI_FLOOR: CliVersionFloor = {
+    minimum: '2.1.69',
+    risk: 'may load skills committed in the pull request'
+};
+
+/**
+ * Credentials the Copilot CLI uses itself but the agent's shell commands never
+ * need. --secret-env-vars removes them from the shell and MCP server
+ * environments and redacts their values from output; the CLI still reads them
+ * from its own process environment. AZUREDEVOPS_TOKEN is deliberately absent:
+ * the comment scripts the agent runs read it from the shell environment.
+ */
+const COPILOT_SECRET_ENV_VARS = ['GH_TOKEN', 'COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'COPILOT_PROVIDER_API_KEY', 'COPILOT_PROVIDER_BEARER_TOKEN'];
+
+/** Single-quoted PowerShell string literal (no expansion; quotes doubled). */
+function quotePowerShellLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Prefix for PowerShell commands that reloads PATH from the registry on
+ * Windows, so a CLI installed earlier in this run (winget) is found.
+ */
+function windowsPathRefresh(): string {
+    return isWindows()
+        ? '$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User"); '
+        : '';
+}
+
+interface CopilotCliOptions {
+    model?: string;
+    reasoningEffort?: string;
+    ignoreCustomInstructions: boolean;
+}
+
+/** Copilot CLI flags, as a fragment of the PowerShell command that launches it. */
+function buildCopilotCliArgs(options: CopilotCliOptions): string {
+    const flags = [
+        '--allow-all-paths',
+        '--allow-all-tools',
+        `--deny-tool 'shell(git push)'`,
+        // The built-in GitHub MCP servers add network tools a PR review does not need
+        '--disable-builtin-mcps',
+        `'--secret-env-vars=${COPILOT_SECRET_ENV_VARS.join(',')}'`
+    ];
+    if (options.ignoreCustomInstructions) {
+        // Repository instruction files (AGENTS.md, .github/copilot-instructions.md,
+        // CLAUDE.md, ...) and repository skills; both load even in untrusted folders
+        flags.push('--no-custom-instructions', '--excluded-tools skill');
+    }
+    if (options.model) {
+        flags.push(`--model ${options.model}`);
+    }
+    if (options.reasoningEffort) {
+        flags.push(`--reasoning-effort ${options.reasoningEffort}`);
+    }
+    return flags.join(' ');
+}
+
+/**
+ * Environment for the Copilot CLI. Removes the variables that make the CLI
+ * trust its working directory — COPILOT_ALLOW_ALL set to exactly 'true' and the
+ * GITHUB_COPILOT_PROMPT_MODE_* opt-ins — because a trusted folder's hooks, MCP
+ * servers, plugin settings and extensions are loaded, and the PR controls them.
+ */
+function buildCopilotCliEnv(baseEnv: NodeJS.ProcessEnv): { env: NodeJS.ProcessEnv; removed: string[] } {
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    const removed: string[] = [];
+    for (const name of Object.keys(env)) {
+        const upper = name.toUpperCase();
+        if (upper === 'COPILOT_ALLOW_ALL' || upper.startsWith('GITHUB_COPILOT_PROMPT_MODE_')) {
+            delete env[name];
+            removed.push(name);
+        }
+    }
+    return { env, removed };
+}
+
+/**
+ * The saved Copilot trusted folder that contains `checkoutPath` (trust is
+ * inherited by subfolders), or null. Paths compare case-insensitively on Windows.
+ */
+function findTrustingFolder(checkoutPath: string, trustedFolders: unknown, platform: NodeJS.Platform = process.platform): string | null {
+    if (!Array.isArray(trustedFolders)) {
+        return null;
+    }
+    const pathApi = platform === 'win32' ? path.win32 : path.posix;
+    const fold = (value: string) => platform === 'win32' ? value.toLowerCase() : value;
+    const checkout = fold(pathApi.resolve(checkoutPath));
+    for (const entry of trustedFolders) {
+        if (typeof entry !== 'string' || !entry.trim()) {
+            continue;
+        }
+        const folder = fold(pathApi.resolve(entry));
+        // A root such as C:\ or / already ends with the separator
+        const prefix = folder.endsWith(pathApi.sep) ? folder : folder + pathApi.sep;
+        if (checkout === folder || checkout.startsWith(prefix)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+/**
+ * JSON.parse for JSON with comments (// and /* *\/) and trailing commas, as
+ * the Copilot CLI writes its config.json (it starts with // comment lines).
+ * String contents are left untouched.
+ */
+function parseJsonWithComments(text: string): unknown {
+    let withoutComments = '';
+    let inString = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            withoutComments += ch;
+            if (ch === '\\') {
+                withoutComments += text[++i] ?? '';
+            } else if (ch === '"') {
+                inString = false;
+            }
+        } else if (ch === '"') {
+            inString = true;
+            withoutComments += ch;
+        } else if (ch === '/' && text[i + 1] === '/') {
+            while (i + 1 < text.length && text[i + 1] !== '\n') {
+                i++;
+            }
+        } else if (ch === '/' && text[i + 1] === '*') {
+            const end = text.indexOf('*/', i + 2);
+            i = end < 0 ? text.length : end + 1;
+        } else {
+            withoutComments += ch;
+        }
+    }
+
+    // Drop commas that directly precede a closing brace or bracket
+    let clean = '';
+    inString = false;
+    for (let i = 0; i < withoutComments.length; i++) {
+        const ch = withoutComments[i];
+        if (inString) {
+            clean += ch;
+            if (ch === '\\') {
+                clean += withoutComments[++i] ?? '';
+            } else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+        } else if (ch === ',' && /^\s*[}\]]/.test(withoutComments.slice(i + 1))) {
+            continue;
+        }
+        clean += ch;
+    }
+    return JSON.parse(clean);
+}
+
+/** `trustedFolders` from the Copilot CLI's config.json, or undefined if unreadable. */
+function readCopilotTrustedFolders(): unknown {
+    const copilotHome = process.env['COPILOT_HOME'] || path.join(os.homedir(), '.copilot');
+    const configPath = path.join(copilotHome, 'config.json');
+    try {
+        const config: any = parseJsonWithComments(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+        return config && typeof config === 'object' ? config.trustedFolders : undefined;
+    } catch (err) {
+        tl.debug(`Could not read the Copilot CLI config at ${configPath}: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+    }
+}
+
+interface ClaudeCliOptions {
+    diffOnlyActive: boolean;
+    model?: string;
+    reasoningEffort?: string;
+    maxTurns?: string;
+    maxBudget?: string;
+    ignoreCustomInstructions: boolean;
+    workingDirectory: string;
+}
+
+/** Claude Code CLI flags, as a fragment of the PowerShell command that launches it. */
+function buildClaudeCliArgs(options: ClaudeCliOptions): string {
+    let flags = `--dangerously-skip-permissions`;
+    flags += ` --output-format stream-json --verbose --include-partial-messages`;
+    // Load only the build user's own settings. The project and local sources
+    // come from the PR checkout: their hooks and helper commands run, their
+    // .mcp.json servers start, and their env block changes the CLI's own
+    // environment (it could redirect ANTHROPIC_BASE_URL). Verified with 2.1.316:
+    // without this flag, a checkout's SessionStart hook and .mcp.json server ran.
+    flags += ` --setting-sources user`;
+    if (!options.ignoreCustomInstructions) {
+        // Excluding the project source also drops the repository's CLAUDE.md.
+        // --add-dir plus CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 (see
+        // buildClaudeCliEnv) loads it again without the project's settings,
+        // skills, or MCP servers (verified with 2.1.316).
+        flags += ` --add-dir ${quotePowerShellLiteral(options.workingDirectory)}`;
+    }
+    if (options.diffOnlyActive) {
+        flags += ` --allowedTools "Bash(pwsh *)" "Write"`;
+    } else {
+        flags += ` --allowedTools "Bash" "Read" "Write" "Edit" "Glob" "Grep"`;
+    }
+    flags += ` --disallowedTools "Bash(git push *)"`;
+
+    if (options.model) {
+        flags += ` --model ${options.model}`;
+    }
+    if (options.reasoningEffort) {
+        // Claude Code uses --effort (no --reasoning-effort alias)
+        flags += ` --effort ${options.reasoningEffort}`;
+    }
+    if (options.maxTurns) {
+        flags += ` --max-turns ${options.maxTurns}`;
+    }
+    if (options.maxBudget) {
+        flags += ` --max-budget-usd ${options.maxBudget}`;
+    }
+    return flags;
+}
+
+/** Environment for the Claude Code CLI (see buildClaudeCliArgs). */
+function buildClaudeCliEnv(baseEnv: NodeJS.ProcessEnv, options: { ignoreCustomInstructions: boolean }): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    if (!options.ignoreCustomInstructions) {
+        env['CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD'] = '1';
+    }
+    return env;
+}
+
+/** First `major.minor.patch` in a CLI's --version output, or null. */
+function parseCliVersion(text: string | null | undefined): string | null {
+    const match = /(\d+)\.(\d+)\.(\d+)/.exec(text || '');
+    return match ? `${match[1]}.${match[2]}.${match[3]}` : null;
+}
+
+/** Numeric comparison of two `major.minor.patch` strings: negative, 0, or positive. */
+function compareVersions(a: string, b: string): number {
+    const left = a.split('.').map(part => parseInt(part, 10) || 0);
+    const right = b.split('.').map(part => parseInt(part, 10) || 0);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+        const difference = (left[i] || 0) - (right[i] || 0);
+        if (difference !== 0) {
+            return difference;
+        }
+    }
+    return 0;
+}
+
+/** The installed CLI's version, or null when it can't be run or read. */
+function getCliVersion(cliCommand: string): string | null {
+    try {
+        const result = child_process.spawnSync('pwsh', ['-NoProfile', '-Command', `${windowsPathRefresh()}${cliCommand} --version`], {
+            encoding: 'utf8',
+            timeout: 60_000
+        });
+        return result.status === 0 ? parseCliVersion(`${result.stdout || ''}\n${result.stderr || ''}`) : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Log line for an update attempt. An unchanged version is not proof that the
+ * CLI is current: `claude update` has exited 0 without updating.
+ */
+function describeCliUpdate(label: string, before: string | null, after: string | null): string {
+    if (!before || !after) {
+        return `${label} update finished, but the version could not be read${after ? ` (now ${after})` : ''}.`;
+    }
+    if (before !== after) {
+        return `${label} updated from ${before} to ${after}.`;
+    }
+    return `${label} version unchanged (${before}); it may already be current, or the update did not apply.`;
+}
+
+/**
+ * Runs a CLI's own update command (autoUpdateCli). Never throws: a failed
+ * update leaves the installed version in place, and the review runs anyway.
+ */
+async function updateExistingCli(options: {
+    label: string;
+    getVersion: () => string | null;
+    command: string;
+    args: string[];
+    maxAttempts?: number;
+    timeoutMs?: number;
+}): Promise<{ ok: boolean; message: string }> {
+    const before = options.getVersion();
+    try {
+        // No shell: the args are a PowerShell command line, passed verbatim
+        await runInstallerWithRetry(`${options.label} update`, options.command, options.args, options.maxAttempts ?? 2,
+            { shell: false, timeoutMs: options.timeoutMs ?? 5 * 60 * 1000 });
+    } catch (err) {
+        return {
+            ok: false,
+            message: `Could not update the ${options.label}: ${err instanceof Error ? err.message : String(err)}. ` +
+                `Continuing with the installed version (${before ?? 'unknown'}).`
+        };
+    }
+    return { ok: true, message: describeCliUpdate(options.label, before, options.getVersion()) };
+}
+
+/** Warning for a CLI older than its floor, or null when it is new enough or unknown. */
+function cliVersionWarning(label: string, version: string | null, floor: CliVersionFloor): string | null {
+    if (!version || compareVersions(version, floor.minimum) >= 0) {
+        return null;
+    }
+    return `${label} ${version} is older than ${floor.minimum}. Older versions ${floor.risk}. ` +
+        'Update the CLI on this agent, or set autoUpdateCli: true.';
+}
+
+function reportCliVersion(label: string, version: string | null, floor: CliVersionFloor): void {
+    if (!version) {
+        tl.debug(`Could not read the ${label} version.`);
+        return;
+    }
+    console.log(`${label} version: ${version}`);
+    const warning = cliVersionWarning(label, version, floor);
+    if (warning) {
+        tl.warning(warning);
+    }
+}
+
 async function checkCopilotCli(): Promise<boolean> {
     try {
         const result = child_process.spawnSync('copilot', ['--version'], {
@@ -1651,18 +2040,84 @@ async function checkCopilotCli(): Promise<boolean> {
     }
 }
 
+interface InstallerOptions {
+    /** Run through a shell (default true, which install one-liners such as `curl ... | bash` need) */
+    shell?: boolean;
+    /** Kill the command and fail the attempt after this long (default: no limit) */
+    timeoutMs?: number;
+}
+
+/**
+ * Kills a process and everything it started. Killing only the direct child is
+ * not enough: an update runs as pwsh → CLI → (npm ...), and on Windows the
+ * grandchildren outlive their parent, so a timed-out update could keep
+ * replacing the CLI while the next attempt or the review runs.
+ */
+function killProcessTree(child: child_process.ChildProcess): void {
+    const pid = child.pid;
+    if (pid === undefined) {
+        return;
+    }
+    try {
+        if (isWindows()) {
+            // /T: the whole tree; synchronous, so it is gone once this returns
+            child_process.spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+            return;
+        }
+        // Collect descendants before killing anything (orphans get reparented)
+        const listing = child_process.spawnSync('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8' });
+        const childrenOf = new Map<number, number[]>();
+        for (const line of (listing.stdout || '').split('\n')) {
+            const [childPid, parentPid] = line.trim().split(/\s+/).map(Number);
+            if (childPid && parentPid) {
+                childrenOf.set(parentPid, [...(childrenOf.get(parentPid) || []), childPid]);
+            }
+        }
+        const tree = [pid];
+        for (let i = 0; i < tree.length; i++) {
+            tree.push(...(childrenOf.get(tree[i]) || []));
+        }
+        for (const target of tree) {
+            try {
+                process.kill(target, 'SIGKILL');
+            } catch {
+                // Already exited
+            }
+        }
+    } catch {
+        child.kill('SIGKILL');
+    }
+}
+
 /**
  * Runs a single installer command to completion, resolving on exit code 0.
  */
-function runInstallerOnce(command: string, args: string[]): Promise<void> {
+function runInstallerOnce(command: string, args: string[], options: InstallerOptions = {}): Promise<void> {
     return new Promise((resolve, reject) => {
         const installProcess = child_process.spawn(command, args, {
-            shell: true,
+            shell: options.shell ?? true,
             stdio: 'inherit'
         });
 
+        // On timeout, stop the whole process tree and fail the attempt only
+        // once the command has exited, so a retry never overlaps it
+        let timedOut = false;
+        let reapTimeoutId: NodeJS.Timeout | undefined;
+        const timeoutId = options.timeoutMs
+            ? setTimeout(() => {
+                timedOut = true;
+                killProcessTree(installProcess);
+                // Safety net in case the exit is never reported
+                reapTimeoutId = setTimeout(() => reject(new Error(`Timed out after ${Math.round(options.timeoutMs! / 1000)} seconds`)), 10_000);
+            }, options.timeoutMs)
+            : undefined;
+
         installProcess.on('close', (code: number | null) => {
-            if (code === 0) {
+            clearTimeout(timeoutId);
+            clearTimeout(reapTimeoutId);
+            if (timedOut) {
+                reject(new Error(`Timed out after ${Math.round(options.timeoutMs! / 1000)} seconds`));
+            } else if (code === 0) {
                 resolve();
             } else {
                 reject(new Error(`Exit code: ${code}`));
@@ -1670,6 +2125,8 @@ function runInstallerOnce(command: string, args: string[]): Promise<void> {
         });
 
         installProcess.on('error', (err: Error) => {
+            clearTimeout(timeoutId);
+            clearTimeout(reapTimeoutId);
             reject(err);
         });
     });
@@ -1685,11 +2142,12 @@ async function runInstallerWithRetry(
     description: string,
     command: string,
     args: string[],
-    maxAttempts: number = 3
+    maxAttempts: number = 3,
+    options: InstallerOptions = {}
 ): Promise<void> {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            await runInstallerOnce(command, args);
+            await runInstallerOnce(command, args, options);
             return;
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -1777,16 +2235,10 @@ async function runPowerShellScript(scriptPath: string, args: string[]): Promise<
     });
 }
 
-async function runCopilotCli(promptFilePath: string, model: string | undefined, reasoningEffort: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean): Promise<void> {
+async function runCopilotCli(promptFilePath: string, model: string | undefined, reasoningEffort: string | undefined, workingDirectory: string, timeoutMs: number, diffOnlyActive: boolean, ignoreCustomInstructions: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
         // Build PowerShell command that reads prompt file and passes content to copilot CLI
-        let copilotFlags = `--allow-all-paths --allow-all-tools --deny-tool 'shell(git push)'`;
-        if (model) {
-            copilotFlags += ` --model ${model}`;
-        }
-        if (reasoningEffort) {
-            copilotFlags += ` --reasoning-effort ${reasoningEffort}`;
-        }
+        const copilotFlags = buildCopilotCliArgs({ model, reasoningEffort, ignoreCustomInstructions });
 
         // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
         // Users can inspect the full prompt via publishPromptArtifacts.
@@ -1803,7 +2255,10 @@ async function runCopilotCli(promptFilePath: string, model: string | undefined, 
         const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${copilotCmd}`;
         console.log(`Running Powershell: ${psCommand}`);
 
-        const envVars = { ...process.env };
+        const { env: envVars, removed } = buildCopilotCliEnv(process.env);
+        if (removed.length > 0) {
+            console.log(`Removed from the Copilot CLI environment (they make the CLI trust the pull request checkout): ${removed.join(', ')}`);
+        }
 
         const copilotProcess = child_process.spawn(
             'pwsh',
@@ -1953,32 +2408,13 @@ async function runClaudeCodeCli(
     timeoutMs: number,
     maxTurns: string | undefined,
     maxBudget: string | undefined,
-    diffOnlyActive: boolean
+    diffOnlyActive: boolean,
+    ignoreCustomInstructions: boolean
 ): Promise<void> {
     return new Promise((resolve, reject) => {
-        // Build Claude Code CLI flags
-        let claudeFlags = `--dangerously-skip-permissions`;
-        claudeFlags += ` --output-format stream-json --verbose --include-partial-messages`;
-        if (diffOnlyActive) {
-            claudeFlags += ` --allowedTools "Bash(pwsh *)" "Write"`;
-        } else {
-            claudeFlags += ` --allowedTools "Bash" "Read" "Write" "Edit" "Glob" "Grep"`;
-        }
-        claudeFlags += ` --disallowedTools "Bash(git push *)"`;
-
-        if (model) {
-            claudeFlags += ` --model ${model}`;
-        }
-        if (reasoningEffort) {
-            // Claude Code uses --effort (no --reasoning-effort alias)
-            claudeFlags += ` --effort ${reasoningEffort}`;
-        }
-        if (maxTurns) {
-            claudeFlags += ` --max-turns ${maxTurns}`;
-        }
-        if (maxBudget) {
-            claudeFlags += ` --max-budget-usd ${maxBudget}`;
-        }
+        const claudeFlags = buildClaudeCliArgs({
+            diffOnlyActive, model, reasoningEffort, maxTurns, maxBudget, ignoreCustomInstructions, workingDirectory
+        });
 
         // When diffOnlyActive, pipe the prompt via stdin to avoid Windows command-line
         // length limits. Claude Code reads from stdin when content is piped to `claude -p`.
@@ -1999,7 +2435,7 @@ async function runClaudeCodeCli(
         const psCommand = `${envRefresh} $prompt = Get-Content -Path '${promptFilePath}' -Raw; ${printPrompt} ${streamParser}`;
         console.log(`Running PowerShell: ${psCommand}`);
 
-        const envVars = { ...process.env };
+        const envVars = buildClaudeCliEnv(process.env, { ignoreCustomInstructions });
 
         const claudeProcess = child_process.spawn(
             'pwsh',
@@ -2061,5 +2497,20 @@ export {
     collectContextDegradations,
     isSnapshotBound,
     shouldRecordReviewState,
-    buildDeltaPathspecs
+    buildDeltaPathspecs,
+    COPILOT_CLI_FLOOR,
+    CLAUDE_CLI_FLOOR,
+    COPILOT_SECRET_ENV_VARS,
+    buildCopilotCliArgs,
+    buildCopilotCliEnv,
+    findTrustingFolder,
+    parseJsonWithComments,
+    readCopilotTrustedFolders,
+    buildClaudeCliArgs,
+    buildClaudeCliEnv,
+    parseCliVersion,
+    compareVersions,
+    describeCliUpdate,
+    updateExistingCli,
+    cliVersionWarning
 };

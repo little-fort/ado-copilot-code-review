@@ -424,7 +424,7 @@ After a review, the task records which pull request iteration it reviewed, so la
 **Notes:**
 - Recording uses the same "Contribute to pull requests" permission as posting comments. If it fails, the task logs a warning and keeps working as before (every run reviews the whole PR).
 - A re-queued build skips even if someone replied to a review comment in the meantime; set `skipReviewedIterations: false` (or push a commit) to have the agent respond.
-- The hash also covers the built-in prompt, so a task update that changes it (1.6.2 does) starts a fresh record: each open PR gets one full review after the upgrade.
+- The hash also covers the built-in prompt, so a task update that changes it (1.7.0 does) starts a fresh record: each open PR gets one full review after the upgrade.
 - Without a record for the current configuration — for example the first review after upgrading, or a token that cannot write PR properties — the prompt falls back to treating any earlier automated review threads as a sign of a re-review. That fallback cannot tell which configuration wrote those threads, so a second, differently configured review of a PR is also treated as a re-review on its first run.
 - Raw prompt modes are skipped and recorded too, as long as their prompt posts comments through `Add-CopilotComment.ps1`.
 - A comment-script call that PowerShell rejects before the script starts (for example a misspelled parameter name) leaves no trace for the task to detect. If the agent then gives up on that comment instead of retrying, the iteration can still be recorded.
@@ -582,7 +582,7 @@ What the task does **not** prevent: the agent has a general-purpose shell, and t
 
 **CLI versions:** tested with GitHub Copilot CLI 1.0.105 and Claude Code 2.1.316. The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
 
-**Changes in 1.6.2:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server. Custom and raw prompts that tell the agent how to post must use `-CommentFile` (and `-ContentFile` for `Update-CopilotComment.ps1`) instead of inline `-Comment`/`-Content` text, which is now refused during a review. Inline comments on files outside the pull request are posted as general comments, and `Update-CopilotComment.ps1` and `Delete-CopilotComment.ps1` act only on the threads and comments the review policy allows.
+**Changes in 1.7.0:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server. Custom and raw prompts that tell the agent how to post must use `-CommentFile` (and `-ContentFile` for `Update-CopilotComment.ps1`) instead of inline `-Comment`/`-Content` text, which is now refused during a review. Inline comments on files outside the pull request are posted as general comments, and `Update-CopilotComment.ps1` and `Delete-CopilotComment.ps1` act only on the threads and comments the review policy allows.
 
 ## Limitations
 

@@ -9,8 +9,8 @@
     "author": "LittleFortSoftware",
     "version": {
         "Major": 1,
-        "Minor": 6,
-        "Patch": 2
+        "Minor": 7,
+        "Patch": 0
     },
     "instanceNameFormat": "Copilot Code Review",
     "minimumAgentVersion": "2.182.1",

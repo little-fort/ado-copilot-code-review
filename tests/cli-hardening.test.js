@@ -94,6 +94,58 @@ describe('CLI launch hardening (PR #65 rework)', function () {
         });
     });
 
+    describe('buildClaudeInvocation', () => {
+        /**
+         * Runs the invocation in a real pwsh with a stand-in `claude` first on
+         * PATH, the way runClaudeCodeCli does (prompt read with Get-Content -Raw).
+         * On Windows the stand-in is a .cmd shim with no .ps1 or .exe next to it:
+         * the case where an argument-passed prompt used to be split at its double
+         * quotes. Returns the argv and stdin the stand-in received.
+         */
+        function runWithStandIn(prompt, flags) {
+            const binDir = fs.mkdtempSync(path.join(tmpDir, 'bin-'));
+            const echo = path.join(binDir, 'stdin-echo.js');
+            fs.writeFileSync(echo,
+                "let input = ''; process.stdin.setEncoding('utf8');" +
+                "process.stdin.on('data', d => { input += d; });" +
+                "process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin: input })));");
+            if (process.platform === 'win32') {
+                fs.writeFileSync(path.join(binDir, 'claude.cmd'), `@"${process.execPath}" "%~dp0stdin-echo.js" %*\r\n`);
+            } else {
+                const shim = path.join(binDir, 'claude');
+                fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/stdin-echo.js" "$@"\n`);
+                fs.chmodSync(shim, 0o755);
+            }
+            const promptFile = path.join(binDir, 'prompt.txt');
+            fs.writeFileSync(promptFile, prompt, 'utf8');
+
+            const quote = text => text.replace(/'/g, "''");
+            const command = `$env:PATH = '${quote(binDir)}' + [System.IO.Path]::PathSeparator + $env:PATH; ` +
+                `$prompt = Get-Content -Path '${quote(promptFile)}' -Raw; ${task.buildClaudeInvocation(flags)}`;
+            const result = child_process.spawnSync('pwsh', ['-NoProfile', '-Command', command], { encoding: 'utf8' });
+            assert.equal(result.status, 0, `pwsh failed: ${result.stderr}`);
+            return JSON.parse(result.stdout);
+        }
+
+        it('sends a prompt with double quotes and non-ASCII text on stdin, intact', () => {
+            // Shaped like the templates' command lines, plus an em dash
+            const prompt = 'Reply step:\n\npwsh -Command ". ./Add-CopilotComment.ps1 -ThreadId <id> -CommentFile \'./_reply.md\'"\n\n' +
+                'A "quoted" word — and $(not-expanded) text.';
+            const received = runWithStandIn(prompt, "--output-format stream-json --model 'sonnet'");
+
+            // PowerShell ends piped text with a newline; nothing else may change
+            const normalize = text => text.replace(/\r\n/g, '\n').replace(/\n$/, '');
+            assert.equal(normalize(received.stdin), prompt);
+            assert.deepEqual(received.argv, ['-p', '--output-format', 'stream-json', '--model', 'sonnet']);
+        });
+
+        it('pipes the prompt in every mode instead of passing it as an argument', () => {
+            const invocation = task.buildClaudeInvocation('--verbose');
+            assert.match(invocation, /^\$prompt \| claude -p /);
+            assert.doesNotMatch(invocation, /"\$prompt"/);
+        });
+    });
+
     describe('buildClaudeCliEnv', () => {
         it('turns on CLAUDE.md loading for the extra directory only when instructions are kept', () => {
             const baseEnv = { PATH: '/usr/bin', ANTHROPIC_API_KEY: 'key' };

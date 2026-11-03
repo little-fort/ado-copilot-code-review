@@ -2664,6 +2664,20 @@ function buildClaudeStreamParser(claudeInvocation: string): string {
     ].join(' ');
 }
 
+/**
+ * The PowerShell fragment that runs Claude Code on the prompt held in $prompt.
+ * The prompt always goes in on stdin, which `claude -p` reads when no prompt
+ * argument is given. Passing it as an argument (`claude -p "$prompt"`, the
+ * former non-diff-only form) breaks on Windows when `claude` resolves to an npm
+ * .cmd shim: PowerShell's Windows argument mode quotes arguments for .cmd/.bat
+ * files the legacy way, so the prompt was split at its double quotes, which the
+ * bundled templates contain (verified with pwsh 7.6). Stdin also avoids the
+ * Windows command-line length limit.
+ */
+function buildClaudeInvocation(claudeFlags: string): string {
+    return `$prompt | claude -p ${claudeFlags}`;
+}
+
 async function runClaudeCodeCli(
     promptFilePath: string,
     model: string | undefined,
@@ -2680,13 +2694,7 @@ async function runClaudeCodeCli(
             diffOnlyActive, model, reasoningEffort, maxTurns, maxBudget, ignoreCustomInstructions, workingDirectory
         });
 
-        // When diffOnlyActive, pipe the prompt via stdin to avoid Windows command-line
-        // length limits. Claude Code reads from stdin when content is piped to `claude -p`.
-        const claudeInvocation = diffOnlyActive
-            ? `$prompt | claude -p ${claudeFlags}`
-            : `claude -p "$prompt" ${claudeFlags}`;
-
-        const streamParser = buildClaudeStreamParser(claudeInvocation);
+        const streamParser = buildClaudeStreamParser(buildClaudeInvocation(claudeFlags));
 
         // In diff-only mode the prompt contains the embedded diff and is too noisy to print.
         // Users can inspect the full prompt via publishPromptArtifacts.
@@ -2754,6 +2762,7 @@ export {
     forwardSanitizedStream,
     forwardSanitizedOutput,
     buildClaudeStreamParser,
+    buildClaudeInvocation,
     computeReviewStateKeyPrefix,
     readReviewState,
     isIterationAlreadyReviewed,

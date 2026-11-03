@@ -141,6 +141,16 @@ describe('incremental re-review state (issue #67)', () => {
             assert.equal(state.currentIteration, 3);
             assert.equal(state.lastReviewedIteration, 2);
             assert.deepEqual(state.delta.files, [{ path: '/src/a.cs', changeType: 'edit' }]);
+            // Written by an older script version: unknown, not empty
+            assert.equal(state.changedFiles, null);
+        });
+
+        it('reads the changed-file list, dropping unusable entries (PR #65 rework)', () => {
+            const state = task.readReviewState(writeState(JSON.stringify({
+                currentIteration: 3, currentSourceCommit: SHA_C, fullChangesStatus: 'Complete',
+                changedFiles: ['/src/a.cs', '', 7, null, '/src/b.cs']
+            })));
+            assert.deepEqual(state.changedFiles, ['/src/a.cs', '/src/b.cs']);
         });
     });
 
@@ -173,7 +183,33 @@ describe('incremental re-review state (issue #67)', () => {
 
         it('reports no activity when nothing was posted', () => {
             assert.deepEqual(task.summarizeReviewActivity(newStateDir()),
-                { readable: true, completedPosts: 0, unfinishedAttempts: 0, agentErrors: 0 });
+                { readable: true, completedPosts: 0, unfinishedAttempts: 0, agentErrors: 0, refusals: [] });
+        });
+
+        it('counts a finished deletion as a completed attempt but not as a post', () => {
+            const stateDir = newStateDir();
+            writeActivity(stateDir, { [`${id(8)}.started`]: 'delete', [`${id(8)}.done`]: 'delete' });
+            const summary = task.summarizeReviewActivity(stateDir);
+            assert.equal(summary.completedPosts, 0);
+            assert.equal(summary.unfinishedAttempts, 0);
+        });
+
+        it('collects the reasons for refused actions, one line each (PR #65 rework)', () => {
+            const stateDir = newStateDir();
+            writeActivity(stateDir, {
+                [`${id(9)}.started`]: 'reply',
+                [`${'b'.repeat(32)}.refused`]: 'this review may not reply to thread #12;\r\nit may act only on listed threads.',
+                [`${'c'.repeat(32)}.refused`]: 'x'.repeat(600),
+                [`${'d'.repeat(32)}.refused`]: '  '
+            });
+            const summary = task.summarizeReviewActivity(stateDir);
+            assert.equal(summary.unfinishedAttempts, 1);
+            assert.equal(summary.completedPosts, 0);
+            assert.deepEqual(summary.refusals, [
+                '(no reason recorded)',
+                'this review may not reply to thread #12; it may act only on listed threads.',
+                'x'.repeat(500) + '...'
+            ].sort());
         });
 
         it('counts completed posts, but not the wrapper that delegates them', () => {
@@ -274,7 +310,7 @@ describe('incremental re-review state (issue #67)', () => {
                     stateReadStatus: 'NotFound', lastReviewedIteration: null, lastReviewedSourceCommit: null,
                     delta: { status: 'NotApplicable', reason: null, files: [] }
                 },
-                activity: { readable: true, completedPosts: 2, unfinishedAttempts: 0, agentErrors: 0 },
+                activity: { readable: true, completedPosts: 2, unfinishedAttempts: 0, agentErrors: 0, refusals: [] },
                 reviewContextWarnings: false,
                 contextDegradations: [],
                 snapshotBound: true,
@@ -292,6 +328,8 @@ describe('incremental re-review state (issue #67)', () => {
             'unreadable activity': input => { input.activity.readable = false; },
             'an agent error result': input => { input.activity.agentErrors = 1; },
             'an unfinished posting attempt': input => { input.activity.unfinishedAttempts = 1; },
+            // Even without the unfinished marker the refused attempt should have left
+            'a refused action (PR #65 rework)': input => { input.activity.refusals = ['this review may not reply to thread #12.']; },
             'context fetch warnings': input => { input.reviewContextWarnings = true; },
             'a context degradation marker': input => { input.contextDegradations = ['Existing comment threads could not be retrieved.']; },
             'an incomplete changed-file list': input => { input.state.fullChangesStatus = 'Partial'; },

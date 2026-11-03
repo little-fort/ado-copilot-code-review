@@ -14,7 +14,7 @@
 #>
 
 BeforeDiscovery {
-    $script:ActivityHelperScripts = @('Add-CopilotComment.ps1', 'Add-AzureDevOpsPRComment.ps1', 'Update-CopilotComment.ps1')
+    $script:ActivityHelperScripts = @('Add-CopilotComment.ps1', 'Add-AzureDevOpsPRComment.ps1', 'Update-CopilotComment.ps1', 'Delete-CopilotComment.ps1')
     $script:ContextHelperScripts = @('Get-AzureDevOpsPR.ps1', 'Get-AzureDevOpsWorkItems.ps1', 'Get-JiraWorkItems.ps1')
 }
 
@@ -44,6 +44,14 @@ BeforeAll {
         $dir = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
         $dir
+    }
+
+    # The review policy the task writes into the state folder before the agent
+    # runs (PR #65 rework): without it the comment scripts refuse every action.
+    # Thread 42 is an automated-review thread the agent may act on.
+    function Get-PolicyFiles {
+        param([string]$StateDir, [string]$WorkspaceRoot = $StateDir)
+        @{ (Join-Path $StateDir 'review-policy.json') = (New-TestPolicyJson -WorkspaceRoot $WorkspaceRoot -Threads @(New-TestPolicyThread -ThreadId 42 -AgentCommentIds 1)) }
     }
 
     # Activity markers as a summary: attempts started, attempts finished, and
@@ -163,7 +171,7 @@ Describe 'Posting activity evidence' {
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 200; Body = $PrJson },
             @{ Status = 200; Body = $ThreadJson }
-        ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+        ) -Files (Get-PolicyFiles $stateDir) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
             param($baseUrl)
             @('-File', (Join-Path $ScriptsDir 'Add-AzureDevOpsPRComment.ps1'),
               '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
@@ -181,7 +189,7 @@ Describe 'Posting activity evidence' {
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 200; Body = $PrJson },
             @{ Status = 400; Body = '{"message":"bad request"}' }
-        ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+        ) -Files (Get-PolicyFiles $stateDir) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
             param($baseUrl)
             @('-File', (Join-Path $ScriptsDir 'Add-AzureDevOpsPRComment.ps1'),
               '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
@@ -189,6 +197,8 @@ Describe 'Posting activity evidence' {
         }
 
         $result.ExitCode | Should -Be 1
+        # The API rejected the post, so this is not a policy refusal
+        $result.Requests.Count | Should -Be 2
         $summary = Get-ActivitySummary $stateDir
         $summary.Started | Should -Be 1
         $summary.Unfinished | Should -Be 1
@@ -196,15 +206,17 @@ Describe 'Posting activity evidence' {
 
     It 'records the wrapper and the inner script for a successful reply' {
         $stateDir = New-StateDir
+        $workDir = New-StateDir
+        Set-Content -LiteralPath (Join-Path $workDir '_reply.md') -Value 'Addressed.'
         $environment = $CommentEnvironment.Clone()
         $environment.COPILOT_REVIEW_STATE_DIR = $stateDir
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 200; Body = $PrJson },
             @{ Status = 200; Body = $ThreadJson },
             @{ Status = 200; Body = '{"id":2,"author":{"displayName":"CI Mock"},"publishedDate":"2026-01-01T00:00:00Z"}' }
-        ) -Environment $environment -BuildArgs {
+        ) -Files (Get-PolicyFiles $stateDir $workDir) -WorkingDirectory $workDir -Environment $environment -BuildArgs {
             param($baseUrl)
-            @('-File', (Join-Path $ScriptsDir 'Add-CopilotComment.ps1'), '-Comment', 'Addressed.', '-ThreadId', '42')
+            @('-File', (Join-Path $ScriptsDir 'Add-CopilotComment.ps1'), '-CommentFile', './_reply.md', '-ThreadId', '42')
         }
 
         $result.ExitCode | Should -Be 0
@@ -220,12 +232,13 @@ Describe 'Posting activity evidence' {
         @{ Case = 'zero thread ID'; Arguments = @('-Comment', 'Feedback', '-ThreadId', '0') }
     ) {
         $stateDir = New-StateDir
+        $workDir = New-StateDir
         $environment = $CommentEnvironment.Clone()
         $environment.COPILOT_REVIEW_STATE_DIR = $stateDir
         # GetNewClosure captures only locals, so resolve the path here
         $wrapperArgs = $Arguments
         $wrapperScript = Join-Path $ScriptsDir 'Add-CopilotComment.ps1'
-        $result = Invoke-ScriptWithMockApi -Responses @() -Environment $environment -BuildArgs {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Files (Get-PolicyFiles $stateDir $workDir) -WorkingDirectory $workDir -Environment $environment -BuildArgs {
             param($baseUrl)
             @('-File', $wrapperScript) + $wrapperArgs
         }.GetNewClosure()
@@ -243,7 +256,7 @@ Describe 'Posting activity evidence' {
         $environment.COPILOT_REVIEW_STATE_DIR = $stateDir
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 200; Body = '{"id":42,"status":"fixed"}' }
-        ) -Environment $environment -BuildArgs {
+        ) -Files (Get-PolicyFiles $stateDir) -Environment $environment -BuildArgs {
             param($baseUrl)
             @('-File', (Join-Path $ScriptsDir 'Update-CopilotComment.ps1'), '-ThreadId', '42', '-Status', 'Fixed')
         }
@@ -261,7 +274,7 @@ Describe 'Posting activity evidence' {
         $environment.COPILOT_REVIEW_STATE_DIR = $stateDir
         $result = Invoke-ScriptWithMockApi -Responses @(
             @{ Status = 500; Body = '{"message":"internal server error"}' }
-        ) -Environment $environment -BuildArgs {
+        ) -Files (Get-PolicyFiles $stateDir) -Environment $environment -BuildArgs {
             param($baseUrl)
             @('-File', (Join-Path $ScriptsDir 'Update-CopilotComment.ps1'), '-ThreadId', '42', '-Status', 'Fixed')
         }
@@ -283,7 +296,7 @@ Describe 'Posting activity evidence' {
         $environment.COPILOT_REVIEW_STATE_DIR = $stateDir
         $updateArgs = $Arguments
         $updateScript = Join-Path $ScriptsDir 'Update-CopilotComment.ps1'
-        $result = Invoke-ScriptWithMockApi -Responses @() -Environment $environment -BuildArgs {
+        $result = Invoke-ScriptWithMockApi -Responses @() -Files (Get-PolicyFiles $stateDir) -Environment $environment -BuildArgs {
             param($baseUrl)
             @('-File', $updateScript) + $updateArgs
         }.GetNewClosure()

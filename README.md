@@ -145,6 +145,8 @@ For longer custom prompts, create a .txt file in your repository and pass the fi
     promptFile: '$(Build.SourcesDirectory)/.copilot/review-prompt.txt'
 ```
 
+If your prompt tells the agent how to post comments, have it write the text to a file in the working directory and pass the file with `-CommentFile`: during a review the comment scripts refuse text passed inline with `-Comment` (see [Security Model](#security-model)).
+
 ### Manual Trigger for Specific PR
 
 If you don't want to setup an automatic trigger, you can instead set up a pipeline with a **Pull Request ID** parameter to run reviews on demand:
@@ -415,13 +417,14 @@ After a review, the task records which pull request iteration it reviewed, so la
 
 **How it works:** the record is a pull request property (`CopilotCodeReview.v1.<hash>.Iteration.<n>`, holding the iteration's source commit). The hash covers the review configuration — agent, model, prompt, and review settings such as `resolveThreads`, `maxMinorIssues`, and the work item source — so two differently configured reviews of the same PR (say, a Copilot review and a Claude Code security review) never skip each other, while two identical ones share the record.
 
-**When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through, all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration (in a PR validation build, `System.PullRequest.SourceCommitId` must match; otherwise the iteration must be checked out). A review that posted nothing is only recorded when `suppressPositiveFeedback` is on, since a clean review then legitimately posts nothing. Anything else simply means the next run reviews the iteration again.
+**When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through (none was refused by the [review policy](#security-model)), all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration (in a PR validation build, `System.PullRequest.SourceCommitId` must match; otherwise the iteration must be checked out). A review that posted nothing is only recorded when `suppressPositiveFeedback` is on, since a clean review then legitimately posts nothing. Anything else simply means the next run reviews the iteration again.
 
 **When the "changes since last review" section is omitted** (and the whole PR is reviewed as usual): after a rebase or a merge from the target branch (the merge base changed, so the commit-to-commit diff would mix in target-branch changes), after the PR is retargeted, or when the change lists could not be fully retrieved. In diff-only mode the extra diff is also left out when the last reviewed commit isn't in the local clone (e.g. after a force push) or when it would be more than half the size of the full diff.
 
 **Notes:**
 - Recording uses the same "Contribute to pull requests" permission as posting comments. If it fails, the task logs a warning and keeps working as before (every run reviews the whole PR).
 - A re-queued build skips even if someone replied to a review comment in the meantime; set `skipReviewedIterations: false` (or push a commit) to have the agent respond.
+- The hash also covers the built-in prompt, so a task update that changes it (1.6.2 does) starts a fresh record: each open PR gets one full review after the upgrade.
 - Without a record for the current configuration — for example the first review after upgrading, or a token that cannot write PR properties — the prompt falls back to treating any earlier automated review threads as a sign of a re-review. That fallback cannot tell which configuration wrote those threads, so a second, differently configured review of a PR is also treated as a re-review on its first run.
 - Raw prompt modes are skipped and recorded too, as long as their prompt posts comments through `Add-CopilotComment.ps1`.
 - A comment-script call that PowerShell rejects before the script starts (for example a misspelled parameter name) leaves no trace for the task to detect. If the agent then gives up on that comment instead of retrying, the iteration can still be recorded.
@@ -439,7 +442,7 @@ Enable `publishPromptArtifacts` to publish all generated context files and the f
     publishPromptArtifacts: true
 ```
 
-The published artifact (`CopilotCodeReview`) will contain files such as `PR_Details.txt`, `Iteration_Details.txt`, commit SHA files, work item details (if enabled), and the final prompt file sent to the CLI agent.
+The published artifact (`CopilotCodeReview`) will contain files such as `PR_Details.txt`, `Iteration_Details.txt`, commit SHA files, work item details (if enabled), the review policy the comment scripts enforced (`review-policy.json`), and the final prompt file sent to the CLI agent.
 
 ## Setting Up Authentication
 
@@ -562,8 +565,16 @@ The review agent runs in your build, inside a checkout of the pull request it re
 - **GitHub credentials stay out of the agent's shell.** Copilot runs with `--secret-env-vars` for `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, and the custom-provider keys: commands the agent runs don't see them, and their values are redacted from output.
 - **Repository instruction files are optional.** By default the agent still reads them: CLAUDE.md for Claude Code; AGENTS.md, CLAUDE.md, `.github/copilot-instructions.md` and related files, plus repository skills, for Copilot. A pull request can edit these files, so set `ignoreCustomInstructions: true` if you don't want the changes under review to shape their own review.
 - **Untrusted text is marked.** In the context files, the PR title, description, branch names, comments, commit messages, changed-file names, and linked work items (Azure Boards or Jira) are wrapped in `<<<UNTRUSTED_CONTENT ...>>>` markers that carry a random id for each run, and so are the diffs embedded in diff-only mode. The prompt tells the agent to treat marked text, and the code under review, as information, never as instructions. This makes prompt injection harder, not impossible. Raw prompt modes get the markers in the context files but not the instruction, since raw prompts are passed to the CLI as-is.
+- **The comment scripts act only within the review.** Before the agent starts, the task writes a review policy for the run, and the comment scripts (`Add-CopilotComment.ps1`, `Add-AzureDevOpsPRComment.ps1`, `Update-CopilotComment.ps1`, `Delete-CopilotComment.ps1`) check every action against it, before sending anything:
+  - They call only the pull request under review, on the configured server, project, and repository.
+  - They reply to and resolve only threads from earlier automated reviews and, with `resolveThreads: all`, active or pending human threads. Raw prompts may act on any thread, since `resolveThreads` doesn't apply to them. They edit or delete only comments an automated review wrote. Threads and comments created during the same run are not on the list.
+  - They read comment text only from files inside the working directory — not inside `.git`, not through a link that leads elsewhere, at most 100,000 characters — and refuse text passed inline with `-Comment` or `-Content`: inline text travels through the agent's shell command line, where command substitution in text copied from the pull request could run.
+  - They anchor inline comments only to files the pull request changes; a comment on any other file is posted as a general comment that names the file and line.
+  - They never post the Azure DevOps token or another known credential (`SYSTEM_ACCESSTOKEN`, the Anthropic key or OAuth token, GitHub tokens, custom-provider keys), plain or Base64-encoded. This check also applies when you run the scripts yourself.
 
-What the task does **not** prevent: the agent has a general-purpose shell, and that shell holds the Azure DevOps token the comment scripts use (and, for Claude Code, the Anthropic API key or OAuth token). A pull request that manages to steer the agent with injected instructions could misuse them. Treat a review of an untrusted pull request like any other build of untrusted code:
+  A refused action fails that script call, keeps the run from being recorded as reviewed (see [Incremental Re-Reviews](#incremental-re-reviews)), and is reported as a pipeline warning, since it can mean the agent followed instructions planted in the pull request.
+
+What the task does **not** prevent: the agent has a general-purpose shell, and that shell holds the Azure DevOps token the comment scripts use (and, for Claude Code, the Anthropic API key or OAuth token). A pull request that manages to steer the agent with injected instructions could misuse them — the comment-script checks stop a partly misled agent, but an agent fully under an attacker's control could call the Azure DevOps REST API directly, or edit the policy file. Treat a review of an untrusted pull request like any other build of untrusted code:
 
 - Prefer Microsoft-hosted or other ephemeral agents, so nothing a review does carries over to later runs.
 - On self-hosted agents, never save Copilot folder trust on the agent's work folder or any folder above it, and keep the checkout step's `persistCredentials` off.
@@ -571,13 +582,13 @@ What the task does **not** prevent: the agent has a general-purpose shell, and t
 
 **CLI versions:** tested with GitHub Copilot CLI 1.0.105 and Claude Code 2.1.316. The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
 
-**Changes in 1.6.2:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server.
+**Changes in 1.6.2:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server. Custom and raw prompts that tell the agent how to post must use `-CommentFile` (and `-ContentFile` for `Update-CopilotComment.ps1`) instead of inline `-Comment`/`-Content` text, which is now refused during a review. Inline comments on files outside the pull request are posted as general comments, and `Update-CopilotComment.ps1` and `Delete-CopilotComment.ps1` act only on the threads and comments the review policy allows.
 
 ## Limitations
 
 - **GitHub Copilot CLI**: On Windows, requires `winget` to be available. On Linux, requires `curl` and `bash` (standard on most systems). If using MS-hosted agents, these should be available by default.
 - **Claude Code CLI**: Requires `npm` to be available (pre-installed on all Azure DevOps agents). Requires an Anthropic API key or a Claude subscription OAuth token.
-- **Inline Comment Fallback**: Review comments are posted inline on the relevant file and lines. If Azure DevOps rejects an inline anchor, the comment is posted as a general PR comment with the file and line reference included in the text instead.
+- **Inline Comment Fallback**: Review comments are posted inline on the relevant file and lines. If Azure DevOps rejects an inline anchor, or the file isn't part of the pull request, the comment is posted as a general PR comment with the file and line reference included in the text instead.
 - **Context Window**: Very large PRs may exceed the agent's context limits
 
 ## Troubleshooting
@@ -599,6 +610,16 @@ The installed Copilot CLI or Claude Code CLI predates the version that honors th
 ### Warning: the Copilot CLI "trusts the folder"
 
 The build user's Copilot config (`config.json` in `COPILOT_HOME`, by default `~/.copilot`) lists a trusted folder that contains the checkout, so the CLI will load hooks, MCP servers, and plugin settings committed in the pull request. Remove that folder from `trustedFolders`.
+
+### Warning: "The review policy refused an action by the review agent"
+
+The agent tried something the comment scripts don't allow during a review (see [Security Model](#security-model)); the warning gives the reason. Common causes:
+
+- A custom or raw prompt passes comment text inline with `-Comment` or `-Content`. Have the agent write the text to a file and pass `-CommentFile` / `-ContentFile`.
+- The agent tried to resolve a human reviewer's thread with `resolveThreads: agentOnly`, or to edit or delete a comment no automated review wrote. That's the policy working.
+- Anything else — another pull request or server, a file outside the working directory, a credential in the text — can mean the agent followed instructions planted in the pull request. Review the pull request content and the agent's output.
+
+The run isn't recorded as reviewed, so the next run reviews the iteration again.
 
 ### Authentication errors
 

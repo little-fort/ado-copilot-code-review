@@ -140,6 +140,24 @@ describe('Prompt template lockstep', () => {
         assert.ok(promptCustom.includes(tag),
             `prompt-custom.txt no longer contains the attribution tag '${tag}' that index.ts rewrites for Claude Code.`);
     });
+
+    it('no template passes comment text inline (PR #65 rework)', () => {
+        // During a review the comment scripts refuse -Comment and -Content:
+        // inline text goes through the agent's shell command line
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.doesNotMatch(text, /-Comment\s+['"]/, `${name} still passes comment text with -Comment`);
+            assert.doesNotMatch(text, /-Content\s+['"]/, `${name} still passes comment text with -Content`);
+            assert.ok(text.includes(". ./Add-CopilotComment.ps1 -ThreadId <id> -CommentFile './_reply.md'"),
+                `${name} no longer tells the agent to reply from a comment file`);
+        }
+    });
+
+    it('the posting-limits note is identical in both templates (PR #65 rework)', () => {
+        const note = text => text.split(/\r?\n/).find(line => line.startsWith('- The comment scripts enforce limits'));
+        assert.ok(note(promptDefault), 'prompt.txt has no note starting "- The comment scripts enforce limits"');
+        assert.equal(note(promptCustom), note(promptDefault),
+            'the posting-limits note differs between prompt.txt and prompt-custom.txt');
+    });
 });
 
 describe('Dev/prod task definition parity', () => {

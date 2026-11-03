@@ -22,15 +22,19 @@ BeforeAll {
     if ($parseErrors.Count -gt 0) {
         throw "Get-AzureDevOpsPR.ps1 failed to parse: $($parseErrors -join '; ')"
     }
-    $funcAst = $ast.Find({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Test-AgentAuthoredThread'
-    }, $true)
-    if (-not $funcAst) {
-        throw 'Test-AgentAuthoredThread function not found in Get-AzureDevOpsPR.ps1 — update this test if it was renamed.'
+    # Test-AgentAuthoredThread delegates to Test-AgentAuthoredComment (PR #65
+    # rework), so both are loaded
+    foreach ($functionName in 'Test-AgentAuthoredComment', 'Test-AgentAuthoredThread') {
+        $funcAst = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }, $true)
+        if (-not $funcAst) {
+            throw "$functionName function not found in Get-AzureDevOpsPR.ps1 — update this test if it was renamed."
+        }
+        . ([scriptblock]::Create($funcAst.Extent.Text))
     }
-    . ([scriptblock]::Create($funcAst.Extent.Text))
 
     $previewAst = $ast.Find({
         param($node)

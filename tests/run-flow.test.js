@@ -216,6 +216,48 @@ describe('task run flow (issue #67)', function () {
             assert.match(fs.readFileSync(path.join(workDir, 'Iteration_Details.txt'), 'utf8'),
                 new RegExp(`<<<UNTRUSTED_CONTENT id=${id} source=changed-files>>>`));
             assert.ok(!output.includes(id), 'the id reached the task log before the agent step');
+
+            // Review policy (PR #65 rework): written right after the PR details,
+            // naming the configured pull request; the thread fetch failed, so
+            // it allows no thread actions
+            assert.ok(output.indexOf('Review policy written') > output.indexOf('[Step 2/6]'));
+            assert.ok(output.indexOf('Review policy written') < output.indexOf('[Step 3/6]'));
+            const policy = JSON.parse(fs.readFileSync(path.join(tempDir, stateDirs[0], 'review-policy.json'), 'utf8'));
+            assert.deepEqual(policy.destination, {
+                collectionUri: `http://127.0.0.1:${port}/testorg`, project: 'TestProject', repository: 'TestRepo', pullRequestId: 5
+            });
+            assert.equal(policy.workspaceRoot, path.resolve(workDir));
+            assert.equal(policy.threadsComplete, false);
+            assert.deepEqual(policy.threads, []);
+            assert.equal(policy.changedFilesComplete, true);
+            assert.deepEqual(policy.changedFiles, ['/src/a.cs']);
+        } finally {
+            server.close();
+        }
+    });
+
+    it('writes the review policy from the pull request\'s threads before the agent step (PR #65 rework)', async () => {
+        const comment = (id, content, author) => ({ id, commentType: 'text', content, author: { displayName: author, uniqueName: `${author}@example.com` } });
+        const { server, port } = await startMockAzureDevOps(baseRoutes({
+            '/testorg/TestProject/_apis/git/repositories/TestRepo/pullrequests/5/threads': [200, { count: 3, value: [
+                { id: 11, status: 'active', comments: [comment(1, 'Finding', 'TestProject Build Service (testorg)'), comment(2, 'Disagree', 'Dev')] },
+                { id: 12, status: 'active', comments: [comment(1, 'Human concern', 'Jane')] },
+                { id: 13, status: 'fixed', comments: [comment(1, 'Old concern', 'Jane')] }
+            ] }]
+        }));
+        try {
+            const { workDir, tempDir } = newDirs();
+            fs.mkdirSync(path.join(workDir, 'Add-AzureDevOpsPRComment.ps1'));
+
+            const output = await runTask(port, workDir, tempDir, { resolveThreads: 'agentOnly' });
+
+            assert.match(output, /Review policy written: the agent may act on 1 of 3 comment thread\(s\); inline comments may anchor to the 1 changed file\(s\)\./);
+            const stateDir = fs.readdirSync(tempDir).find(name => name.startsWith('copilot-review-'));
+            const policy = JSON.parse(fs.readFileSync(path.join(tempDir, stateDir, 'review-policy.json'), 'utf8'));
+            assert.equal(policy.resolveThreads, 'agentOnly');
+            assert.equal(policy.threadsComplete, true);
+            assert.deepEqual(policy.threads.map(t => [t.threadId, t.mayReply, t.agentCommentIds]),
+                [[11, true, [1]], [12, false, []], [13, false, []]]);
         } finally {
             server.close();
         }

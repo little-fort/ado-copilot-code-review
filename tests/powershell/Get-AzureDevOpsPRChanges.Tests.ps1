@@ -266,6 +266,9 @@ Describe 'Get-AzureDevOpsPRChanges.ps1 review state (issue #67)' {
         $result.State.currentSourceCommit | Should -Be $ShaC
         $result.State.fullChangesStatus | Should -Be 'Complete'
         $result.FileText | Should -Not -Match 'Changes Since Last Review'
+        # Every current path, for the review policy's inline-comment check
+        # (PR #65 rework); rename origins are not anchor targets
+        @($result.State.changedFiles) | Should -Be @('/src/a.cs', '/src/new.cs')
     }
 
     It 'treats a missing properties resource as no state' {
@@ -352,6 +355,8 @@ Describe 'Get-AzureDevOpsPRChanges.ps1 review state (issue #67)' {
 
         $result.Requests.Count | Should -Be 6
         $result.State.fullChangesStatus | Should -Be 'Partial'
+        # What was retrieved, kept as a JSON array even with a single entry
+        $result.StateText | Should -Match '"changedFiles":\s*\[\s*"/src/a\.cs"\s*\]'
         $result.State.delta.status | Should -Be 'NotApplicable'
         $result.State.delta.reason | Should -Match 'incomplete'
     }

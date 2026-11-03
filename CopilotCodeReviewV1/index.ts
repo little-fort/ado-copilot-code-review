@@ -354,6 +354,8 @@ interface ReviewState {
     currentIteration: number;
     currentSourceCommit: string;
     fullChangesStatus: string;
+    /** Paths the current iteration changes (complete when fullChangesStatus is 'Complete'); null if not reported */
+    changedFiles: string[] | null;
     stateReadStatus: string;
     lastReviewedIteration: number | null;
     lastReviewedSourceCommit: string | null;
@@ -382,6 +384,9 @@ function readReviewState(filePath: string): ReviewState | null {
             currentIteration: parsed.currentIteration,
             currentSourceCommit: parsed.currentSourceCommit,
             fullChangesStatus: String(parsed.fullChangesStatus ?? ''),
+            changedFiles: Array.isArray(parsed.changedFiles)
+                ? parsed.changedFiles.filter((file: unknown) => typeof file === 'string' && file.length > 0)
+                : null,
             stateReadStatus: String(parsed.stateReadStatus ?? ''),
             lastReviewedIteration: typeof parsed.lastReviewedIteration === 'number' ? parsed.lastReviewedIteration : null,
             lastReviewedSourceCommit: typeof parsed.lastReviewedSourceCommit === 'string' ? parsed.lastReviewedSourceCommit : null,
@@ -416,6 +421,8 @@ interface ReviewActivitySummary {
     unfinishedAttempts: number;
     /** Error results reported by the review agent itself */
     agentErrors: number;
+    /** Reasons the comment scripts gave for actions the review policy refused (PR #65 rework) */
+    refusals: string[];
 }
 
 /**
@@ -423,11 +430,13 @@ interface ReviewActivitySummary {
  * writes "<id>.started" when it begins and "<id>.done" (containing its action)
  * when it succeeds, so a started attempt without a done marker failed — however
  * it exited. The wrapper script's own attempts count as failures when they
- * break off early, but not as posts (the script it calls reports those).
+ * break off early, but not as posts (the script it calls reports those), and
+ * neither do deletions. A refused action also leaves "<id>.refused" with the
+ * reason.
  */
 function summarizeReviewActivity(stateDir: string): ReviewActivitySummary {
     const activityDir = path.join(stateDir, 'activity');
-    const summary: ReviewActivitySummary = { readable: true, completedPosts: 0, unfinishedAttempts: 0, agentErrors: 0 };
+    const summary: ReviewActivitySummary = { readable: true, completedPosts: 0, unfinishedAttempts: 0, agentErrors: 0, refusals: [] };
 
     let entries: string[];
     try {
@@ -454,8 +463,19 @@ function summarizeReviewActivity(stateDir: string): ReviewActivitySummary {
             }
         } else if (name.endsWith('.agent-error')) {
             summary.agentErrors++;
+        } else if (/^[0-9a-f]{32}\.refused$/i.test(name)) {
+            // For reporting only: the refused attempt is already counted as
+            // unfinished through its started marker
+            let reason = '';
+            try {
+                reason = fs.readFileSync(path.join(activityDir, name), 'utf8').replace(/\s+/g, ' ').trim();
+            } catch {
+                // Reported without a reason below
+            }
+            summary.refusals.push(reason.length > 500 ? `${reason.slice(0, 500)}...` : (reason || '(no reason recorded)'));
         }
     }
+    summary.refusals.sort();
 
     for (const id of started) {
         if (!completed.has(id)) {
@@ -568,6 +588,11 @@ function shouldRecordReviewState(input: {
     if (activity.unfinishedAttempts > 0) {
         return { record: false, reason: `${activity.unfinishedAttempts} comment posting attempt(s) did not complete` };
     }
+    // A refused attempt already leaves an unfinished marker; this also holds
+    // when that best-effort marker could not be written
+    if (activity.refusals.length > 0) {
+        return { record: false, reason: `the review policy refused ${activity.refusals.length} action(s) by the review agent` };
+    }
     if (input.reviewContextWarnings || input.contextDegradations.length > 0) {
         return { record: false, reason: 'some review context could not be fetched' };
     }
@@ -619,6 +644,148 @@ function gitRevParse(cwd: string, revision: string): string | undefined {
     } catch {
         return undefined;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review policy (PR #65 rework)
+//
+// Before the review agent starts, the task writes review-policy.json to the
+// per-run state folder. The comment scripts the agent runs check every action
+// against it: the pull request they may post to, the threads they may reply to
+// or resolve, the comments they may edit or delete, where comment text may be
+// read from, and the files inline comments may anchor to. These checks are
+// defense in depth, not a security boundary — the agent's shell also holds the
+// Azure DevOps token, so an agent that is fully under an attacker's control
+// could call the REST API itself. The rules live here so they can be tested
+// without a pipeline; the scripts only read the result.
+// ---------------------------------------------------------------------------
+
+/** A comment thread as Get-AzureDevOpsPR.ps1 -ThreadPolicyFile reports it. */
+interface PolicyThreadData {
+    threadId: number;
+    status: string;
+    /** Created by an automated review (Build Service author or attribution tag) */
+    agentAuthored: boolean;
+    comments: { commentId: number; agentAuthored: boolean }[];
+}
+
+/** Contents of review-policy.json, read by the comment scripts. */
+interface ReviewPolicy {
+    schemaVersion: 1;
+    /** The only pull request the scripts may call */
+    destination: { collectionUri: string; project: string; repository: string; pullRequestId: number };
+    resolveThreads: string;
+    rawPrompt: boolean;
+    /** Comment text files must lie inside this folder (resolved by the scripts) */
+    workspaceRoot: string;
+    /** False when the threads could not be fetched; the scripts then allow no thread actions */
+    threadsComplete: boolean;
+    threads: {
+        threadId: number;
+        status: string;
+        agentAuthored: boolean;
+        mayReply: boolean;
+        mayUpdateStatus: boolean;
+        /** Comments an automated review wrote: the only ones that may be edited or deleted */
+        agentCommentIds: number[];
+    }[];
+    /** False when the list below may be missing files; the scripts then accept any file in the workspace */
+    changedFilesComplete: boolean;
+    /** Files inline comments may anchor to, in Azure DevOps form ('/src/App.cs') */
+    changedFiles: string[];
+}
+
+/**
+ * Reads the thread data written by Get-AzureDevOpsPR.ps1. Null when the file is
+ * missing or unreadable or the threads could not be fetched: the policy then
+ * allows no thread actions rather than guessing.
+ */
+function readPolicyThreadData(filePath: string): PolicyThreadData[] | null {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^﻿/, ''));
+        if (!parsed || parsed.threadsStatus !== 'Complete' || !Array.isArray(parsed.threads)) {
+            return null;
+        }
+        const isId = (value: unknown): value is number => Number.isInteger(value) && (value as number) > 0;
+        return parsed.threads
+            .filter((thread: any) => thread && isId(thread.threadId))
+            .map((thread: any) => ({
+                threadId: thread.threadId,
+                status: typeof thread.status === 'string' ? thread.status : '',
+                agentAuthored: thread.agentAuthored === true,
+                comments: Array.isArray(thread.comments)
+                    ? thread.comments
+                        .filter((comment: any) => comment && isId(comment.commentId))
+                        .map((comment: any) => ({ commentId: comment.commentId, agentAuthored: comment.agentAuthored === true }))
+                    : []
+            }));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Builds the review policy. Template prompts may reply to and resolve threads
+ * from earlier automated reviews and, with resolveThreads 'all', the active
+ * and pending human threads the prompt lists; raw prompts may act on any
+ * thread, since resolveThreads does not apply to them. Edits and deletions are
+ * limited to comments an automated review wrote in every mode.
+ */
+function buildReviewPolicy(input: {
+    collectionUri: string;
+    project: string;
+    repository: string;
+    pullRequestId: number;
+    resolveThreads: string;
+    rawPrompt: boolean;
+    workspaceRoot: string;
+    threads: PolicyThreadData[] | null;
+    reviewState: ReviewState | null;
+}): ReviewPolicy {
+    const threads = (input.threads || []).map(thread => {
+        const openHumanThread = input.resolveThreads === 'all' && ['active', 'pending'].includes(thread.status.toLowerCase());
+        const mayAct = input.rawPrompt || thread.agentAuthored || openHumanThread;
+        return {
+            threadId: thread.threadId,
+            status: thread.status,
+            agentAuthored: thread.agentAuthored,
+            mayReply: mayAct,
+            mayUpdateStatus: mayAct,
+            agentCommentIds: thread.comments.filter(comment => comment.agentAuthored).map(comment => comment.commentId)
+        };
+    });
+    const changedFiles = input.reviewState?.changedFiles ?? null;
+    return {
+        schemaVersion: 1,
+        destination: {
+            collectionUri: input.collectionUri,
+            project: input.project,
+            repository: input.repository,
+            pullRequestId: input.pullRequestId
+        },
+        resolveThreads: input.resolveThreads,
+        rawPrompt: input.rawPrompt,
+        workspaceRoot: input.workspaceRoot,
+        threadsComplete: input.threads !== null,
+        threads,
+        changedFilesComplete: input.reviewState?.fullChangesStatus === 'Complete' && changedFiles !== null,
+        changedFiles: changedFiles || []
+    };
+}
+
+/**
+ * Pipeline warnings for actions the review policy refused. A refusal can mean
+ * the agent followed instructions planted in the pull request, so it should
+ * be visible without reading the agent's output; the list is capped so a
+ * looping agent cannot flood the run summary.
+ */
+function describePolicyRefusals(refusals: string[], limit: number = 10): string[] {
+    const messages = refusals.slice(0, limit)
+        .map(reason => `The review policy refused an action by the review agent: ${reason}`);
+    if (refusals.length > limit) {
+        messages.push(`The review policy refused ${refusals.length - limit} more action(s) by the review agent; see the agent's output for details.`);
+    }
+    return messages;
 }
 
 async function run(): Promise<void> {
@@ -1182,7 +1349,10 @@ async function run(): Promise<void> {
         console.log('\n[Step 2/6] Fetching pull request details...');
         const prDetailsScript = path.join(scriptsDir, 'Get-AzureDevOpsPR.ps1');
         const prDetailsOutput = path.join(workingDirectory, 'PR_Details.txt');
-        
+        // Thread authorship for the review policy (written to the state folder,
+        // out of the agent's working directory)
+        const threadPolicyFile = path.join(reviewStateDir, 'PR_Threads.json');
+
         const prDetailsArgs = [
             '-Token', azureDevOpsToken,
             '-AuthType', azureDevOpsAuthType,
@@ -1191,7 +1361,8 @@ async function run(): Promise<void> {
             '-Repository', repository,
             '-Id', pullRequestId,
             '-OutputFile', prDetailsOutput,
-            '-UntrustedContentId', untrustedContentId
+            '-UntrustedContentId', untrustedContentId,
+            '-ThreadPolicyFile', threadPolicyFile
         ];
         // Human reviewers' threads (full text + replies) are only useful when the
         // agent may resolve them. Raw prompts never receive the directive that
@@ -1208,6 +1379,36 @@ async function run(): Promise<void> {
             tl.warning('Pull request details could not be retrieved. Continuing with less review context.');
             reviewContextWarnings = true;
         }
+
+        // Review policy (PR #65 rework): what the comment scripts will let the
+        // agent do in this run. The scripts refuse every action without it, so
+        // a failure to write it ends the run here.
+        const reviewPolicyFile = path.join(reviewStateDir, 'review-policy.json');
+        const reviewPolicy = buildReviewPolicy({
+            collectionUri: resolvedCollectionUri,
+            project,
+            repository,
+            pullRequestId: Number.parseInt(pullRequestId, 10),
+            resolveThreads,
+            rawPrompt: !!(promptRaw || isPromptFileRawSet),
+            workspaceRoot: path.resolve(workingDirectory),
+            threads: readPolicyThreadData(threadPolicyFile),
+            reviewState
+        });
+        try {
+            fs.writeFileSync(reviewPolicyFile, JSON.stringify(reviewPolicy, null, 2), 'utf8');
+        } catch (err) {
+            tl.setResult(tl.TaskResult.Failed,
+                `The review policy could not be written to ${reviewPolicyFile}: ${err instanceof Error ? err.message : String(err)}. ` +
+                'The comment scripts refuse every action without it, so the review cannot run.');
+            return;
+        }
+        const actionableThreads = reviewPolicy.threads.filter(thread => thread.mayReply || thread.mayUpdateStatus).length;
+        console.log(`Review policy written: the agent may act on ${actionableThreads} of ${reviewPolicy.threads.length} comment thread(s)` +
+            (reviewPolicy.threadsComplete ? '' : ' (the threads could not be retrieved)') +
+            (reviewPolicy.changedFilesComplete
+                ? `; inline comments may anchor to the ${reviewPolicy.changedFiles.length} changed file(s).`
+                : '; inline comments may anchor to any file in the working directory (the changed-file list is incomplete).'));
 
         // Diff-only mode: pre-compute the git diff from commit SHAs
         let diffContent: string | null = null;
@@ -1593,6 +1794,7 @@ async function run(): Promise<void> {
                 path.join(workingDirectory, 'Work_Item_Details.txt'),
                 path.join(workingDirectory, 'PR_Metadata.json'),
                 reviewStateFile,
+                reviewPolicyFile,
                 promptFilePath,
             ];
 
@@ -1646,20 +1848,30 @@ async function run(): Promise<void> {
         // Step 6: Run the CLI agent with a timeout
         console.log(`\n[Step 6/6] Running ${agentName} code review...`);
         const timeoutMs = timeoutMinutes * 60 * 1000;
-        if (useClaudeCode) {
-            await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive, ignoreCustomInstructions);
-        } else {
-            // Folder trust saved in the CLI's own config (it is inherited by
-            // subfolders) makes the CLI load hooks, MCP servers and plugin
-            // settings committed in the PR. The task keeps the build user's
-            // config by design, so it can only point this out.
-            const trustingFolder = findTrustingFolder(workingDirectory, readCopilotTrustedFolders());
-            if (trustingFolder) {
-                tl.warning(`The GitHub Copilot CLI on this agent trusts the folder '${trustingFolder}', which contains this checkout, ` +
-                    'so it will load hooks, MCP servers, and plugin settings committed in the pull request. ' +
-                    "Remove that folder from 'trustedFolders' in the CLI's config.json (in COPILOT_HOME, by default ~/.copilot).");
+        try {
+            if (useClaudeCode) {
+                await runClaudeCodeCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, maxTurns, maxBudget, diffOnlyActive, ignoreCustomInstructions);
+            } else {
+                // Folder trust saved in the CLI's own config (it is inherited by
+                // subfolders) makes the CLI load hooks, MCP servers and plugin
+                // settings committed in the PR. The task keeps the build user's
+                // config by design, so it can only point this out.
+                const trustingFolder = findTrustingFolder(workingDirectory, readCopilotTrustedFolders());
+                if (trustingFolder) {
+                    tl.warning(`The GitHub Copilot CLI on this agent trusts the folder '${trustingFolder}', which contains this checkout, ` +
+                        'so it will load hooks, MCP servers, and plugin settings committed in the pull request. ' +
+                        "Remove that folder from 'trustedFolders' in the CLI's config.json (in COPILOT_HOME, by default ~/.copilot).");
+                }
+                await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive, ignoreCustomInstructions);
             }
-            await runCopilotCli(promptFilePath, model, reasoningEffort, workingDirectory, timeoutMs, diffOnlyActive, ignoreCustomInstructions);
+        } finally {
+            // Refused actions can mean the agent followed instructions planted
+            // in the pull request: report them even when the agent run failed.
+            // The reasons quote the agent's arguments, so neutralize logging
+            // commands in them.
+            for (const message of describePolicyRefusals(summarizeReviewActivity(reviewStateDir).refusals)) {
+                tl.warning(sanitizePipelineLog(message));
+            }
         }
 
         console.log('\n' + '='.repeat(60));
@@ -1713,7 +1925,7 @@ async function run(): Promise<void> {
                 tl.warning(`Could not record iteration #${reviewState!.currentIteration} as reviewed, so the next run will review it again. ` +
                     `Error: ${err instanceof Error ? err.message : String(err)}`);
             }
-        } else if (activity.unfinishedAttempts > 0 || activity.agentErrors > 0) {
+        } else if (activity.unfinishedAttempts > 0 || activity.agentErrors > 0 || activity.refusals.length > 0) {
             // Likely lost feedback: make it visible in the run summary
             tl.warning(`Not recording this iteration as reviewed: ${recordDecision.reason}. The next run will review it again.`);
         } else {
@@ -2551,6 +2763,9 @@ export {
     isSnapshotBound,
     shouldRecordReviewState,
     buildDeltaPathspecs,
+    readPolicyThreadData,
+    buildReviewPolicy,
+    describePolicyRefusals,
     COPILOT_CLI_FLOOR,
     CLAUDE_CLI_FLOOR,
     COPILOT_SECRET_ENV_VARS,

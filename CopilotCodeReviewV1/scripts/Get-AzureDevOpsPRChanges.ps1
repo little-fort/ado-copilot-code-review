@@ -33,7 +33,8 @@
 
 .PARAMETER ReviewStateFile
     Optional (pass together with -ReviewStateKeyPrefix). Path of the JSON file that receives the
-    current iteration, the last reviewed iteration, and the changes since then, for the task to act on.
+    current iteration, its changed files, the last reviewed iteration, and the changes since then, for
+    the task to act on.
 
 .PARAMETER UntrustedContentId
     Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
@@ -857,6 +858,9 @@ if ($ReviewStateFile) {
         currentIteration         = [int]$iterationId
         currentSourceCommit      = [string]$latestIteration.sourceRefCommit.commitId
         fullChangesStatus        = [string]$changeResult.Status
+        # Every path the current iteration changes (complete when
+        # fullChangesStatus is); the review policy anchors inline comments to these
+        changedFiles             = @($changeEntries | Where-Object { $_.item -and $_.item.path } | ForEach-Object { [string]$_.item.path })
         stateReadStatus          = $reviewState.stateReadStatus
         lastReviewedIteration    = $reviewState.lastReviewedIteration
         lastReviewedSourceCommit = $reviewState.lastReviewedSourceCommit

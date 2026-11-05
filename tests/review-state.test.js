@@ -152,6 +152,50 @@ describe('incremental re-review state (issue #67)', () => {
             })));
             assert.deepEqual(state.changedFiles, ['/src/a.cs', '/src/b.cs']);
         });
+
+        it('reads the record of the last reviewed iteration, keeping only well-formed fields', () => {
+            const state = task.readReviewState(writeState(JSON.stringify({
+                currentIteration: 3, currentSourceCommit: SHA_C, stateReadStatus: 'Found', lastReviewedIteration: 2,
+                lastReviewedRecord: {
+                    name: 'CopilotCodeReview.v1.0123456789abcdef.Iteration.2', iterationCreated: '2026-11-04T23:15:33Z',
+                    buildId: 366, buildNumber: '20261104.1', buildUrl: 'https://dev.azure.com/org/Proj/_build/results?buildId=366',
+                    recordedAt: '2026-11-04T23:21:09Z'
+                }
+            })));
+            assert.deepEqual(state.lastReviewedRecord, {
+                name: 'CopilotCodeReview.v1.0123456789abcdef.Iteration.2', iterationCreated: '2026-11-04T23:15:33Z',
+                buildId: 366, buildNumber: '20261104.1', buildUrl: 'https://dev.azure.com/org/Proj/_build/results?buildId=366',
+                recordedAt: '2026-11-04T23:21:09Z'
+            });
+
+            const partial = task.readReviewState(writeState(JSON.stringify({
+                currentIteration: 3, currentSourceCommit: SHA_C,
+                lastReviewedRecord: { name: 'x.Iteration.2', buildId: '366', buildNumber: 7, buildUrl: '' }
+            })));
+            assert.deepEqual(partial.lastReviewedRecord,
+                { name: 'x.Iteration.2', iterationCreated: null, buildId: null, buildNumber: null, buildUrl: null, recordedAt: null });
+
+            const none = task.readReviewState(writeState(JSON.stringify({ currentIteration: 3, currentSourceCommit: SHA_C, lastReviewedRecord: { buildId: 366 } })));
+            assert.equal(none.lastReviewedRecord, null);
+        });
+    });
+
+    describe('buildReviewRecordArgs', () => {
+        it('passes the build that runs the review to the recording script', () => {
+            assert.deepEqual(task.buildReviewRecordArgs('366', '20261104.1', 'My Project'),
+                ['-BuildId', '366', '-BuildNumber', '20261104.1', '-BuildProject', 'My Project']);
+            assert.deepEqual(task.buildReviewRecordArgs('366', undefined, ''), ['-BuildId', '366']);
+        });
+
+        it('passes nothing outside a build pipeline or for an unusable build ID', () => {
+            for (const id of [undefined, '', '0', '-1', '12a', '1.5', '2147483648', '00366']) {
+                assert.deepEqual(task.buildReviewRecordArgs(id, '20261104.1', 'Proj'), [], `build ID ${JSON.stringify(id)}`);
+            }
+        });
+
+        it("leaves out a value that pwsh would read as a parameter name", () => {
+            assert.deepEqual(task.buildReviewRecordArgs('366', '-Token', '-x'), ['-BuildId', '366']);
+        });
     });
 
     describe('isIterationAlreadyReviewed', () => {

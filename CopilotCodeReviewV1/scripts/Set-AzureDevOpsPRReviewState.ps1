@@ -3,10 +3,10 @@
     Records that a pull request iteration was reviewed, for incremental re-reviews.
 
 .DESCRIPTION
-    Writes one pull request property, <StateKeyPrefix>.Iteration.<Iteration> = <SourceCommit>,
-    marking that iteration as reviewed by the review configuration the prefix identifies
-    (issue #67). Get-AzureDevOpsPRChanges.ps1 reads these records on later runs to skip an
-    iteration that was already reviewed, or to focus the review on what changed since.
+    Writes one pull request property, <StateKeyPrefix>.Iteration.<Iteration>, marking that
+    iteration as reviewed by the review configuration the prefix identifies (issue #67). Get-AzureDevOpsPRChanges.ps1
+    reads these records on later runs to skip an iteration that was already reviewed, or to focus
+    the review on what changed since.
 
     Every reviewed iteration gets its own property, so concurrent runs never overwrite each
     other's records and the write is idempotent (safe to retry). The task calls this script only
@@ -39,6 +39,16 @@
 
 .PARAMETER SourceCommit
     Required. The 40-character source commit SHA of that iteration.
+
+.PARAMETER BuildId
+    Optional. ID of the build that ran the review (Build.BuildId). Without it the record holds no
+    build details (a run outside a build pipeline).
+
+.PARAMETER BuildNumber
+    Optional. Build number of that build (Build.BuildNumber); used only with -BuildId.
+
+.PARAMETER BuildProject
+    Optional. Project of that build (System.TeamProject), for the link to it; used only with -BuildId.
 
 .EXAMPLE
     .\Set-AzureDevOpsPRReviewState.ps1 -Token "oauth-token" -AuthType "Bearer" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject" -Repository "myrepo" -Id 123 -StateKeyPrefix "CopilotCodeReview.v1.0123456789abcdef" -Iteration 4 -SourceCommit "<40-hex SHA>"
@@ -86,7 +96,17 @@ param(
 
     [Parameter(Mandatory = $true, HelpMessage = "Source commit SHA of the reviewed iteration")]
     [ValidatePattern('^[0-9a-fA-F]{40}$')]
-    [string]$SourceCommit
+    [string]$SourceCommit,
+
+    [Parameter(Mandatory = $false, HelpMessage = "ID of the build that ran the review (Build.BuildId)")]
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$BuildId = 0,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Build number of that build (Build.BuildNumber)")]
+    [string]$BuildNumber = '',
+
+    [Parameter(Mandatory = $false, HelpMessage = "Project of that build (System.TeamProject)")]
+    [string]$BuildProject = ''
 )
 
 #region Helper Functions
@@ -206,6 +226,21 @@ $headers.Remove("Content-Type")
 $propertiesUrl = "$CollectionUri/$Project/_apis/git/repositories/$Repository/pullRequests/$Id/properties?api-version=7.1"
 $propertyName = "$($StateKeyPrefix).Iteration.$Iteration"
 
+# The record (see .DESCRIPTION). Readers check every build detail's shape, so
+# values that wouldn't pass (too long, line breaks) are left out here.
+$record = [ordered]@{ sourceCommit = $SourceCommit.ToLowerInvariant() }
+if ($BuildId -gt 0) {
+    $record.buildId = $BuildId
+    if ($BuildNumber -and $BuildNumber.Length -le 255 -and $BuildNumber -match '^[^\p{C}]+$') {
+        $record.buildNumber = $BuildNumber
+    }
+    if ($BuildProject -and $BuildProject.Length -le 64 -and $BuildProject -match '^[^\p{C}]+$') {
+        $record.buildProject = $BuildProject
+    }
+}
+$record.recordedAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+$recordValue = ConvertTo-Json -Compress -InputObject $record
+
 # -InputObject keeps the one-operation patch a JSON array (piping a single
 # object to ConvertTo-Json would produce a bare object, which the API rejects).
 # 'replace' adds the property when it does not exist yet.
@@ -213,7 +248,7 @@ $patch = ConvertTo-Json -Compress -Depth 3 -InputObject @(
     [ordered]@{
         op    = 'replace'
         path  = "/$propertyName"
-        value = $SourceCommit.ToLowerInvariant()
+        value = $recordValue
     }
 )
 

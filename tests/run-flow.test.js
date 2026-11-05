@@ -145,10 +145,40 @@ describe('task run flow (issue #67)', function () {
 
             assert.match(output, /already reviewed iteration #1 \(cccccccc\); skipping the review/);
             assert.match(output, /##vso\[task\.complete result=Succeeded;[^\]]*\]Skipped: iteration #1/);
+            // A record written before build details were added
+            assert.match(output, /Reviewed by:\s+not recorded \(this record predates build details\)/);
             assert.doesNotMatch(output, /Fetching pull request details/);
             assert.doesNotMatch(output, /CLI installation/);
             assert.ok(requests.some(r => r.path.endsWith('/properties')), 'the review state was not read');
             assert.ok(!requests.some(r => r.path.endsWith('/threads')), 'PR details were fetched despite the skip');
+        } finally {
+            server.close();
+        }
+    });
+
+    it('names the build that reviewed a skipped iteration, with a link to that run', async () => {
+        const prefix = task.computeReviewStateKeyPrefix({
+            agent: 'copilot', model: '', reasoningEffort: '', maxTurns: '', maxBudget: '',
+            providerType: '', providerBaseUrl: '', diffOnly: false, promptMode: 'default', promptText: '',
+            templateText: fs.readFileSync(path.join(taskDir, 'scripts', 'prompt.txt'), 'utf8'),
+            resolveThreads: 'all', suppressPositiveFeedback: false, maxMinorIssues: '5', workItemSource: 'none'
+        });
+        const record = JSON.stringify({ sourceCommit: SOURCE_SHA, buildId: 366, buildNumber: '20261104.1', recordedAt: '2026-11-04T23:21:09Z' });
+        const properties = { count: 1, value: { [`${prefix}.Iteration.1`]: { $type: 'System.String', $value: record } } };
+        const { server, port } = await startMockAzureDevOps(baseRoutes({
+            '/testorg/TestProject/_apis/git/repositories/TestRepo/pullrequests/5/properties': [200, properties]
+        }));
+        try {
+            const { workDir, tempDir } = newDirs();
+            const output = await runTask(port, workDir, tempDir);
+
+            // Step 1 details, then the skip message and the task result
+            assert.match(output, /Reviewed by:\s+build 20261104\.1, 2026-11-04 23:21 UTC/);
+            assert.match(output, new RegExp(`Record:\\s+${prefix.replace(/\./g, '\\.')}\\.Iteration\\.1`));
+            assert.match(output, /already reviewed iteration #1 \(cccccccc\) in build 20261104\.1; skipping the review/);
+            // No buildProject in the record: the link uses the pull request's project
+            assert.ok(output.includes(`That review: http://127.0.0.1:${port}/testorg/TestProject/_build/results?buildId=366`), output);
+            assert.match(output, /##vso\[task\.complete result=Succeeded;[^\]]*\]Skipped: iteration #1 \(cccccccc\) was already reviewed in build 20261104\.1\./);
         } finally {
             server.close();
         }

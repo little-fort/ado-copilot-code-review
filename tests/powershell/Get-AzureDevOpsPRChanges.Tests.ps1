@@ -201,12 +201,12 @@ Describe 'Get-AzureDevOpsPRChanges.ps1 review state (issue #67)' {
 
         # Three iterations; the current one (3) can change merge base or reason
         function New-IterationsJson {
-            param([string]$CurrentBase = $BaseOne, [string]$CurrentReason = 'push')
+            param([string]$CurrentBase = $BaseOne, [string]$CurrentReason = 'push', [string]$SecondCreated = '2026-11-04T23:15:33.123Z')
             @{
                 count = 3
                 value = @(
                     @{ id = 1; reason = 'create'; sourceRefCommit = @{ commitId = $ShaA }; targetRefCommit = @{ commitId = '1' * 40 }; commonRefCommit = @{ commitId = $BaseOne } },
-                    @{ id = 2; reason = 'push'; sourceRefCommit = @{ commitId = $ShaB }; targetRefCommit = @{ commitId = '1' * 40 }; commonRefCommit = @{ commitId = $BaseOne } },
+                    @{ id = 2; reason = 'push'; createdDate = $SecondCreated; sourceRefCommit = @{ commitId = $ShaB }; targetRefCommit = @{ commitId = '1' * 40 }; commonRefCommit = @{ commitId = $BaseOne } },
                     @{ id = 3; reason = $CurrentReason; sourceRefCommit = @{ commitId = $ShaC }; targetRefCommit = @{ commitId = '1' * 40 }; commonRefCommit = @{ commitId = $CurrentBase } }
                 )
             } | ConvertTo-Json -Depth 5
@@ -322,6 +322,110 @@ Describe 'Get-AzureDevOpsPRChanges.ps1 review state (issue #67)' {
 
         $result.State.lastReviewedIteration | Should -Be 1
         $result.Requests[5].Path | Should -Match '(\$|%24)compareTo=1'
+    }
+
+    It 'names the build that reviewed the last iteration so the run can be found' {
+        $record = '{"sourceCommit":"' + $ShaB + '","buildId":366,"buildNumber":"20261104.1","buildProject":"My Project","recordedAt":"2026-11-04T23:21:09Z"}'
+        $responses = (Get-BaseResponses -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 1 = $ShaA; 2 = $record }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        $result.ExitCode | Should -Be 0
+        $result.State.lastReviewedIteration | Should -Be 2
+        $result.Output | Should -Match 'Last reviewed iteration: #2'
+        # UTC regardless of the machine's time zone (Invoke-RestMethod hands back local [datetime] values)
+        $result.Output | Should -Match ([regex]::Escape('Source commit:  bbbbbbbb (iteration created 2026-11-04 23:15 UTC)'))
+        $result.Output | Should -Match ([regex]::Escape('Reviewed by:    build 20261104.1, 2026-11-04 23:21 UTC'))
+        $result.Output | Should -Match '/testorg/My%20Project/_build/results\?buildId=366'
+        $result.Output | Should -Match ([regex]::Escape("Record:         $Prefix.Iteration.2"))
+
+        $result.State.lastReviewedRecord.name | Should -Be "$Prefix.Iteration.2"
+        $result.State.lastReviewedRecord.buildId | Should -Be 366
+        $result.State.lastReviewedRecord.buildNumber | Should -Be '20261104.1'
+        $result.State.lastReviewedRecord.buildUrl | Should -Match '^http://.+/testorg/My%20Project/_build/results\?buildId=366$'
+        # Read the timestamps from the raw text: ConvertFrom-Json would turn them into [datetime]
+        $result.StateText | Should -Match '"recordedAt":\s*"2026-11-04T23:21:09Z"'
+        $result.StateText | Should -Match '"iterationCreated":\s*"2026-11-04T23:15:33Z"'
+    }
+
+    It 'reports the iteration time in UTC when the server sends an offset' {
+        # Invoke-RestMethod turns an offset timestamp into a local-time [datetime];
+        # 'Z' timestamps (what Azure DevOps sends today) stay UTC either way
+        $responses = (Get-BaseResponses -Iterations (New-IterationsJson -SecondCreated '2026-11-04T17:15:33.123-06:00') `
+            -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 2 = $ShaB }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        $result.Output | Should -Match ([regex]::Escape('(iteration created 2026-11-04 23:15 UTC)'))
+        $result.StateText | Should -Match '"iterationCreated":\s*"2026-11-04T23:15:33Z"'
+    }
+
+    It 'says when a record predates the build details' {
+        $responses = (Get-BaseResponses -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 2 = $ShaB }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        $result.State.lastReviewedIteration | Should -Be 2
+        $result.Output | Should -Match 'Reviewed by:    not recorded \(this record predates build details\)'
+        $result.State.lastReviewedRecord.buildId | Should -BeNullOrEmpty
+        $result.State.lastReviewedRecord.buildUrl | Should -BeNullOrEmpty
+    }
+
+    It 'ignores a <Name> record and falls back to the earlier one' -ForEach @(
+        @{ Name = 'malformed'; Value = '{"sourceCommit":' },
+        @{ Name = 'JSON array'; Value = '["' + ('b' * 40) + '"]' },
+        @{ Name = 'mismatched JSON'; Value = '{"sourceCommit":"' + ('9' * 40) + '","buildId":366}' },
+        @{ Name = 'commit-less'; Value = '{"buildId":366,"buildNumber":"20261104.1"}' }
+    ) {
+        $responses = (Get-BaseResponses -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 1 = $ShaA; 2 = $Value }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        $result.ExitCode | Should -Be 0
+        $result.State.lastReviewedIteration | Should -Be 1
+        $result.Requests[5].Path | Should -Match '(\$|%24)compareTo=1'
+    }
+
+    It 'shows only checked build details from a forged record' {
+        # Anyone who can contribute to the pull request can write its properties
+        $record = (@{
+            sourceCommit = $ShaB
+            buildId      = 7
+            buildNumber  = '##vso[task.setvariable variable=hijack]1'
+            buildProject = '../../evil.example.com'
+        } | ConvertTo-Json -Compress)
+        $responses = (Get-BaseResponses -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 2 = $record }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        $result.State.lastReviewedIteration | Should -Be 2
+        $result.Output | Should -Not -Match '##vso\['
+        $result.Output | Should -Match ([regex]::Escape('Reviewed by:    build # #vso[task.setvariable variable=hijack]1'))
+        # The link stays on the configured server: the project is escaped into one path segment
+        $result.State.lastReviewedRecord.buildUrl | Should -Match '^http://localhost:\d+/testorg/\.\.%2F\.\.%2Fevil\.example\.com/_build/results\?buildId=7$'
+    }
+
+    It 'drops a build detail with the wrong shape (<Name>)' -ForEach @(
+        @{ Name = 'line break in the build number'; Field = 'buildNumber'; Json = '"buildId":7,"buildNumber":"20261104.1\nReviewed by: build 1"' },
+        @{ Name = 'build ID as text'; Field = 'buildId'; Json = '"buildId":"7","buildNumber":"20261104.1"' },
+        @{ Name = 'negative build ID'; Field = 'buildId'; Json = '"buildId":-7' },
+        @{ Name = 'unparseable time'; Field = 'recordedAt'; Json = '"recordedAt":"yesterday"' }
+    ) {
+        $record = '{"sourceCommit":"' + $ShaB + '",' + $Json + '}'
+        $responses = (Get-BaseResponses -Properties @{ Status = 200; Body = (New-PropertiesJson @{ 2 = $record }) }) + @(
+            @{ Status = 200; Body = (New-DeltaPage @(@{ Path = '/src/a.cs'; Type = 'edit' })) }
+        )
+        $result = Invoke-ChangesScript -StateKeyPrefix $Prefix -Responses $responses
+
+        # The record still counts (its commit matches); only the bad detail is dropped
+        $result.State.lastReviewedIteration | Should -Be 2
+        $result.State.lastReviewedRecord.$Field | Should -BeNullOrEmpty
+        $result.Output | Should -Not -Match 'Reviewed by: build 1'
     }
 
     It 'omits the delta when the merge base changed (rebase or target merge)' {

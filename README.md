@@ -222,40 +222,37 @@ steps:
 
 ### Copilot Models
 
-As of August 2026 (Copilot CLI 1.0.80), here are the model options supported by the GitHub Copilot CLI:
+As of November 2026 (Copilot CLI 1.0.105), these are the models GitHub Copilot offers in the CLI:
 
-- `auto` — lets Copilot route each request to the most efficient model for the task
-- `claude-sonnet-5` (default when no model is specified)
-- `claude-fable-5`
+- `auto` — lets Copilot pick the best available model for each request
+- `claude-sonnet-5.5` (default)
+- `claude-sonnet-5`
+- `claude-opus-5.5`
 - `claude-opus-5`
 - `claude-opus-4.8`
 - `claude-opus-4.8-fast` (preview)
-- `claude-opus-4.7`
-- `claude-sonnet-4.6` †
-- `claude-opus-4.6` †
-- `claude-sonnet-4.5` †
-- `claude-opus-4.5` †
+- `claude-fable-5.1`
+- `claude-fable-5`
+- `claude-haiku-5.5`
 - `claude-haiku-4.5`
+- `gpt-6.1-sol`
+- `gpt-6.1-terra`
+- `gpt-6-sol`
+- `gpt-6-luna`
+- `gpt-6-astra`
 - `gpt-5.6-sol`
 - `gpt-5.6-terra`
 - `gpt-5.6-luna`
-- `gpt-5.5`
-- `gpt-5.4`
-- `gpt-5.4-mini`
 - `gpt-5.3-codex`
-- `gpt-5-mini`
-- `gemini-3.7-flash`
-- `gemini-3.6-flash`
-- `gemini-3.5-flash`
-- `gemini-3.1-pro-preview` † (public preview)
-- `grok-4.5`
+- `gemini-4-argon`
+- `gemini-3.8-flash`
+- `grok-4.7`
+- `grok-4.6`
 - `kimi-k3`
-- `kimi-k2.7-code`
-- `mai-code-1-flash-picker` (MAI-Code-1-Flash)
+- `mai-code-1.1-flash`
+- 
 
-† Scheduled for [deprecation on September 1, 2026](https://github.blog/changelog/2026-07-31-upcoming-august-2026-model-deprecations-in-github-copilot/); Claude Sonnet 4.6 remains available to individual Copilot subscribers on annual plans.
-
-Model availability varies by Copilot plan and organization policy, so a model the CLI accepts may still be rejected at runtime if your subscription doesn't include it. See [supported AI models in Copilot](https://docs.github.com/en/copilot/reference/ai-models/supported-ai-models-in-copilot) for the full availability matrix.
+Model availability varies by Copilot plan and organization policy, so some models may still be rejected at runtime if your subscription doesn't include it. See [supported AI models in Copilot](https://docs.github.com/en/copilot/reference/ai-models/supported-models) for the full availability matrix.
 
 ### Custom Model Providers
 
@@ -415,8 +412,6 @@ After a review, the task records which pull request iteration it reviewed, so la
 - **Already-reviewed iterations are skipped.** When a run finds that the PR's current iteration was already reviewed — for example a re-queued build, or a branch policy re-running the build after the target branch moved — it finishes immediately, before installing the CLI or running the agent. Set `skipReviewedIterations: false` to force a fresh review.
 - **Re-reviews focus on what changed.** When new commits were pushed since the last review, `Iteration_Details.txt` gains a `[Changes Since Last Review]` section listing the files changed since then, with the `git diff` command that shows exactly those changes. In [diff-only mode](#diff-only-review-mode) that smaller diff is also embedded in the prompt. The review prompt limits new non-Critical findings to those changes.
 
-**How it works:** the record is a pull request property (`CopilotCodeReview.v1.<hash>.Iteration.<n>`, holding the iteration's source commit). The hash covers the review configuration — agent, model, prompt, and review settings such as `resolveThreads`, `maxMinorIssues`, and the work item source — so two differently configured reviews of the same PR (say, a Copilot review and a Claude Code security review) never skip each other, while two identical ones share the record.
-
 **When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through (none was refused by the [review policy](#security-model)), all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration (in a PR validation build, `System.PullRequest.SourceCommitId` must match; otherwise the iteration must be checked out). A review that posted nothing is only recorded when `suppressPositiveFeedback` is on, since a clean review then legitimately posts nothing. Anything else simply means the next run reviews the iteration again.
 
 **When the "changes since last review" section is omitted** (and the whole PR is reviewed as usual): after a rebase or a merge from the target branch (the merge base changed, so the commit-to-commit diff would mix in target-branch changes), after the PR is retargeted, or when the change lists could not be fully retrieved. In diff-only mode the extra diff is also left out when the last reviewed commit isn't in the local clone (e.g. after a force push) or when it would be more than half the size of the full diff.
@@ -442,7 +437,7 @@ Enable `publishPromptArtifacts` to publish all generated context files and the f
     publishPromptArtifacts: true
 ```
 
-The published artifact (`CopilotCodeReview`) will contain files such as `PR_Details.txt`, `Iteration_Details.txt`, commit SHA files, work item details (if enabled), the review policy the comment scripts enforced (`review-policy.json`), and the final prompt file sent to the CLI agent.
+The published artifact contains files such as `PR_Details.txt`, `Iteration_Details.txt`, commit SHA files, work item details (if enabled), the review state and the review policy the comment scripts enforced, and the final prompt file sent to the CLI agent.
 
 ## Setting Up Authentication
 
@@ -571,18 +566,16 @@ The review agent runs in your build, inside a checkout of the pull request it re
   - They read comment text only from files inside the working directory — not inside `.git`, not through a link that leads elsewhere, at most 100,000 characters — and refuse text passed inline with `-Comment` or `-Content`: inline text travels through the agent's shell command line, where command substitution in text copied from the pull request could run.
   - They anchor inline comments only to files the pull request changes; a comment on any other file is posted as a general comment that names the file and line.
   - They never post the Azure DevOps token or another known credential (`SYSTEM_ACCESSTOKEN`, the Anthropic key or OAuth token, GitHub tokens, custom-provider keys), plain or Base64-encoded. This check also applies when you run the scripts yourself.
+   
+A refused action fails that script call, keeps the run from being recorded as reviewed (see [Incremental Re-Reviews](#incremental-re-reviews)), and is reported as a pipeline warning, since it can mean the agent followed instructions planted in the pull request.
 
-  A refused action fails that script call, keeps the run from being recorded as reviewed (see [Incremental Re-Reviews](#incremental-re-reviews)), and is reported as a pipeline warning, since it can mean the agent followed instructions planted in the pull request.
-
-What the task does **not** prevent: the agent has a general-purpose shell, and that shell holds the Azure DevOps token the comment scripts use (and, for Claude Code, the Anthropic API key or OAuth token). A pull request that manages to steer the agent with injected instructions could misuse them — the comment-script checks stop a partly misled agent, but an agent fully under an attacker's control could call the Azure DevOps REST API directly, or edit the policy file. Treat a review of an untrusted pull request like any other build of untrusted code:
+Treat a review of an untrusted pull request like any other build of untrusted code:
 
 - Prefer Microsoft-hosted or other ephemeral agents, so nothing a review does carries over to later runs.
 - On self-hosted agents, never save Copilot folder trust on the agent's work folder or any folder above it, and keep the checkout step's `persistCredentials` off.
 - Give the pipeline identity only the permissions the review needs ("Contribute to pull requests" on the repository).
 
 **CLI versions:** tested with GitHub Copilot CLI 1.0.105 and Claude Code 2.1.316. The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
-
-**Changes in 1.7.0:** Claude Code reviews no longer apply a repository's `.claude/settings.json` or `.mcp.json`, and Copilot reviews run without the CLI's built-in GitHub MCP server. Custom and raw prompts that tell the agent how to post must use `-CommentFile` (and `-ContentFile` for `Update-CopilotComment.ps1`) instead of inline `-Comment`/`-Content` text, which is now refused during a review. Inline comments on files outside the pull request are posted as general comments, and `Update-CopilotComment.ps1` and `Delete-CopilotComment.ps1` act only on the threads and comments the review policy allows.
 
 ## Limitations
 

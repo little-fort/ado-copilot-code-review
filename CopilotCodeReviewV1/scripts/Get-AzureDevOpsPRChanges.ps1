@@ -470,14 +470,165 @@ function Get-PropertyValue {
     return $entry.Value
 }
 
+function ConvertTo-UtcTimestamp {
+    <#
+        Normalizes a timestamp to 'yyyy-MM-ddTHH:mm:ssZ', or $null when it isn't
+        one. Invoke-RestMethod and ConvertFrom-Json turn ISO strings into
+        [datetime] values (often converted to local time), so all three shapes
+        are accepted; an unspecified kind is taken as UTC.
+    #>
+    param($Value)
+
+    $utc = $null
+    if ($Value -is [datetime]) {
+        $utc = if ($Value.Kind -eq [DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) } else { $Value.ToUniversalTime() }
+    }
+    elseif ($Value -is [DateTimeOffset]) {
+        $utc = $Value.UtcDateTime
+    }
+    elseif ($Value -is [string] -and $Value) {
+        $parsed = [DateTimeOffset]::MinValue
+        $styles = [Globalization.DateTimeStyles]::AssumeUniversal
+        if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+            $utc = $parsed.UtcDateTime
+        }
+    }
+    if ($null -eq $utc) {
+        return $null
+    }
+    return $utc.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-UtcForDisplay {
+    # 'yyyy-MM-ddTHH:mm:ssZ' (from ConvertTo-UtcTimestamp) -> 'yyyy-MM-dd HH:mm UTC'
+    param([string]$Timestamp)
+    return "$($Timestamp.Substring(0, 10)) $($Timestamp.Substring(11, 5)) UTC"
+}
+
+function ConvertFrom-ReviewRecord {
+    <#
+        Parses one review record, the value of a <prefix>.Iteration.<n> pull
+        request property written by Set-AzureDevOpsPRReviewState.ps1:
+          {"sourceCommit":"<sha>","buildId":366,"buildNumber":"20261104.1",
+           "buildProject":"Proxapi","recordedAt":"2026-11-04T23:21:09Z"}
+        Records written before the build details were added hold only the SHA.
+
+        Anyone who can contribute to the pull request can write its properties,
+        so the build details are only ever displayed: each one must have the
+        expected shape or it is dropped, and the build number is neutralized for
+        the log. Returns $null when the value has no source commit to check.
+    #>
+    param($Value)
+
+    $text = ([string]$Value).Trim()
+    if (-not $text.StartsWith('{')) {
+        if (-not $text) {
+            return $null
+        }
+        # Older record: just the SHA
+        return [pscustomobject]@{ SourceCommit = $text; BuildId = $null; BuildNumber = $null; BuildProject = $null; RecordedAt = $null }
+    }
+
+    # System.Text.Json keeps the JSON value kinds as written (ConvertFrom-Json
+    # would turn a date-like string, such as a build number, into a [datetime])
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($text)
+    }
+    catch {
+        return $null
+    }
+    try {
+        if ($document.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            return $null
+        }
+        # First occurrence of each property, as JsonElement values
+        $fields = @{}
+        foreach ($property in $document.RootElement.EnumerateObject()) {
+            if (-not $fields.ContainsKey($property.Name)) {
+                $fields[$property.Name] = $property.Value
+            }
+        }
+        $readString = {
+            param([string]$Name, [int]$MaxLength)
+            $element = $fields[$Name]
+            if ($null -eq $element -or $element.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+                return $null
+            }
+            $value = $element.GetString()
+            # No control or format characters (line breaks could fake log lines)
+            if ($value.Length -gt $MaxLength -or $value -notmatch '^[^\p{C}]+$') {
+                return $null
+            }
+            return $value
+        }
+
+        $sourceCommit = & $readString 'sourceCommit' 64
+        if (-not $sourceCommit -or -not $sourceCommit.Trim()) {
+            return $null
+        }
+        $buildId = $null
+        $idElement = $fields['buildId']
+        $parsedId = 0
+        if ($null -ne $idElement -and $idElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and
+            $idElement.TryGetInt32([ref]$parsedId) -and $parsedId -gt 0) {
+            $buildId = $parsedId
+        }
+        $buildNumber = & $readString 'buildNumber' 255
+        if ($buildNumber) {
+            $buildNumber = ConvertTo-SafeLogText $buildNumber
+        }
+
+        return [pscustomobject]@{
+            SourceCommit = $sourceCommit.Trim()
+            BuildId      = $buildId
+            BuildNumber  = $buildNumber
+            BuildProject = & $readString 'buildProject' 64
+            RecordedAt   = ConvertTo-UtcTimestamp (& $readString 'recordedAt' 40)
+        }
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Write-LastReviewDetails {
+    <#
+        Prints (console only) the details that let a user find the run that
+        reviewed the last recorded iteration. Every value is either built here
+        or was checked by ConvertFrom-ReviewRecord.
+    #>
+    param($State)
+
+    $record = $State.lastReviewedRecord
+    if (-not $record) {
+        return
+    }
+    $created = if ($record.iterationCreated) { " (iteration created $(Format-UtcForDisplay $record.iterationCreated))" } else { '' }
+    Write-Host "  Source commit:  $($State.lastReviewedSourceCommit.Substring(0, 8))$created"
+    $when = if ($record.recordedAt) { ", $(Format-UtcForDisplay $record.recordedAt)" } else { '' }
+    if ($record.buildId) {
+        $build = if ($record.buildNumber) { "build $($record.buildNumber)" } else { "build ID $($record.buildId)" }
+        Write-Host "  Reviewed by:    $build$when"
+        Write-Host "                  $($record.buildUrl)"
+    }
+    elseif ($record.recordedAt) {
+        Write-Host "  Reviewed by:    a run outside a build pipeline$when"
+    }
+    else {
+        Write-Host "  Reviewed by:    not recorded (this record predates build details)"
+    }
+    Write-Host "  Record:         $($record.name)"
+}
+
 function Get-ReviewState {
     <#
         Works out what this review configuration has already reviewed (issue #67).
 
         Each reviewed iteration is recorded as its own property,
-        <prefix>.Iteration.<n> = <source commit SHA>. The last reviewed iteration
-        is the highest n up to the current one whose recorded SHA still matches
-        that iteration's source commit; anything else is ignored.
+        <prefix>.Iteration.<n> = <record> (the source commit SHA plus the build
+        that reviewed it; see ConvertFrom-ReviewRecord). The last reviewed
+        iteration is the highest n up to the current one whose recorded SHA still
+        matches that iteration's source commit; anything else is ignored.
 
         When that iteration is older than the current one, the changes since then
         are fetched ($compareTo) — but only when the result is trustworthy:
@@ -504,6 +655,8 @@ function Get-ReviewState {
         stateReadStatus          = 'NotFound'
         lastReviewedIteration    = $null
         lastReviewedSourceCommit = $null
+        # Where the last reviewed iteration's record came from (for the log)
+        lastReviewedRecord       = $null
         delta                    = [ordered]@{ status = 'NotApplicable'; reason = $null; files = @() }
     }
 
@@ -522,6 +675,8 @@ function Get-ReviewState {
     $keyPattern = '^' + [regex]::Escape($KeyPrefix) + '\.Iteration\.(\d{1,9})$'
     $lastId = 0
     $lastSha = $null
+    $lastRecord = $null
+    $lastRecordName = $null
     foreach ($name in $properties.Names) {
         $match = [regex]::Match($name, $keyPattern)
         if (-not $match.Success) {
@@ -531,15 +686,16 @@ function Get-ReviewState {
         if ($recordedId -lt 1 -or $recordedId -gt $currentId -or $recordedId -le $lastId) {
             continue
         }
-        $recordedSha = [string](Get-PropertyValue -Properties $properties.Value -Name $name)
+        $record = ConvertFrom-ReviewRecord -Value (Get-PropertyValue -Properties $properties.Value -Name $name)
         $iteration = $iterationsById[$recordedId]
-        if (-not $iteration -or -not $iteration.sourceRefCommit -or
-            [string]::IsNullOrWhiteSpace($recordedSha) -or
-            $recordedSha.Trim() -ine [string]$iteration.sourceRefCommit.commitId) {
+        if (-not $record -or -not $iteration -or -not $iteration.sourceRefCommit -or
+            $record.SourceCommit -ine [string]$iteration.sourceRefCommit.commitId) {
             continue
         }
         $lastId = $recordedId
         $lastSha = [string]$iteration.sourceRefCommit.commitId
+        $lastRecord = $record
+        $lastRecordName = $name
     }
 
     if ($lastId -eq 0) {
@@ -549,6 +705,21 @@ function Get-ReviewState {
     $state.stateReadStatus = 'Found'
     $state.lastReviewedIteration = $lastId
     $state.lastReviewedSourceCommit = $lastSha
+    # The link is built here from the configured server, the recorded project
+    # (escaped) and a numeric build ID, so a forged record can't point elsewhere
+    $buildUrl = $null
+    if ($lastRecord.BuildId) {
+        $buildProject = if ($lastRecord.BuildProject) { $lastRecord.BuildProject } else { $Project }
+        $buildUrl = "$($CollectionUri.TrimEnd('/'))/$([uri]::EscapeDataString($buildProject))/_build/results?buildId=$($lastRecord.BuildId)"
+    }
+    $state.lastReviewedRecord = [ordered]@{
+        name             = $lastRecordName
+        iterationCreated = ConvertTo-UtcTimestamp $iterationsById[$lastId].createdDate
+        buildId          = $lastRecord.BuildId
+        buildNumber      = $lastRecord.BuildNumber
+        buildUrl         = $buildUrl
+        recordedAt       = $lastRecord.RecordedAt
+    }
 
     if ($lastId -eq $currentId) {
         $state.delta.reason = 'The current iteration was already reviewed.'
@@ -674,6 +845,7 @@ if ($ReviewStateKeyPrefix) {
         -CurrentIteration $latestIteration -FullChanges $changeResult
     if ($reviewState.lastReviewedIteration) {
         Write-Host "Last reviewed iteration: #$($reviewState.lastReviewedIteration)" -ForegroundColor Green
+        Write-LastReviewDetails -State $reviewState
     }
     if ($reviewState.delta.reason) {
         Write-Host "  $($reviewState.delta.reason)" -ForegroundColor DarkGray
@@ -864,6 +1036,7 @@ if ($ReviewStateFile) {
         stateReadStatus          = $reviewState.stateReadStatus
         lastReviewedIteration    = $reviewState.lastReviewedIteration
         lastReviewedSourceCommit = $reviewState.lastReviewedSourceCommit
+        lastReviewedRecord       = $reviewState.lastReviewedRecord
         delta                    = $reviewState.delta
     }
     try {

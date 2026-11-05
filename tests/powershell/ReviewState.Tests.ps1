@@ -105,15 +105,23 @@ Describe 'Set-AzureDevOpsPRReviewState.ps1' {
         $script:SetScript = Join-Path $ScriptsDir 'Set-AzureDevOpsPRReviewState.ps1'
 
         function Invoke-SetState {
-            param([hashtable[]]$Responses, [string]$Iteration = '4', [string]$Commit = $Sha, [string]$Prefix = $PrefixValue)
+            param([hashtable[]]$Responses, [string]$Iteration = '4', [string]$Commit = $Sha, [string]$Prefix = $PrefixValue, [string[]]$Extra = @())
             $setScript = $SetScript
             Invoke-ScriptWithMockApi -Responses $Responses -BuildArgs {
                 param($baseUrl)
                 @('-File', $setScript,
                   '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
                   '-Project', 'TestProject', '-Repository', 'TestRepo', '-Id', '123',
-                  '-StateKeyPrefix', $Prefix, '-Iteration', $Iteration, '-SourceCommit', $Commit)
+                  '-StateKeyPrefix', $Prefix, '-Iteration', $Iteration, '-SourceCommit', $Commit) + $Extra
             }.GetNewClosure()
+        }
+
+        # The record (the property value) the single PATCH operation writes, as raw JSON text.
+        # Read it with System.Text.Json: ConvertFrom-Json would turn recordedAt into a [datetime].
+        function Get-WrittenRecord {
+            param($Request)
+            $operations = @(ConvertFrom-Json -InputObject $Request.Body -NoEnumerate)[0]
+            [System.Text.Json.JsonDocument]::Parse([string]$operations[0].value).RootElement
         }
     }
 
@@ -133,7 +141,34 @@ Describe 'Set-AzureDevOpsPRReviewState.ps1' {
         @($operations).Count | Should -Be 1
         $operations[0].op | Should -Be 'replace'
         $operations[0].path | Should -Be "/$PrefixValue.Iteration.4"
-        $operations[0].value | Should -Be $Sha
+
+        # Outside a build pipeline the record holds the commit and the time only
+        $record = Get-WrittenRecord $request
+        $record.GetProperty('sourceCommit').GetString() | Should -Be $Sha
+        $record.GetProperty('recordedAt').GetString() | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        @($record.EnumerateObject() | ForEach-Object Name) | Should -Be @('sourceCommit', 'recordedAt')
+    }
+
+    It 'records the build that ran the review' {
+        $result = Invoke-SetState -Responses @(@{ Status = 200; Body = '{"count":1,"value":{}}' }) `
+            -Extra @('-BuildId', '366', '-BuildNumber', '20261104.1', '-BuildProject', 'My Project')
+
+        $result.ExitCode | Should -Be 0
+        $record = Get-WrittenRecord $result.Requests[0]
+        $record.GetProperty('sourceCommit').GetString() | Should -Be $Sha
+        $record.GetProperty('buildId').GetInt32() | Should -Be 366
+        $record.GetProperty('buildNumber').GetString() | Should -Be '20261104.1'
+        $record.GetProperty('buildProject').GetString() | Should -Be 'My Project'
+    }
+
+    It 'leaves out a build number that readers would reject' {
+        $result = Invoke-SetState -Responses @(@{ Status = 200; Body = '{"count":1,"value":{}}' }) `
+            -Extra @('-BuildId', '366', '-BuildNumber', ('x' * 256))
+
+        $result.ExitCode | Should -Be 0
+        $record = Get-WrittenRecord $result.Requests[0]
+        $record.GetProperty('buildId').GetInt32() | Should -Be 366
+        @($record.EnumerateObject() | ForEach-Object Name) | Should -Not -Contain 'buildNumber'
     }
 
     It 'retries a transient failure' {

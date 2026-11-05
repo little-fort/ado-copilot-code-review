@@ -183,7 +183,7 @@
             "label": "Copilot Model",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. The model to use for the review (e.g., 'claude-sonnet-5', 'gpt-5.5'). If not specified, uses the CLI's default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
+            "helpMarkDown": "Optional. The model to use for the review (e.g., 'claude-sonnet-5', 'gpt-6.1-sol'). If not specified, uses the CLI's default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
         },
         {
             "name": "reasoningEffort",
@@ -361,7 +361,7 @@
             "label": "Publish Prompt Artifacts",
             "required": false,
             "defaultValue": false,
-            "helpMarkDown": "When enabled, publishes all context files (PR details, iteration details, work items, commit SHAs) and the final assembled prompt as pipeline artifacts. Useful for debugging prompt construction and reviewing what context the CLI agent received."
+            "helpMarkDown": "When enabled, publishes all context files (PR details, iteration details, work items, commit SHAs) and the final assembled prompt to the CopilotCodeReview pipeline artifact, in a folder for this task (agent name plus the start of its configuration hash, e.g. copilot-5ab7), so several review tasks in one job keep separate files. Useful for debugging prompt construction and reviewing what context the CLI agent received."
         }
     ],
     "execution": {

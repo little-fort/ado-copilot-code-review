@@ -343,10 +343,86 @@ function computeReviewStateKeyPrefix(config: ReviewConfiguration): string {
     return `CopilotCodeReview.v1.${hash}`;
 }
 
+/**
+ * Folder inside the CopilotCodeReview artifact that holds one task's files:
+ * the agent plus the first four hex digits of its review-state key, for
+ * example "copilot-5ab7". Several review tasks in one job (say a Copilot
+ * review and a Claude Code review) publish to the same artifact, and without
+ * a folder each would overwrite the other's same-named files. Two tasks with
+ * identical configurations share a key, but the second one normally skips the
+ * already-reviewed iteration before it publishes anything.
+ */
+function artifactSubfolderName(agent: 'copilot' | 'claude', reviewStateKeyPrefix: string): string {
+    const hash = reviewStateKeyPrefix.slice(reviewStateKeyPrefix.lastIndexOf('.') + 1);
+    return `${agent}-${hash.slice(0, 4)}`;
+}
+
+/**
+ * Copies the files that exist into <stagingRoot>/<subfolder>/ and returns the
+ * names it copied. The task uploads stagingRoot as one directory: the agent
+ * keeps each file's path below that directory, so the files land in
+ * CopilotCodeReview/<subfolder>/ while the artifact stays associated with the
+ * CopilotCodeReview container folder, the same path for every task. (A nested
+ * containerfolder would instead associate the one artifact name with a
+ * different path per task.) Copying also freezes the files as the agent got
+ * them; the agent uploads asynchronously at the end of the task.
+ */
+function stageArtifactFiles(files: Array<string | undefined>, stagingRoot: string, subfolder: string): string[] {
+    const folder = path.join(stagingRoot, subfolder);
+    const staged: string[] = [];
+    for (const file of files) {
+        if (!file || !fs.existsSync(file)) {
+            continue;
+        }
+        fs.mkdirSync(folder, { recursive: true });
+        const name = path.basename(file);
+        fs.copyFileSync(file, path.join(folder, name));
+        staged.push(name);
+    }
+    return staged;
+}
+
+/** Name of the build artifact that publishPromptArtifacts fills. */
+const PROMPT_ARTIFACT_NAME = 'CopilotCodeReview';
+
+/**
+ * Stages the files (stageArtifactFiles) and asks the agent to upload the
+ * staging folder into the CopilotCodeReview artifact. Returns the staged file
+ * names; uploads nothing when none of the files exist, since the agent warns
+ * about an empty folder.
+ */
+function publishPromptArtifactFiles(files: Array<string | undefined>, stagingRoot: string, subfolder: string): string[] {
+    const staged = stageArtifactFiles(files, stagingRoot, subfolder);
+    if (staged.length > 0) {
+        tl.command('artifact.upload', {
+            containerfolder: PROMPT_ARTIFACT_NAME,
+            artifactname: PROMPT_ARTIFACT_NAME
+        }, stagingRoot);
+    }
+    return staged;
+}
+
 interface ReviewDeltaFile {
     path: string;
     changeType: string;
     originalPath?: string | null;
+}
+
+/**
+ * The record of the last reviewed iteration, as Get-AzureDevOpsPRChanges.ps1
+ * reports it: the property name, when the iteration was created, and the build
+ * that reviewed it. Build details are missing from records written before they
+ * were added and from runs outside a build pipeline. The script checks their
+ * shape and builds the URL itself, since anyone who can contribute to the pull
+ * request can write its properties.
+ */
+interface LastReviewRecord {
+    name: string;
+    iterationCreated: string | null;
+    buildId: number | null;
+    buildNumber: string | null;
+    buildUrl: string | null;
+    recordedAt: string | null;
 }
 
 /** Contents of Review_State.json (written by Get-AzureDevOpsPRChanges.ps1). */
@@ -359,11 +435,49 @@ interface ReviewState {
     stateReadStatus: string;
     lastReviewedIteration: number | null;
     lastReviewedSourceCommit: string | null;
+    /** Where the last reviewed iteration's record came from; null without one */
+    lastReviewedRecord: LastReviewRecord | null;
     delta: {
         status: string;
         reason: string | null;
         files: ReviewDeltaFile[];
     };
+}
+
+/** The lastReviewedRecord object from Review_State.json; null unless it has a name. */
+function readLastReviewRecord(value: any): LastReviewRecord | null {
+    if (!value || typeof value !== 'object' || typeof value.name !== 'string' || value.name.length === 0) {
+        return null;
+    }
+    const text = (field: unknown) => typeof field === 'string' && field.length > 0 ? field : null;
+    return {
+        name: value.name,
+        iterationCreated: text(value.iterationCreated),
+        buildId: Number.isSafeInteger(value.buildId) && value.buildId > 0 ? value.buildId : null,
+        buildNumber: text(value.buildNumber),
+        buildUrl: text(value.buildUrl),
+        recordedAt: text(value.recordedAt)
+    };
+}
+
+/**
+ * Arguments for Set-AzureDevOpsPRReviewState.ps1 that identify the build
+ * running the review (Build.BuildId, Build.BuildNumber, System.TeamProject),
+ * so later runs can name and link it. Empty outside a build pipeline. A value
+ * starting with '-' is left out: pwsh would read it as a parameter name.
+ */
+function buildReviewRecordArgs(buildId: string | undefined, buildNumber: string | undefined, teamProject: string | undefined): string[] {
+    if (!buildId || !/^[1-9]\d{0,9}$/.test(buildId) || Number(buildId) > 2147483647) {
+        return [];
+    }
+    const args = ['-BuildId', buildId];
+    if (buildNumber && !buildNumber.startsWith('-')) {
+        args.push('-BuildNumber', buildNumber);
+    }
+    if (teamProject && !teamProject.startsWith('-')) {
+        args.push('-BuildProject', teamProject);
+    }
+    return args;
 }
 
 /** Reads Review_State.json; null when it is missing or not usable. */
@@ -390,6 +504,7 @@ function readReviewState(filePath: string): ReviewState | null {
             stateReadStatus: String(parsed.stateReadStatus ?? ''),
             lastReviewedIteration: typeof parsed.lastReviewedIteration === 'number' ? parsed.lastReviewedIteration : null,
             lastReviewedSourceCommit: typeof parsed.lastReviewedSourceCommit === 'string' ? parsed.lastReviewedSourceCommit : null,
+            lastReviewedRecord: readLastReviewRecord(parsed.lastReviewedRecord),
             delta: {
                 status: String(delta.status ?? 'NotApplicable'),
                 reason: typeof delta.reason === 'string' ? delta.reason : null,
@@ -1338,10 +1453,18 @@ async function run(): Promise<void> {
         const reviewState = readReviewState(reviewStateFile);
         if (skipReviewedIterations && isIterationAlreadyReviewed(reviewState)) {
             const reviewedIteration = `iteration #${reviewState!.currentIteration} (${reviewState!.currentSourceCommit.substring(0, 8)})`;
-            console.log(`\nThis review configuration already reviewed ${reviewedIteration}; skipping the review.`);
+            // Name the build that reviewed it, so the user can find that run (details above, from Step 1)
+            const record = reviewState!.lastReviewedRecord;
+            const reviewedIn = record?.buildNumber ? ` in build ${sanitizePipelineLog(record.buildNumber)}`
+                : record?.buildId ? ` in build ID ${record.buildId}`
+                : '';
+            console.log(`\nThis review configuration already reviewed ${reviewedIteration}${reviewedIn}; skipping the review.`);
+            if (record?.buildUrl) {
+                console.log(`That review: ${sanitizePipelineLog(record.buildUrl)}`);
+            }
             console.log('Set skipReviewedIterations to false to review it again.');
             tl.setResult(tl.TaskResult.Succeeded,
-                `Skipped: ${reviewedIteration} was already reviewed. Set skipReviewedIterations: false to review it again.`);
+                `Skipped: ${reviewedIteration} was already reviewed${reviewedIn}. Set skipReviewedIterations: false to review it again.`);
             return;
         }
 
@@ -1783,7 +1906,6 @@ async function run(): Promise<void> {
         // Publish prompt artifacts for debugging if requested
         if (publishPromptArtifacts) {
             console.log('\n[Artifacts] Publishing prompt and context files...');
-            const artifactName = 'CopilotCodeReview';
             const artifactFiles = [
                 prDetailsOutput,
                 iterationDetailsOutput,
@@ -1798,14 +1920,17 @@ async function run(): Promise<void> {
                 promptFilePath,
             ];
 
-            for (const artifactFile of artifactFiles) {
-                if (artifactFile && fs.existsSync(artifactFile)) {
-                    tl.command('artifact.upload', {
-                        containerfolder: artifactName,
-                        artifactname: artifactName
-                    }, artifactFile);
-                    console.log(`  Uploaded: ${path.basename(artifactFile)}`);
+            // Each task gets its own folder in the shared artifact (see stageArtifactFiles)
+            const subfolder = artifactSubfolderName(useClaudeCode ? 'claude' : 'copilot', reviewStateKeyPrefix);
+            const stagingRoot = path.join(reviewStateDir, 'artifact');
+            try {
+                const staged = publishPromptArtifactFiles(artifactFiles, stagingRoot, subfolder);
+                for (const name of staged) {
+                    console.log(`  Uploaded: ${PROMPT_ARTIFACT_NAME}/${subfolder}/${name}`);
                 }
+            } catch (error) {
+                // Artifacts are a debugging aid; never fail the review over them
+                tl.warning(`Could not publish the prompt artifacts: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
 
@@ -1919,7 +2044,8 @@ async function run(): Promise<void> {
                     '-Id', pullRequestId,
                     '-StateKeyPrefix', reviewStateKeyPrefix,
                     '-Iteration', String(reviewState!.currentIteration),
-                    '-SourceCommit', reviewState!.currentSourceCommit
+                    '-SourceCommit', reviewState!.currentSourceCommit,
+                    ...buildReviewRecordArgs(tl.getVariable('Build.BuildId'), tl.getVariable('Build.BuildNumber'), tl.getVariable('System.TeamProject'))
                 ]);
             } catch (err) {
                 tl.warning(`Could not record iteration #${reviewState!.currentIteration} as reviewed, so the next run will review it again. ` +
@@ -2764,7 +2890,11 @@ export {
     buildClaudeStreamParser,
     buildClaudeInvocation,
     computeReviewStateKeyPrefix,
+    artifactSubfolderName,
+    stageArtifactFiles,
+    publishPromptArtifactFiles,
     readReviewState,
+    buildReviewRecordArgs,
     isIterationAlreadyReviewed,
     summarizeReviewActivity,
     prepareReviewStateFolders,

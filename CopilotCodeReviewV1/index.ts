@@ -681,6 +681,12 @@ function isSnapshotBound(options: {
  * reviewed when it was not — the cost of a false "no" is only a fuller review
  * next time, while a false "yes" would let later runs skip or narrow past code
  * nobody reviewed. Call only after the agent exited successfully.
+ *
+ * A run that posted nothing is recorded too: a re-review can legitimately
+ * find nothing new while earlier threads stay open (posting "looks good"
+ * would then be wrong), and requiring a post kept such iterations from ever
+ * being recorded. What this cannot catch is a comment-script call that failed
+ * before the script started (it leaves no activity marker); see the README.
  */
 function shouldRecordReviewState(input: {
     state: ReviewState | null;
@@ -688,7 +694,6 @@ function shouldRecordReviewState(input: {
     reviewContextWarnings: boolean;
     contextDegradations: string[];
     snapshotBound: boolean;
-    suppressPositiveFeedback: boolean;
 }): { record: boolean; reason: string } {
     const { state, activity } = input;
     if (!state || state.currentIteration < 1 || !/^[0-9a-f]{40}$/i.test(state.currentSourceCommit)) {
@@ -716,10 +721,6 @@ function shouldRecordReviewState(input: {
     }
     if (!input.snapshotBound) {
         return { record: false, reason: `the reviewed code could not be confirmed to be iteration #${state.currentIteration}` };
-    }
-    // With positive feedback suppressed, a clean review legitimately posts nothing
-    if (activity.completedPosts === 0 && !input.suppressPositiveFeedback) {
-        return { record: false, reason: 'no comments, replies, or thread updates were posted' };
     }
     return { record: true, reason: `iteration #${state.currentIteration} was reviewed` };
 }
@@ -2030,8 +2031,7 @@ async function run(): Promise<void> {
             activity,
             reviewContextWarnings,
             contextDegradations: collectContextDegradations(reviewStateDir),
-            snapshotBound,
-            suppressPositiveFeedback
+            snapshotBound
         });
         if (recordDecision.record) {
             try {

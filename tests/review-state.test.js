@@ -357,8 +357,7 @@ describe('incremental re-review state (issue #67)', () => {
                 activity: { readable: true, completedPosts: 2, unfinishedAttempts: 0, agentErrors: 0, refusals: [] },
                 reviewContextWarnings: false,
                 contextDegradations: [],
-                snapshotBound: true,
-                suppressPositiveFeedback: false
+                snapshotBound: true
             };
         }
 
@@ -377,8 +376,7 @@ describe('incremental re-review state (issue #67)', () => {
             'context fetch warnings': input => { input.reviewContextWarnings = true; },
             'a context degradation marker': input => { input.contextDegradations = ['Existing comment threads could not be retrieved.']; },
             'an incomplete changed-file list': input => { input.state.fullChangesStatus = 'Partial'; },
-            'an unbound snapshot': input => { input.snapshotBound = false; },
-            'zero posts with positive feedback allowed': input => { input.activity.completedPosts = 0; }
+            'an unbound snapshot': input => { input.snapshotBound = false; }
         };
         for (const [name, apply] of Object.entries(blockers)) {
             it(`does not record with ${name}`, () => {
@@ -390,19 +388,23 @@ describe('incremental re-review state (issue #67)', () => {
             });
         }
 
-        it('records a clean review that posted nothing when positive feedback is suppressed', () => {
+        it('records a clean review that posted nothing (a re-review that found nothing new)', () => {
             const input = recordableInput();
             input.activity.completedPosts = 0;
-            input.suppressPositiveFeedback = true;
             assert.equal(task.shouldRecordReviewState(input).record, true);
         });
 
-        it('never records a run with a failed attempt, even with positive feedback suppressed', () => {
-            const input = recordableInput();
-            input.activity.completedPosts = 0;
-            input.activity.unfinishedAttempts = 1;
-            input.suppressPositiveFeedback = true;
-            assert.equal(task.shouldRecordReviewState(input).record, false);
+        it('never records a run that posted nothing because its attempts failed or were refused', () => {
+            for (const apply of [
+                input => { input.activity.unfinishedAttempts = 1; },
+                input => { input.activity.refusals = ['this review may not reply to thread #12.']; },
+                input => { input.activity.agentErrors = 1; }
+            ]) {
+                const input = recordableInput();
+                input.activity.completedPosts = 0;
+                apply(input);
+                assert.equal(task.shouldRecordReviewState(input).record, false);
+            }
         });
     });
 

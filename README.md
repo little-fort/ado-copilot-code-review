@@ -29,6 +29,28 @@ This extension supports Windows and Linux Azure DevOps agents. Compatible with M
   - **Personal Access Token**: Required for Azure DevOps Server (on-prem) or if you prefer explicit token management. Needs permissions to read pull requests, write comments, and read code.
 - **PowerShell 7+**: This extension requires PowerShell 7 or later (`pwsh`) to be installed on the agent. PowerShell 7 is pre-installed on Microsoft-hosted agents.
 
+## How It Works
+
+1. **Fetch PR Context**: The task retrieves the PR's iteration details and its review record, then pull request metadata, existing comments, and linked work item details via the Azure DevOps API or Jira.
+2. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`.
+3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
+4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
+5. **Record the Review**: When the run provably reviewed the iteration, the task records it on the pull request so later runs can skip it or focus on what changed
+
+### Default Review Focus Areas
+
+The default prompt instructs Copilot to focus on:
+
+- **Performance**: Identifying inefficient code patterns
+- **Best Practices**: Adherence to coding standards
+- **Reusability**: Opportunities for code reuse
+- **Maintainability**: Code clarity and documentation
+- **Simplification**: Reducing complexity
+- **Security**: Potential vulnerabilities
+- **Code Consistency**: Style and pattern consistency
+
+Findings are triaged in two phases: the agent first enumerates every candidate issue across the full diff, then scores each by severity and confidence before posting. Critical and Major findings always post individually, high-confidence Minor findings are consolidated into a single capped comment, nits and speculation are dropped. On re-reviews, new comments are limited to newly pushed changes plus Critical findings, which keeps review rounds from surfacing endless new commentary on already-reviewed code.
+
 ## Installation
 
 1. Install the extension from the [Azure DevOps Marketplace](https://marketplace.visualstudio.com/items?itemName=LittleFortSoftware.ado-copilot-code-review)
@@ -175,7 +197,9 @@ steps:
       pullRequestId: '${{ parameters.pullRequestId }}'
 ```
 
-## Input Reference
+## Configuration
+
+### Input Reference
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -250,7 +274,6 @@ As of November 2026 (Copilot CLI 1.0.105), these are the models GitHub Copilot o
 - `grok-4.6`
 - `kimi-k3`
 - `mai-code-1.1-flash`
-- 
 
 Model availability varies by Copilot plan and organization policy, so some models may still be rejected at runtime if your subscription doesn't include it. See [supported AI models in Copilot](https://docs.github.com/en/copilot/reference/ai-models/supported-models) for the full availability matrix.
 
@@ -322,16 +345,16 @@ When configured:
 
 ### Review Behavior Options
 
-Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt — so none of them apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
+Three inputs tune how the review agent behaves across iterations. All of them apply to Copilot and Claude Code alike, and all work by adjusting the built-in review prompt. None of the options apply to raw prompt modes (`promptRaw`/`promptFileRaw`), where the prompt is passed through unmodified.
 
 **`resolveThreads`** controls which existing comment threads the agent may resolve when a new iteration addresses them:
 
-- `all` (default) — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers, replying with an explanation before marking the thread fixed. This matches the behavior the extension has had since thread resolution was introduced.
+- `all` (default) — the agent may resolve any thread the current changes clearly address, including threads opened by human reviewers. The agent will reply with an explanation before marking the thread fixed.
 - `agentOnly` — the agent only resolves threads created by previous automated reviews. Threads opened by human reviewers are never touched.
 
-**`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment; with this enabled, the agent posts nothing at all unless it has actionable feedback.
+**`suppressPositiveFeedback`** disables courtesy feedback. By default, a review that finds no issues posts a single "looks good to merge" comment. With this enabled, the agent posts nothing at all unless it has actionable feedback.
 
-**`maxMinorIssues`** bounds low-severity noise. The review prompt instructs the agent to triage the full diff first, score every finding by severity (Critical/Major/Minor/Nit) and confidence, and then post: Critical and Major findings always get individual comments and are never capped, while high-confidence Minor findings are consolidated into a single compact "Minor suggestions" comment containing at most this many items (`0` drops Minor feedback entirely). Nits and low-confidence speculation are never posted.
+**`maxMinorIssues`** bounds low-severity noise. The review prompt instructs the agent to triage the full diff first, score every finding by severity (Critical/Major/Minor/Nit) and confidence, and then post. Critical and Major findings always get individual comments and are never capped, while high-confidence Minor findings are consolidated into a single compact "Minor suggestions" comment containing at most this many items (`0` drops Minor feedback entirely). Nits and low-confidence speculation are never posted.
 
 ```yaml
 - task: CopilotCodeReview@1
@@ -347,8 +370,8 @@ Three inputs tune how the review agent behaves across iterations. All of them ap
 
 Teams that track work in Jira but host code in Azure DevOps can pull review context from Jira instead of Azure Boards. When the three Jira inputs are set (and `includeWorkItems` is enabled), the task:
 
-1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`) — the same convention Jira's own development panel uses. Lowercase keys in branch names are recognized.
-2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve (HTTP 404) are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
+1. Scans the PR's **source branch name, title, and description** for Jira issue keys (e.g., `PROJ-123`). Lowercase keys in branch names are recognized.
+2. Fetches each candidate issue from the Jira Cloud REST API. Keys that don't resolve are skipped silently, so key-shaped false positives like `UTF-8` never break the run.
 3. Writes the issue details into the same work-item context file the review prompt already consumes: summary, type, status, priority, assignee/reporter, due date, labels, components, fix versions, parent, description, environment, subtasks, linked issues, and the 10 most recent comments. Empty fields are omitted.
 
 ```yaml
@@ -364,7 +387,7 @@ Teams that track work in Jira but host code in Azure DevOps can pull review cont
     jiraCustomFields: 'Acceptance Criteria,customfield_10031'   # optional
 ```
 
-**Custom fields.** Fields like acceptance criteria are site-specific custom fields in Jira, so they are opt-in via `jiraCustomFields`: list the fields to include by display name (case-insensitive) or by `customfield_NNNNN` ID. Display names are resolved against the site's field catalog once per run; names that don't resolve are skipped with a warning and never fail the review. Rich-text values are converted to plain text the same way descriptions are. If a field's display name contains a comma, use its ID instead (the Jira admin field list shows IDs, or append `?fields=*all&expand=names` to any issue's REST URL).
+**Custom fields.** Fields like acceptance criteria are site-specific custom fields in Jira, so they are opt-in via `jiraCustomFields`: list the fields to include by display name (case-insensitive) or by `customfield_NNNNN` ID. Display names are resolved against the site's field catalog once per run; names that don't resolve are skipped with a warning and never fail the review.
 
 Notes:
 
@@ -409,20 +432,12 @@ If the diff cannot be computed (e.g., missing commits due to a shallow clone), t
 
 After a review, the task records which pull request iteration it reviewed, so later runs don't spend tokens repeating work:
 
-- **Already-reviewed iterations are skipped.** When a run finds that the PR's current iteration was already reviewed — for example a re-queued build, or a branch policy re-running the build after the target branch moved — it finishes immediately, before installing the CLI or running the agent. Set `skipReviewedIterations: false` to force a fresh review.
-- **Re-reviews focus on what changed.** When new commits were pushed since the last review, `Iteration_Details.txt` gains a `[Changes Since Last Review]` section listing the files changed since then, with the `git diff` command that shows exactly those changes. In [diff-only mode](#diff-only-review-mode) that smaller diff is also embedded in the prompt. The review prompt limits new non-Critical findings to those changes.
+- **Already-reviewed iterations are skipped.** When a run finds that the PR's current iteration was already reviewed, it finishes immediately, before installing the CLI or running the agent. Set `skipReviewedIterations: false` to force a fresh review.
+- **Re-reviews focus on what changed.** When new commits were pushed since the last review, `Iteration_Details.txt` gains a `[Changes Since Last Review]` section listing the files changed since then, with the `git diff` command that shows exactly those changes. The review prompt limits new non-Critical findings to those changes.
 
-**When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through (none was refused by the [review policy](#security-model)), all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration (in a PR validation build, `System.PullRequest.SourceCommitId` must match; otherwise the iteration must be checked out). A review that posted nothing is recorded as well — for example a re-review that found nothing new while earlier threads are still open. Anything else simply means the next run reviews the iteration again.
+**When a run is recorded:** only when it provably reviewed the iteration — the agent finished successfully, every comment it attempted to post went through (none was refused by the [review policy](#security-model)), all review context (threads, work items, the changed-file list) was fetched, and the reviewed code is confirmed to be that iteration. A review that completes without issue but finds nothing to post is recorded as well.
 
-**When the "changes since last review" section is omitted** (and the whole PR is reviewed as usual): after a rebase or a merge from the target branch (the merge base changed, so the commit-to-commit diff would mix in target-branch changes), after the PR is retargeted, or when the change lists could not be fully retrieved. In diff-only mode the extra diff is also left out when the last reviewed commit isn't in the local clone (e.g. after a force push) or when it would be more than half the size of the full diff.
-
-**Notes:**
-- Recording uses the same "Contribute to pull requests" permission as posting comments. If it fails, the task logs a warning and keeps working as before (every run reviews the whole PR).
-- A re-queued build skips even if someone replied to a review comment in the meantime; set `skipReviewedIterations: false` (or push a commit) to have the agent respond.
-- The hash also covers the built-in prompt, so a task update that changes it (1.7.0 does) starts a fresh record: each open PR gets one full review after the upgrade.
-- Without a record for the current configuration — for example the first review after upgrading, or a token that cannot write PR properties — the prompt falls back to treating any earlier automated review threads as a sign of a re-review. That fallback cannot tell which configuration wrote those threads, so a second, differently configured review of a PR is also treated as a re-review on its first run.
-- Raw prompt modes are skipped and recorded too. Only posting attempts made through the comment scripts are checked, so a raw prompt that posts some other way is recorded whether or not its posts went through.
-- A comment-script call that PowerShell rejects before the script starts (for example a misspelled parameter name) leaves no trace for the task to detect. If the agent then gives up on that comment instead of retrying, the iteration can still be recorded, even when that was the only comment of the run.
+> NOTE: The PR will still review as normal after a rebase, merge from target branch, or when the change list could not be fully retrieved.
 
 ### Publishing Prompt Artifacts
 
@@ -529,45 +544,22 @@ Two options are supported — provide exactly one:
 
 Alternatively, you can create the pipeline first and then configure the pipeline-specific variables.
 
-## How It Works
-
-1. **Fetch PR Context**: The task retrieves the PR's iteration details and its review record, then pull request metadata, existing comments, and linked work item details via the Azure DevOps API (or from Jira, when the [Jira inputs](#jira-work-items) are configured). If this review configuration already reviewed the current iteration, the run ends here (see [Incremental Re-Reviews](#incremental-re-reviews)).
-2. **Install CLI Agent**: The task ensures the configured CLI agent is installed on the build agent. GitHub Copilot CLI is installed via `winget` (Windows) or the official install script (Linux). Claude Code CLI is installed via `npm install -g @anthropic-ai/claude-code`. With `autoUpdateCli: true`, an existing install is updated first. The task logs the CLI version and warns when it is older than the versions it supports (see [Security Model](#security-model)).
-3. **Run Code Review**: Using the PR context and local Git commands, the CLI agent analyzes the changes using the configured or default prompt
-4. **Post Comments**: Review findings are posted as comments on the pull request via the Azure DevOps API
-5. **Record the Review**: When the run provably reviewed the iteration, the task records it on the pull request so later runs can skip it or focus on what changed
-
-## Default Review Focus Areas
-
-The default prompt instructs Copilot to focus on:
-
-- **Performance**: Identifying inefficient code patterns
-- **Best Practices**: Adherence to coding standards
-- **Reusability**: Opportunities for code reuse
-- **Maintainability**: Code clarity and documentation
-- **Simplification**: Reducing complexity
-- **Security**: Potential vulnerabilities
-- **Code Consistency**: Style and pattern consistency
-
-Findings are triaged in two phases: the agent first enumerates every candidate issue across the full diff, then scores each by severity (Critical/Major/Minor/Nit) and confidence before posting. Critical and Major findings always post individually; high-confidence Minor findings are consolidated into a single capped comment (see `maxMinorIssues`); nits and speculation are dropped. On re-reviews, new comments are limited to newly pushed changes plus Critical findings, which keeps review rounds from surfacing endless new commentary on already-reviewed code.
-
 ## Security Model
 
-The review agent runs in your build, inside a checkout of the pull request it reviews. Everything in that checkout — code, instruction files, and CLI configuration files — can be written by the pull request's author, who may not be trusted. The task limits what that content can do:
+The review agent runs in your build, inside a checkout of the pull request it reviews. Everything in that checkout can be written by the PR's author, who may not be trusted. The task limits what that content can do:
 
-- **Repository CLI configuration is not loaded.** Claude Code runs with `--setting-sources user`, so a checkout's `.claude/settings.json`, `.claude/settings.local.json`, and `.mcp.json` are ignored: no hooks or helper commands from the repository run, its `env` block doesn't apply, and its MCP servers, skills, and subagents don't load. The build user's own `~/.claude` settings still apply. The Copilot CLI loads a repository's hooks, MCP servers, and plugin settings only from folders it trusts; the task removes the environment variables that grant that trust (`COPILOT_ALLOW_ALL`, `GITHUB_COPILOT_PROMPT_MODE_*`) and warns when the build user's Copilot config already trusts a folder that contains the checkout (trust is inherited by subfolders).
+- **Repository CLI configuration is not loaded.** Claude Code runs with `--setting-sources user`, so a checkout's `.claude/settings.json`, `.claude/settings.local.json`, and `.mcp.json` are ignored. The build user's own `~/.claude` settings still apply. The task removes the environment variables that grant trust (`COPILOT_ALLOW_ALL`, `GITHUB_COPILOT_PROMPT_MODE_*`) and warns when the build user's Copilot config already trusts a folder that contains the checkout.
 - **No built-in GitHub MCP servers.** Copilot runs with `--disable-builtin-mcps`.
 - **GitHub credentials stay out of the agent's shell.** Copilot runs with `--secret-env-vars` for `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, and the custom-provider keys: commands the agent runs don't see them, and their values are redacted from output.
-- **Repository instruction files are optional.** By default the agent still reads them: CLAUDE.md for Claude Code; AGENTS.md, CLAUDE.md, `.github/copilot-instructions.md` and related files, plus repository skills, for Copilot. A pull request can edit these files, so set `ignoreCustomInstructions: true` if you don't want the changes under review to shape their own review.
-- **Untrusted text is marked.** In the context files, the PR title, description, branch names, comments, commit messages, changed-file names, and linked work items (Azure Boards or Jira) are wrapped in `<<<UNTRUSTED_CONTENT ...>>>` markers that carry a random id for each run, and so are the diffs embedded in diff-only mode. The prompt tells the agent to treat marked text, and the code under review, as information, never as instructions. This makes prompt injection harder, not impossible. Raw prompt modes get the markers in the context files but not the instruction, since raw prompts are passed to the CLI as-is.
+- **Repository instruction files are optional.** By default the agent still reads them: AGENTS.md, CLAUDE.md, copilot-instructions.md and related files. Set `ignoreCustomInstructions: true` if you don't want these files to shape the review.
+- **Untrusted text is marked.** In the context files, the PR title, description, branch names, comments, commit messages, changed-file names, and linked work items are wrapped in `<<<UNTRUSTED_CONTENT ...>>>` markers that carry a random id for each run, and so are the diffs embedded in diff-only mode. The prompt tells the agent to treat marked text, and the code under review, as information, never as instructions. This makes prompt injection harder, not impossible. Raw prompt modes get the markers in the context files but not the instruction, since raw prompts are passed to the CLI as-is.
 - **The comment scripts act only within the review.** Before the agent starts, the task writes a review policy for the run, and the comment scripts (`Add-CopilotComment.ps1`, `Add-AzureDevOpsPRComment.ps1`, `Update-CopilotComment.ps1`, `Delete-CopilotComment.ps1`) check every action against it, before sending anything:
   - They call only the pull request under review, on the configured server, project, and repository.
-  - They reply to and resolve only threads from earlier automated reviews and, with `resolveThreads: all`, active or pending human threads. Raw prompts may act on any thread, since `resolveThreads` doesn't apply to them. They edit or delete only comments an automated review wrote. Threads and comments created during the same run are not on the list.
-  - They read comment text only from files inside the working directory — not inside `.git`, not through a link that leads elsewhere, at most 100,000 characters — and refuse text passed inline with `-Comment` or `-Content`: inline text travels through the agent's shell command line, where command substitution in text copied from the pull request could run.
+  - They reply to and resolve only threads from earlier automated reviews and, with `resolveThreads: all`, active or pending human threads. Raw prompts may act on any thread, since `resolveThreads` doesn't apply to them. They edit or delete only comments an automated review wrote.
+  - They read comment text only from files inside the working directory that are not inside `.git`, not traversed through a link, and at most 100,000 characters. 
+  - The scripts refuse text passed inline with `-Comment` or `-Content`: inline text travels through the agent's shell command line, where command substitution in text copied from the pull request could run.
   - They anchor inline comments only to files the pull request changes; a comment on any other file is posted as a general comment that names the file and line.
-  - They never post the Azure DevOps token or another known credential (`SYSTEM_ACCESSTOKEN`, the Anthropic key or OAuth token, GitHub tokens, custom-provider keys), plain or Base64-encoded. This check also applies when you run the scripts yourself.
-   
-A refused action fails that script call, keeps the run from being recorded as reviewed (see [Incremental Re-Reviews](#incremental-re-reviews)), and is reported as a pipeline warning, since it can mean the agent followed instructions planted in the pull request.
+  - They never post the Azure DevOps token or another known credential, plain or Base64-encoded.
 
 Treat a review of an untrusted pull request like any other build of untrusted code:
 
@@ -575,7 +567,7 @@ Treat a review of an untrusted pull request like any other build of untrusted co
 - On self-hosted agents, never save Copilot folder trust on the agent's work folder or any folder above it, and keep the checkout step's `persistCredentials` off.
 - Give the pipeline identity only the permissions the review needs ("Contribute to pull requests" on the repository).
 
-**CLI versions:** tested with GitHub Copilot CLI 1.0.105 and Claude Code 2.1.316. The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
+**CLI versions:** The task warns when the installed CLI is older than 1.0.41 (Copilot) or 2.1.69 (Claude Code), the first versions known to honor the isolation above. Set `autoUpdateCli: true` to have the task run `copilot update` / `claude update` on an existing install before each review.
 
 ## Limitations
 
@@ -610,7 +602,7 @@ The agent tried something the comment scripts don't allow during a review (see [
 
 - A custom or raw prompt passes comment text inline with `-Comment` or `-Content`. Have the agent write the text to a file and pass `-CommentFile` / `-ContentFile`.
 - The agent tried to resolve a human reviewer's thread with `resolveThreads: agentOnly`, or to edit or delete a comment no automated review wrote. That's the policy working.
-- Anything else — another pull request or server, a file outside the working directory, a credential in the text — can mean the agent followed instructions planted in the pull request. Review the pull request content and the agent's output.
+- Anything else (e.g. another pull request or server, a file outside the working directory, a credential in the text) can mean the agent followed instructions planted in the pull request. Review the pull request content and the agent's output.
 
 The run isn't recorded as reviewed, so the next run reviews the iteration again.
 
@@ -658,6 +650,7 @@ For issues and feature requests, please use the [GitHub Issues](https://github.c
 
 ## Acknowledgments
 
+- Created by [Little Fort Software](https://littlefort.io)
 - Built with [Azure Pipelines Task SDK](https://github.com/microsoft/azure-pipelines-task-lib)
 - Powered by [GitHub Copilot](https://github.com/features/copilot) and [Claude Code](https://claude.ai/code)
 

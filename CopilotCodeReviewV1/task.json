@@ -9,8 +9,8 @@
     "author": "LittleFortSoftware",
     "version": {
         "Major": 1,
-        "Minor": 6,
-        "Patch": 1
+        "Minor": 7,
+        "Patch": 0
     },
     "instanceNameFormat": "Copilot Code Review",
     "minimumAgentVersion": "2.182.1",
@@ -183,7 +183,7 @@
             "label": "Copilot Model",
             "required": false,
             "defaultValue": "",
-            "helpMarkDown": "Optional. The model to use for the review (e.g., 'claude-sonnet-5', 'gpt-5.5'). If not specified, uses the CLI's default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
+            "helpMarkDown": "Optional. The model to use for the review (e.g., 'claude-sonnet-5', 'gpt-6.1-sol'). If not specified, uses the CLI's default model. **Required** when 'Use Custom Model Provider' is enabled—set it to a model identifier your provider serves."
         },
         {
             "name": "reasoningEffort",
@@ -332,12 +332,36 @@
             "helpMarkDown": "When enabled, the review is restricted to ONLY the PR diff. The diff is pre-computed and embedded in the prompt, and CLI tool access is limited to posting comments only. This dramatically reduces token usage for large repositories. Compatible with all prompt modes — when using raw prompts, the diff context is appended to the end of the prompt."
         },
         {
+            "name": "skipReviewedIterations",
+            "type": "boolean",
+            "label": "Skip Already-Reviewed Iterations",
+            "required": false,
+            "defaultValue": true,
+            "helpMarkDown": "After a review, the task records the reviewed PR iteration as a pull request property (scoped to this review configuration: agent, model, prompt, and review settings). When enabled (default), a run for an iteration that was already reviewed — for example a re-queued build or a policy re-run after the target branch moved — finishes immediately without running the agent. Disable to force a fresh review. Re-reviews of newer iterations are told what changed since the last review either way. Requires permission to update the pull request (the same 'Contribute to pull requests' permission used for posting comments)."
+        },
+        {
+            "name": "ignoreCustomInstructions",
+            "type": "boolean",
+            "label": "Ignore Repository Custom Instructions",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, the agent does not load instruction files from the repository under review: CLAUDE.md for Claude Code; AGENTS.md, CLAUDE.md, .github/copilot-instructions.md, and related files, plus repository skills, for the Copilot CLI. The pull request under review can edit these files, so enable this if you don't want the changes to shape their own review. Repository settings, hooks, and MCP servers are not loaded either way (see Security Model in the README)."
+        },
+        {
+            "name": "autoUpdateCli",
+            "type": "boolean",
+            "label": "Auto-Update CLI",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled and the Copilot CLI or Claude Code CLI is already installed on the agent, the task runs its update command ('copilot update' or 'claude update') before the review. A failed update logs a warning and the review continues with the installed version. When disabled (default), keeping the CLI current on self-hosted agents is up to the build admin; the task warns when the installed version is older than it supports."
+        },
+        {
             "name": "publishPromptArtifacts",
             "type": "boolean",
             "label": "Publish Prompt Artifacts",
             "required": false,
             "defaultValue": false,
-            "helpMarkDown": "When enabled, publishes all context files (PR details, iteration details, work items, commit SHAs) and the final assembled prompt as pipeline artifacts. Useful for debugging prompt construction and reviewing what context the CLI agent received."
+            "helpMarkDown": "When enabled, publishes all context files (PR details, iteration details, work items, commit SHAs) and the final assembled prompt to the CopilotCodeReview pipeline artifact, in a folder for this task (agent name plus the start of its configuration hash, e.g. copilot-5ab7), so several review tasks in one job keep separate files. Useful for debugging prompt construction and reviewing what context the CLI agent received."
         }
     ],
     "execution": {

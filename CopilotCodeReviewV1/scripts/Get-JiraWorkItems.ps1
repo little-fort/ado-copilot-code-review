@@ -52,6 +52,10 @@
 .PARAMETER OutputFile
     Optional. Path to write the output to a file. If not specified, output is only written to the console.
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps each Jira issue in untrusted-content markers carrying this id.
+
 .EXAMPLE
     .\Get-JiraWorkItems.ps1 -BaseUrl "https://myorg.atlassian.net" -Email "me@example.com" -ApiToken "token" -PrMetadataFile "./PR_Metadata.json" -OutputFile "./Work_Item_Details.txt"
     Extracts issue keys from the PR metadata and writes the fetched issue details to a file.
@@ -107,10 +111,25 @@ param(
     [string]$GatewayBaseUrl = 'https://api.atlassian.com',
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
+
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
 
 function Write-Output-Line {
     param(
@@ -128,8 +147,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -137,6 +157,62 @@ function Write-Output-Line {
     else {
         Write-Host $sanitized -ForegroundColor $ForegroundColor
     }
+}
+
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
 }
 
 function Get-JiraIssueKeys {
@@ -204,10 +280,10 @@ function Invoke-JiraApi {
             Write-Host "##[error]HTTP status: $statusCode"
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            Write-Host "##[error]API response: $($_.ErrorDetails.Message)"
+            Write-Host "##[error]API response: $(ConvertTo-SafeLogText $_.ErrorDetails.Message)"
         }
         else {
-            Write-Host "##[error]$($_.Exception.Message)"
+            Write-Host "##[error]$(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         if ($statusCode -eq 401) {
             Write-Host "##[error]Authentication failed. Verify the Jira email and API token (created at https://id.atlassian.com/manage-profile/security/api-tokens)."
@@ -281,7 +357,7 @@ function Resolve-JiraApiRoot {
     # type mismatch, so it fails without a fallback attempt.
     $siteAuth = Test-JiraAuth -Root $BaseUrl -Headers $Headers
     if ($siteAuth.Ok) {
-        Write-Host "Authenticated to Jira as: $($siteAuth.DisplayName)" -ForegroundColor Green
+        Write-Host "Authenticated to Jira as: $(ConvertTo-SafeLogText $siteAuth.DisplayName)" -ForegroundColor Green
         return $BaseUrl
     }
 
@@ -307,7 +383,7 @@ function Resolve-JiraApiRoot {
     $gatewayRoot = "$GatewayBaseUrl/ex/jira/$cloudId"
     $gatewayAuth = Test-JiraAuth -Root $gatewayRoot -Headers $Headers
     if ($gatewayAuth.Ok) {
-        Write-Host "Authenticated to Jira as: $($gatewayAuth.DisplayName)" -ForegroundColor Green
+        Write-Host "Authenticated to Jira as: $(ConvertTo-SafeLogText $gatewayAuth.DisplayName)" -ForegroundColor Green
         Write-Host "Scoped API token detected — using the Atlassian platform gateway ($gatewayRoot)." -ForegroundColor Cyan
         return $gatewayRoot
     }
@@ -361,7 +437,8 @@ function Resolve-JiraCustomFields {
             $catalog = Invoke-RestMethod -Uri "$ApiRoot/rest/api/3/field" -Headers $Headers -Method Get -ErrorAction Stop
         }
         catch {
-            Write-Host "##[warning]Could not retrieve the Jira field catalog to resolve custom field names ($($_.Exception.Message)); skipping: $($pendingNames -join ', ')"
+            Write-Host "##[warning]Could not retrieve the Jira field catalog to resolve custom field names ($(ConvertTo-SafeLogText $_.Exception.Message)); skipping: $($pendingNames -join ', ')"
+            Write-ContextDegradation -Name 'jira-field-catalog' -Detail 'Configured Jira custom fields could not be resolved (the Jira field catalog request failed).'
         }
 
         if ($catalog) {
@@ -490,7 +567,8 @@ function Get-JiraCommentWindow {
     catch {
         # Comments are supplemental — degrade to the oldest available page
         # rather than failing the run.
-        Write-Host "##[warning]Could not fetch the most recent comments for ${Key}: $($_.Exception.Message). Showing older comments instead."
+        Write-Host "##[warning]Could not fetch the most recent comments for ${Key}: $(ConvertTo-SafeLogText $_.Exception.Message). Showing older comments instead."
+        Write-ContextDegradation -Name "jira-comments-$Key" -Detail "The most recent comments on Jira issue $Key could not be retrieved."
         $rendered = @($Issue.renderedFields.comment.comments)
         $tailStart = [Math]::Max(0, $embedded.Count - $windowSize)
         $window = for ($i = $tailStart; $i -lt $embedded.Count; $i++) {
@@ -587,7 +665,7 @@ try {
     $prMetadata = Get-Content -Path $PrMetadataFile -Raw | ConvertFrom-Json
 }
 catch {
-    Write-Host "##[error]Failed to parse PR metadata file: $_"
+    Write-Host "##[error]Failed to parse PR metadata file: $(ConvertTo-SafeLogText "$_")"
     exit 1
 }
 
@@ -648,7 +726,7 @@ try {
         }
 
         $issues += $issue
-        Write-Host "  $key — found: $($issue.fields.summary)" -ForegroundColor Green
+        Write-Host "  $key — found: $(ConvertTo-SafeLogText $issue.fields.summary)" -ForegroundColor Green
     }
 }
 catch {
@@ -674,6 +752,9 @@ foreach ($issue in $issues) {
     # native format; fall back to nothing if rendering is unavailable
     $description = ConvertFrom-Html $issue.renderedFields.description
 
+    # Issue fields and comments can be written by anyone with access to the
+    # Jira project, including people outside the development team
+    Write-UntrustedContentMarker -Kind Begin -Source "jira-$($issue.key)"
     Write-Output-Line "`n[$($issue.key) - $issueType]" -ForegroundColor Yellow
     Write-Output-Line "  Title:           $summary"
     Write-Output-Line "  Status:          $status"
@@ -805,6 +886,7 @@ foreach ($issue in $issues) {
             }
         }
     }
+    Write-UntrustedContentMarker -Kind End
 }
 
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

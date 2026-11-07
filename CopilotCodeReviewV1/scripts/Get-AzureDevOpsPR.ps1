@@ -29,6 +29,21 @@
 .PARAMETER Id
     Optional. Specific pull request ID to retrieve detailed information for.
 
+.PARAMETER IncludeHumanThreads
+    Optional. Also emit a HUMAN REVIEWER THREADS (JSON) section listing active threads opened by human
+    reviewers, with their full text, author, and replies. The task passes this only when the review agent
+    is allowed to resolve human threads (resolveThreads = all).
+
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps text written by PR authors and commenters in untrusted-content markers carrying this id.
+
+.PARAMETER ThreadPolicyFile
+    Optional. With -Id, also write the pull request's comment threads as JSON for the task's review
+    policy: each thread's id, status, and whether an automated review created it, plus each comment's
+    id and whether an automated review wrote it. threadsStatus is 'Failed' when the threads could not
+    be retrieved.
+
 .EXAMPLE
     .\Get-AzureDevOpsPR.ps1 -Token "your-pat-token" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject"
     Lists all open pull requests in the project using PAT authentication.
@@ -83,10 +98,31 @@ param(
     [int]$Id,
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Include active human reviewer threads as JSON")]
+    [switch]$IncludeHumanThreads,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Output file for the thread data the task's review policy uses")]
+    [string]$ThreadPolicyFile
 )
 
 #region Helper Functions
+
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
 
 function Write-Output-Line {
     param(
@@ -104,8 +140,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -113,6 +150,62 @@ function Write-Output-Line {
     else {
         Write-Host $sanitized -ForegroundColor $ForegroundColor
     }
+}
+
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
 }
 
 function Get-AuthorizationHeader {
@@ -154,7 +247,7 @@ function Invoke-AzureDevOpsApi {
             $statusCode = $_.Exception.Response.StatusCode.value__
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $errorDetail = $_.ErrorDetails.Message
+            $errorDetail = ConvertTo-SafeLogText $_.ErrorDetails.Message
         }
 
         # Build a descriptive error message with all available context
@@ -174,7 +267,7 @@ function Invoke-AzureDevOpsApi {
             Write-Error "$baseMsg — API response: $errorDetail"
         }
         else {
-            Write-Error "$baseMsg — $($_.Exception.Message)"
+            Write-Error "$baseMsg — $(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         return $null
     }
@@ -286,29 +379,109 @@ function Get-ReviewersSummary {
     return $reviewerInfo -join "; "
 }
 
-function Test-AgentAuthoredThread {
+function Test-AgentAuthoredComment {
     <#
-        Returns $true when a comment thread was created by a previous automated
-        review. Match by: Build Service author OR the agent attribution tag in
-        the first comment. The tag check matters when comments are posted with
-        a PAT — the author is then a human account, so only the tag identifies
-        the thread as agent-created.
+        Returns $true when a comment was written by an automated review. Match
+        by: Build Service author OR the agent attribution tag in the text. The
+        tag check matters when comments are posted with a PAT — the author is
+        then a human account, so only the tag identifies the comment as
+        agent-written.
 
         The tag must be matched with -match and escaped brackets: in a -like
         pattern, [brackets] form a wildcard character class, so a pattern like
         '*[Generated by ...]*' would match nearly every human comment and leak
         human threads into the agent-thread JSON (found by PR #61 review).
     #>
-    param($Thread)
+    param($Comment)
 
-    $firstComment = $Thread.comments[0]
-
-    if (($firstComment.author.displayName -like "*Build Service*") -or
-        ($firstComment.author.uniqueName -like "*Build Service*")) {
+    if (($Comment.author.displayName -like "*Build Service*") -or
+        ($Comment.author.uniqueName -like "*Build Service*")) {
         return $true
     }
 
-    return [bool]($firstComment.content -match '\[Generated by (GitHub Copilot|Claude Code)\]')
+    return [bool]($Comment.content -match '\[Generated by (GitHub Copilot|Claude Code)\]')
+}
+
+function Test-AgentAuthoredThread {
+    # Returns $true when a comment thread was created by a previous automated
+    # review, judged by its first comment (see Test-AgentAuthoredComment)
+    param($Thread)
+
+    return Test-AgentAuthoredComment -Comment $Thread.comments[0]
+}
+
+function Get-CommentPreviewLines {
+    <#
+        Returns the first $MaxLines non-blank, trimmed lines of a comment and
+        how many non-blank lines were left out, for the prose thread summary.
+        Only non-blank lines are displayed, so only those are counted — the
+        "(N more lines)" note then matches what the reader actually missed.
+    #>
+    param(
+        [string]$Content,
+        [int]$MaxLines
+    )
+
+    $lines = @(($Content -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $shown = @($lines | Select-Object -First $MaxLines)
+    return [pscustomobject]@{
+        Lines   = $shown
+        Omitted = $lines.Count - $shown.Count
+    }
+}
+
+function ConvertTo-ThreadJsonObject {
+    <#
+        Builds the JSON shape of a thread section the review agent acts on
+        (COPILOT COMMENT THREADS / HUMAN REVIEWER THREADS): the ids the comment
+        scripts need, status, file position, the full first comment, and every
+        reply. System messages and soft-deleted replies (which have no content)
+        are left out. -IncludeAuthor adds the first comment's author, which
+        matters for human threads; automated-review threads are all ours.
+    #>
+    param(
+        $Thread,
+        [switch]$IncludeAuthor
+    )
+
+    $firstComment = $Thread.comments | Select-Object -First 1
+
+    $filePath = $null
+    $startLine = $null
+    if ($Thread.threadContext -and $Thread.threadContext.filePath) {
+        $filePath = $Thread.threadContext.filePath
+        if ($Thread.threadContext.rightFileStart) {
+            $startLine = $Thread.threadContext.rightFileStart.line
+        }
+        elseif ($Thread.threadContext.leftFileStart) {
+            $startLine = $Thread.threadContext.leftFileStart.line
+        }
+    }
+
+    $replies = @(@($Thread.comments) | Select-Object -Skip 1 | Where-Object {
+        $_.commentType -ne 'system' -and -not $_.isDeleted
+    } | ForEach-Object {
+        [ordered]@{
+            author        = $_.author.displayName
+            content       = $_.content
+            publishedDate = $_.publishedDate
+        }
+    })
+
+    # Ordered so the JSON reads the same way on every run
+    $result = [ordered]@{
+        threadId  = $Thread.id
+        commentId = $firstComment.id
+        status    = $Thread.status
+        filePath  = $filePath
+        startLine = $startLine
+    }
+    if ($IncludeAuthor) {
+        $result.author = $firstComment.author.displayName
+    }
+    $result.content = $firstComment.content
+    $result.replies = $replies
+    return $result
 }
 
 #endregion
@@ -376,12 +549,28 @@ if ($Id -gt 0) {
     # Get PR threads (comments)
     $threadsUrl = "$baseUrl/git/repositories/$Repository/pullrequests/$Id/threads?$apiVersion"
     $threads = Invoke-AzureDevOpsApi -Uri $threadsUrl -Headers $headers
+
+    # The script still produces PR details when these fail, but the review
+    # would then be missing context it relies on
+    if ($null -eq $workItems) {
+        Write-ContextDegradation -Name 'pr-work-items' -Detail 'Linked work items could not be retrieved.'
+    }
+    if ($null -eq $iterations) {
+        Write-ContextDegradation -Name 'pr-iterations' -Detail 'Pull request iterations could not be retrieved.'
+    }
+    if ($null -eq $threads) {
+        Write-ContextDegradation -Name 'pr-threads' -Detail 'Existing comment threads could not be retrieved.'
+    }
     
     # Display detailed information
     Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
     Write-Output-Line "PULL REQUEST DETAILS" -ForegroundColor Green
     Write-Output-Line ("=" * 80) -ForegroundColor DarkGray
-    
+
+    # Everything from here to [Links] is PR-author and commenter text (title,
+    # branch names, display names, description, comments, file paths)
+    Write-UntrustedContentMarker -Kind Begin -Source 'pull-request'
+
     Write-Output-Line "`n[Basic Information]" -ForegroundColor Yellow
     Write-Output-Line "  ID:              #$($pr.pullRequestId)"
     Write-Output-Line "  Title:           $($pr.title)"
@@ -444,15 +633,73 @@ if ($Id -gt 0) {
         }
     }
     
+    # Classify comment threads once (system-generated threads excluded); the
+    # prose summary and the JSON sections below share these sets
+    $commentThreads = @()
+    $agentThreads = @()
+    $humanActiveThreads = @()
+    if ($threads -and $threads.value) {
+        $commentThreads = @($threads.value | Where-Object {
+            $_.comments -and
+            $_.comments.Count -gt 0 -and
+            $_.comments[0].commentType -ne "system"
+        })
+        # Threads created by a previous automated review (see Test-AgentAuthoredThread)
+        $agentThreads = @($commentThreads | Where-Object { Test-AgentAuthoredThread -Thread $_ })
+        if ($IncludeHumanThreads) {
+            $humanActiveThreads = @($commentThreads | Where-Object {
+                -not (Test-AgentAuthoredThread -Thread $_) -and $_.status -in @('active', 'pending')
+            })
+        }
+    }
+
+    # Machine-readable thread data for the task's review policy (PR #65
+    # rework): which threads and comments automated reviews created, so the
+    # comment scripts can limit which threads the agent replies to or
+    # resolves and which comments it edits or deletes. Same thread set as the
+    # sections below (system threads excluded).
+    if ($ThreadPolicyFile) {
+        $threadPolicy = [ordered]@{
+            schemaVersion = 1
+            threadsStatus = if ($null -eq $threads) { 'Failed' } else { 'Complete' }
+            threads       = @($commentThreads | ForEach-Object {
+                $thread = $_
+                [ordered]@{
+                    threadId      = [int]$thread.id
+                    status        = [string]$thread.status
+                    agentAuthored = [bool](Test-AgentAuthoredThread -Thread $thread)
+                    comments      = @(@($thread.comments) | Where-Object { $_ -and $_.commentType -ne 'system' } | ForEach-Object {
+                        [ordered]@{
+                            commentId     = [int]$_.id
+                            agentAuthored = [bool](Test-AgentAuthoredComment -Comment $_)
+                        }
+                    })
+                }
+            })
+        }
+        try {
+            $policyDir = Split-Path -Parent $ThreadPolicyFile
+            if (-not [string]::IsNullOrEmpty($policyDir) -and -not (Test-Path $policyDir)) {
+                New-Item -ItemType Directory -Path $policyDir -Force | Out-Null
+            }
+            [System.IO.File]::WriteAllText($ThreadPolicyFile, (ConvertTo-Json -InputObject $threadPolicy -Depth 6),
+                [System.Text.UTF8Encoding]::new($false))
+        }
+        catch {
+            # Without the file the task allows no thread actions in this run
+            Write-Host "##[warning]Could not write the thread policy file: $(ConvertTo-SafeLogText "$_")"
+        }
+    }
+
+    # Threads printed in full in a JSON section get a one-line pointer in the
+    # prose summary instead of a second copy of their text
+    $agentThreadIds = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($t in $agentThreads) { [void]$agentThreadIds.Add([int]$t.id) }
+    $humanThreadIds = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($t in $humanActiveThreads) { [void]$humanThreadIds.Add([int]$t.id) }
+
     Write-Output-Line "`n[Comments/Threads]" -ForegroundColor Yellow
     if ($threads -and $threads.value) {
-        # Filter to top-level comment threads (exclude system-generated threads)
-        $commentThreads = $threads.value | Where-Object { 
-            $_.comments -and 
-            $_.comments.Count -gt 0 -and 
-            $_.comments[0].commentType -ne "system"
-        }
-        
         $activeThreads = $commentThreads | Where-Object { $_.status -eq "active" }
         $resolvedThreads = $commentThreads | Where-Object { $_.status -eq "fixed" -or $_.status -eq "closed" }
         
@@ -492,20 +739,22 @@ if ($Id -gt 0) {
                 
                 Write-Output-Line "  Author: $($firstComment.author.displayName) | $(Format-DateForDisplay $firstComment.publishedDate)" -ForegroundColor DarkGray
                 
-                # Display comment content (truncate if too long)
-                $commentContent = $firstComment.content
-                if (-not [string]::IsNullOrEmpty($commentContent)) {
-                    # Clean up and format comment
-                    $commentLines = $commentContent -split "`n"
-                    $displayLines = $commentLines | Select-Object -First 30
-                    foreach ($line in $displayLines) {
-                        $trimmedLine = $line.Trim()
-                        if (-not [string]::IsNullOrEmpty($trimmedLine)) {
-                            Write-Output-Line "    $trimmedLine"
-                        }
+                if ($agentThreadIds.Contains([int]$thread.id)) {
+                    Write-Output-Line "    (automated review thread; full text in the COPILOT COMMENT THREADS (JSON) section below)" -ForegroundColor DarkGray
+                }
+                elseif ($humanThreadIds.Contains([int]$thread.id)) {
+                    Write-Output-Line "    (full text and replies in the HUMAN REVIEWER THREADS (JSON) section below)" -ForegroundColor DarkGray
+                }
+                else {
+                    # Resolved threads stay listed so the agent does not repeat
+                    # existing feedback, but a short preview is enough for that
+                    $maxLines = if ($thread.status -in @('fixed', 'closed', 'wontFix', 'byDesign')) { 5 } else { 30 }
+                    $preview = Get-CommentPreviewLines -Content $firstComment.content -MaxLines $maxLines
+                    foreach ($line in $preview.Lines) {
+                        Write-Output-Line "    $line"
                     }
-                    if ($commentLines.Count -gt 3) {
-                        Write-Output-Line "    ... ($($commentLines.Count - 3) more lines)" -ForegroundColor DarkGray
+                    if ($preview.Omitted -gt 0) {
+                        Write-Output-Line "    ... ($($preview.Omitted) more lines)" -ForegroundColor DarkGray
                     }
                 }
                 
@@ -517,6 +766,11 @@ if ($Id -gt 0) {
             }
         }
     }
+    elseif ($null -eq $threads) {
+        # Saying "No comments" here would tell the review agent there is no
+        # existing feedback to respect or resolve
+        Write-Output-Line "  Existing comment threads could not be retrieved from Azure DevOps."
+    }
     else {
         Write-Output-Line "  No comments"
     }
@@ -527,80 +781,44 @@ if ($Id -gt 0) {
             Write-Output-Line "  - #$($wi.id): $($wi.url)"
         }
     }
+    elseif ($null -eq $workItems) {
+        Write-Output-Line "  Linked work items could not be retrieved from Azure DevOps."
+    }
     else {
         Write-Output-Line "  No linked work items"
     }
-    
+
+    Write-UntrustedContentMarker -Kind End
+
     Write-Output-Line "`n[Links]" -ForegroundColor Yellow
     $webUrl = "$CollectionUri/$Project/_git/$($pr.repository.name)/pullrequest/$($pr.pullRequestId)"
     Write-Output-Line "  Web URL: $webUrl"
     
     Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray
 
-    # Output structured JSON for Copilot-created comment threads
-    # This section enables Copilot to identify and resolve its previous comments
-    if ($threads -and $threads.value) {
-        $commentThreads = $threads.value | Where-Object { 
-            $_.comments -and 
-            $_.comments.Count -gt 0 -and 
-            $_.comments[0].commentType -ne "system"
-        }
-        
-        # Filter to threads that were created by a previous automated review
-        # (see Test-AgentAuthoredThread for the matching rules)
-        $copilotThreads = $commentThreads | Where-Object { Test-AgentAuthoredThread -Thread $_ }
-        
-        if ($copilotThreads -and $copilotThreads.Count -gt 0) {
-            Write-Output-Line "`n=== COPILOT COMMENT THREADS (JSON) ===" -ForegroundColor Cyan
-            
-            $jsonThreads = $copilotThreads | ForEach-Object {
-                $thread = $_
-                $firstComment = $thread.comments | Select-Object -First 1
+    # Structured JSON for threads from previous automated reviews, which the
+    # agent replies to and resolves. -InputObject keeps a single thread a
+    # one-element array (piping one object to ConvertTo-Json yields a bare object).
+    if ($agentThreads.Count -gt 0) {
+        Write-Output-Line "`n=== COPILOT COMMENT THREADS (JSON) ===" -ForegroundColor Cyan
+        $jsonThreads = @($agentThreads | ForEach-Object { ConvertTo-ThreadJsonObject -Thread $_ })
+        # Replies in these threads come from people
+        Write-UntrustedContentMarker -Kind Begin -Source 'automated-review-threads'
+        Write-Output-Line (ConvertTo-Json -InputObject $jsonThreads -Compress -Depth 6)
+        Write-UntrustedContentMarker -Kind End
+        Write-Output-Line "=== END COPILOT COMMENT THREADS ===" -ForegroundColor Cyan
+    }
 
-                # Extract file path and line info
-                $filePath = $null
-                $startLine = $null
-                if ($thread.threadContext -and $thread.threadContext.filePath) {
-                    $filePath = $thread.threadContext.filePath
-                    if ($thread.threadContext.rightFileStart) {
-                        $startLine = $thread.threadContext.rightFileStart.line
-                    }
-                    elseif ($thread.threadContext.leftFileStart) {
-                        $startLine = $thread.threadContext.leftFileStart.line
-                    }
-                }
-
-                # Build replies array from all comments after the first
-                $replies = @()
-                $allComments = @($thread.comments)
-                if ($allComments.Count -gt 1) {
-                    $replies = $allComments | Select-Object -Skip 1 | Where-Object {
-                        $_.commentType -ne "system"
-                    } | ForEach-Object {
-                        @{
-                            author        = $_.author.displayName
-                            content       = $_.content
-                            publishedDate = $_.publishedDate
-                        }
-                    }
-                    if ($null -eq $replies) { $replies = @() }
-                }
-
-                @{
-                    threadId  = $thread.id
-                    commentId = $firstComment.id
-                    status    = $thread.status
-                    filePath  = $filePath
-                    startLine = $startLine
-                    content   = $firstComment.content
-                    replies   = @($replies)
-                }
-            }
-
-            $jsonOutput = $jsonThreads | ConvertTo-Json -Compress -Depth 5
-            Write-Output-Line $jsonOutput
-            Write-Output-Line "=== END COPILOT COMMENT THREADS ===" -ForegroundColor Cyan
-        }
+    # Active threads from human reviewers, only when the agent may resolve them
+    # (resolveThreads = all): it needs the full text and replies to judge whether
+    # a concern was addressed or disputed, and the ids to reply and resolve
+    if ($humanActiveThreads.Count -gt 0) {
+        Write-Output-Line "`n=== HUMAN REVIEWER THREADS (JSON) ===" -ForegroundColor Cyan
+        $jsonThreads = @($humanActiveThreads | ForEach-Object { ConvertTo-ThreadJsonObject -Thread $_ -IncludeAuthor })
+        Write-UntrustedContentMarker -Kind Begin -Source 'human-reviewer-threads'
+        Write-Output-Line (ConvertTo-Json -InputObject $jsonThreads -Compress -Depth 6)
+        Write-UntrustedContentMarker -Kind End
+        Write-Output-Line "=== END HUMAN REVIEWER THREADS ===" -ForegroundColor Cyan
     }
 }
 else {
@@ -662,7 +880,7 @@ else {
     }
     
     $tableOutput = $tableData | Format-Table -AutoSize -Wrap | Out-String
-    Write-Host $tableOutput
+    Write-Host (ConvertTo-SafeLogText $tableOutput)
     if ($script:OutputToFile) {
         $script:OutputBuilder.AppendLine($tableOutput) | Out-Null
     }

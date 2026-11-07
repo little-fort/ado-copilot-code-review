@@ -27,6 +27,10 @@
 .PARAMETER OutputFile
     Optional. Path to write the output to a file. If not specified, output is only written to the console.
 
+.PARAMETER UntrustedContentId
+    Optional. Random per-run id (32 lowercase hex characters) from the task. When set, the output file
+    wraps each work item in untrusted-content markers carrying this id.
+
 .EXAMPLE
     .\Get-AzureDevOpsWorkItems.ps1 -Token "your-pat" -CollectionUri "https://dev.azure.com/myorg" -Project "myproject" -WorkItemIds "123,456"
     Retrieves details for work items #123 and #456.
@@ -64,10 +68,25 @@ param(
     [string]$WorkItemIds,
 
     [Parameter(Mandatory = $false, HelpMessage = "Output file path to write results to")]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Random per-run id for untrusted-content markers")]
+    [ValidatePattern('^[0-9a-f]{32}$')]
+    [string]$UntrustedContentId
 )
 
 #region Helper Functions
+
+function ConvertTo-SafeLogText {
+    <#
+        Neutralizes Azure Pipelines logging-command markers in text that came
+        from outside this script (API responses, PR and work item content)
+        before it is written to the pipeline log (issues #47, #69).
+    #>
+    param([string]$Text)
+
+    return $Text -replace '##(?=(?:vso)?\[)', '# #'
+}
 
 function Write-Output-Line {
     param(
@@ -85,8 +104,9 @@ function Write-Output-Line {
         }
     }
 
-    # Sanitize for Azure Pipelines: prevent ##vso[ and ##[ from being interpreted as logging commands
-    $sanitized = $Message -replace '(?m)^##', ' ##'
+    # Sanitize the console copy only; the output file keeps the original text
+    # for the review agent
+    $sanitized = ConvertTo-SafeLogText $Message
 
     if ($NoNewline) {
         Write-Host $sanitized -ForegroundColor $ForegroundColor -NoNewline
@@ -96,6 +116,61 @@ function Write-Output-Line {
     }
 }
 
+function Write-ContextDegradation {
+    <#
+        Tells the task that part of the review context could not be fetched
+        even though this script still succeeds (issue #67). The task then marks
+        the run partially succeeded and does not record the iteration as
+        reviewed, so a later run can review it with complete context.
+        Best-effort, and does nothing outside the task (variable unset).
+    #>
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:COPILOT_REVIEW_STATE_DIR)) {
+        return
+    }
+    try {
+        $contextDir = Join-Path $env:COPILOT_REVIEW_STATE_DIR 'context'
+        [void][System.IO.Directory]::CreateDirectory($contextDir)
+        [System.IO.File]::WriteAllText((Join-Path $contextDir "$Name.degraded"), [string]$Detail)
+    }
+    catch {
+        # Bookkeeping must never fail the context fetch
+    }
+}
+
+function Write-UntrustedContentMarker {
+    <#
+        Writes the opening or closing line of an untrusted-content block to the
+        output file (PR #65 rework). Text between the markers was written by PR
+        authors, commenters, or work item authors; the review prompt tells the
+        agent to treat it as data, never as instructions. The id is random per
+        run (passed by the task), so the content cannot forge a closing marker.
+        Writes nothing without an id or an output file. The markers go to the
+        context file only; the console output stays as it was.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Begin', 'End')]
+        [string]$Kind,
+
+        [string]$Source = ''
+    )
+
+    if ([string]::IsNullOrEmpty($script:UntrustedContentId) -or -not $script:OutputToFile) {
+        return
+    }
+    $marker = if ($Kind -eq 'Begin') {
+        "<<<UNTRUSTED_CONTENT id=$($script:UntrustedContentId) source=$Source>>>"
+    }
+    else {
+        "<<<END_UNTRUSTED_CONTENT id=$($script:UntrustedContentId)>>>"
+    }
+    $script:OutputBuilder.AppendLine($marker) | Out-Null
+}
 function Get-AuthorizationHeader {
     param(
         [string]$Token,
@@ -136,7 +211,7 @@ function Invoke-AzureDevOpsApi {
             $statusCode = $_.Exception.Response.StatusCode.value__
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $errorDetail = $_.ErrorDetails.Message
+            $errorDetail = ConvertTo-SafeLogText $_.ErrorDetails.Message
         }
 
         # Build a descriptive error message with all available context
@@ -156,7 +231,7 @@ function Invoke-AzureDevOpsApi {
             Write-Error "$baseMsg — API response: $errorDetail"
         }
         else {
-            Write-Error "$baseMsg — $($_.Exception.Message)"
+            Write-Error "$baseMsg — $(ConvertTo-SafeLogText $_.Exception.Message)"
         }
         return $null
     }
@@ -222,23 +297,32 @@ $idsParam = $ids -join ','
 
 Write-Host "`nRetrieving details for work item(s): $idsParam..." -ForegroundColor Cyan
 
-# Batch fetch work items
-$workItemsUrl = "$CollectionUri/$Project/_apis/wit/workitems?ids=$idsParam&`$expand=all&$apiVersion"
+# Batch fetch work items. By default one ID that does not exist or that this
+# identity cannot read fails the whole request; errorPolicy=omit returns null
+# in that item's place instead.
+$workItemsUrl = "$CollectionUri/$Project/_apis/wit/workitems?ids=$idsParam&`$expand=all&errorPolicy=omit&$apiVersion"
 $response = Invoke-AzureDevOpsApi -Uri $workItemsUrl -Headers $headers
 
+if ($null -eq $response) {
+    Write-ContextDegradation -Name 'work-item-details' -Detail 'Linked work item details could not be retrieved.'
+}
 if ($null -eq $response -or $null -eq $response.value -or $response.value.Count -eq 0) {
     Write-Warning "No work item details could be retrieved."
     exit 0
 }
 
-Write-Host "Retrieved $($response.value.Count) work item(s)." -ForegroundColor Green
+$workItems = @($response.value | Where-Object { $null -ne $_ })
+$returnedIds = @($workItems | ForEach-Object { [long]$_.id })
+$unreadableIds = @($ids | Where-Object { [long]$_ -notin $returnedIds })
+
+Write-Host "Retrieved $($workItems.Count) work item(s)." -ForegroundColor Green
 
 # Display results
 Write-Output-Line (("=" * 80)) -ForegroundColor DarkGray
 Write-Output-Line "LINKED WORK ITEM DETAILS" -ForegroundColor Green
 Write-Output-Line ("=" * 80) -ForegroundColor DarkGray
 
-foreach ($wi in $response.value) {
+foreach ($wi in $workItems) {
     $fields = $wi.fields
     $wiType = $fields.'System.WorkItemType'
     $wiTitle = $fields.'System.Title'
@@ -247,6 +331,8 @@ foreach ($wi in $response.value) {
     $wiAcceptanceCriteria = ConvertFrom-Html $fields.'Microsoft.VSTS.Common.AcceptanceCriteria'
     $wiReproSteps = ConvertFrom-Html $fields.'Microsoft.VSTS.TCM.ReproSteps'
 
+    # Work item text can be written by anyone with access to the work item
+    Write-UntrustedContentMarker -Kind Begin -Source "work-item-$($wi.id)"
     Write-Output-Line "`n[Work Item #$($wi.id) - $wiType]" -ForegroundColor Yellow
     Write-Output-Line "  Title:           $wiTitle"
     Write-Output-Line "  State:           $wiState"
@@ -272,6 +358,13 @@ foreach ($wi in $response.value) {
             Write-Output-Line "    $_"
         }
     }
+    Write-UntrustedContentMarker -Kind End
+}
+
+# Not a failed fetch (a re-run gets the same result), so no degradation marker
+if ($unreadableIds.Count -gt 0) {
+    $unreadableList = ($unreadableIds | ForEach-Object { "#$_" }) -join ', '
+    Write-Output-Line "`nWork item(s) $unreadableList could not be read (they do not exist or the task's identity has no access)." -ForegroundColor Yellow
 }
 
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

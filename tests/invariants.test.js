@@ -85,6 +85,30 @@ describe('Prompt template lockstep', () => {
             'originalOverview in index.ts no longer appears verbatim in prompt-custom.txt — update them together.');
     });
 
+    it('no template refers to the AZUREDEVOPSPAT environment variable (issue #67)', () => {
+        // Renamed to AZUREDEVOPS_TOKEN in ace6049 and never set since; a prompt
+        // pointing at it sends the agent exploring the API with no credential
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.ok(!text.includes('AZUREDEVOPSPAT'), `${name} still refers to the AZUREDEVOPSPAT environment variable`);
+        }
+    });
+
+    it('the re-review paragraph is identical in both templates (issue #67)', () => {
+        const paragraph = text => text.split(/\r?\n/).find(line => line.startsWith('This is a re-review if'));
+        assert.ok(paragraph(promptDefault), 'prompt.txt has no re-review paragraph starting "This is a re-review if"');
+        assert.equal(paragraph(promptCustom), paragraph(promptDefault),
+            'the re-review paragraph differs between prompt.txt and prompt-custom.txt');
+    });
+
+    it('the [Changes Since Last Review] section name matches between the templates and the script that writes it', () => {
+        const section = '[Changes Since Last Review]';
+        const script = readText('CopilotCodeReviewV1/scripts/Get-AzureDevOpsPRChanges.ps1');
+        assert.ok(script.includes(section), 'Get-AzureDevOpsPRChanges.ps1 no longer writes the [Changes Since Last Review] section');
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.ok(text.includes(section), `${name} no longer refers to the [Changes Since Last Review] section`);
+        }
+    });
+
     it('originalGuidelines matches the Guidelines sentence in prompt.txt', () => {
         const guidelines = extractStringConstant(indexTs, 'originalGuidelines');
         assert.ok(promptDefault.includes(guidelines),
@@ -115,6 +139,24 @@ describe('Prompt template lockstep', () => {
             `prompt.txt no longer contains the attribution tag '${tag}' that index.ts rewrites for Claude Code.`);
         assert.ok(promptCustom.includes(tag),
             `prompt-custom.txt no longer contains the attribution tag '${tag}' that index.ts rewrites for Claude Code.`);
+    });
+
+    it('no template passes comment text inline (PR #65 rework)', () => {
+        // During a review the comment scripts refuse -Comment and -Content:
+        // inline text goes through the agent's shell command line
+        for (const [name, text] of [['prompt.txt', promptDefault], ['prompt-custom.txt', promptCustom]]) {
+            assert.doesNotMatch(text, /-Comment\s+['"]/, `${name} still passes comment text with -Comment`);
+            assert.doesNotMatch(text, /-Content\s+['"]/, `${name} still passes comment text with -Content`);
+            assert.ok(text.includes(". ./Add-CopilotComment.ps1 -ThreadId <id> -CommentFile './_reply.md'"),
+                `${name} no longer tells the agent to reply from a comment file`);
+        }
+    });
+
+    it('the posting-limits note is identical in both templates (PR #65 rework)', () => {
+        const note = text => text.split(/\r?\n/).find(line => line.startsWith('- The comment scripts enforce limits'));
+        assert.ok(note(promptDefault), 'prompt.txt has no note starting "- The comment scripts enforce limits"');
+        assert.equal(note(promptCustom), note(promptDefault),
+            'the posting-limits note differs between prompt.txt and prompt-custom.txt');
     });
 });
 
@@ -149,5 +191,24 @@ describe('Dev/prod task definition parity', () => {
             'Restrictions block differs between dev and prod task.json.');
         assert.equal(devTask.minimumAgentVersion, prodTask.minimumAgentVersion,
             'minimumAgentVersion differs between dev and prod task.json.');
+    });
+
+    it('skips already-reviewed iterations by default (issue #67)', () => {
+        // index.ts falls back to true when the input is unset; the task
+        // definition must agree so the documented default is what ships
+        const input = prodTask.inputs.find(i => i.name === 'skipReviewedIterations');
+        assert.ok(input, 'skipReviewedIterations input is missing from task.json');
+        assert.equal(input.defaultValue, true);
+    });
+
+    it('keeps repository instructions and the installed CLI version by default (PR #65 rework)', () => {
+        // index.ts reads both with getBoolInput(name, false); the task
+        // definition must ship the same defaults
+        for (const name of ['ignoreCustomInstructions', 'autoUpdateCli']) {
+            const input = prodTask.inputs.find(i => i.name === name);
+            assert.ok(input, `${name} input is missing from task.json`);
+            assert.equal(input.type, 'boolean', `${name} must be a boolean input`);
+            assert.equal(input.defaultValue, false, `${name} must default to false`);
+        }
     });
 });

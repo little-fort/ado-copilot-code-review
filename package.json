@@ -1,6 +1,6 @@
 {
     "name": "ado-copilot-code-review",
-    "version": "1.6.1",
+    "version": "1.7.0",
     "description": "Azure DevOps extension for automated code reviews using agentic AI tools",
     "scripts": {
         "build": "cd CopilotCodeReviewV1 && npm run build",

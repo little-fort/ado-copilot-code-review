@@ -203,3 +203,30 @@ Describe 'Add-CopilotComment.ps1 exit code propagation (issue #56)' {
         }
     }
 }
+
+Describe 'Add-AzureDevOpsPRComment.ps1 log output (issue #69)' {
+
+    It 'posts the comment unchanged but neutralizes logging commands in what it prints' {
+        # Review comments often quote code that contains logging commands
+        # (e.g. when reviewing pipeline YAML); echoing them raw would run them
+        $comment = "Use ``Write-Host '##vso[task.complete result=Failed;]'`` sparingly."
+        $result = Invoke-ScriptWithMockApi -Responses @(
+            @{ Status = 200; Body = '{"title":"PR ##vso[task.setvariable variable=Leak]x"}' },
+            @{ Status = 200; Body = $ThreadJson }
+        ) -BuildArgs {
+            param($baseUrl)
+            @('-File', $AddCommentScript,
+              '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
+              '-Project', 'TestProject', '-Repository', 'TestRepo',
+              '-Id', '123', '-Comment', $comment)
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Not -Match '##vso\['
+        $result.Output | Should -Match ([regex]::Escape("# #vso[task.complete result=Failed;]"))
+
+        # The text sent to Azure DevOps is the agent's original comment
+        $posted = $result.Requests[1].Body | ConvertFrom-Json
+        $posted.comments[0].content | Should -BeExactly $comment
+    }
+}

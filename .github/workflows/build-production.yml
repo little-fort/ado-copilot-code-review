@@ -2,14 +2,24 @@ name: Build Production Extension
 
 on:
   workflow_dispatch:
+    inputs:
+      create_draft_release:
+        description: 'Create release draft'
+        type: boolean
+        default: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write  # needed to create the draft release
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Keeps the write-scoped token out of .git/config, where npm install scripts could read it
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,8 +47,16 @@ jobs:
         run: echo "version=$(jq -r '.version' vss-extension.json)" >> $GITHUB_OUTPUT
 
       - name: Upload extension artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: vsix-package-${{ steps.version.outputs.version }}
           path: '*.vsix'
+          # Uploads the .vsix itself rather than a zip; the artifact is named after the file
+          archive: false
           if-no-files-found: error
+
+      - name: Create draft release
+        if: inputs.create_draft_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$VERSION" *.vsix --draft --title "v$VERSION" --target "$GITHUB_SHA" --generate-notes

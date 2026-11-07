@@ -1,5 +1,7 @@
 <#
-    Unit tests for the ConvertFrom-Html helper in Get-AzureDevOpsWorkItems.ps1.
+    Tests for Get-AzureDevOpsWorkItems.ps1: unit tests for the ConvertFrom-Html
+    helper, plus batch-fetch tests that run the script against a mock API
+    (MockApiHelper.ps1).
 
     The function is extracted from the script via the PowerShell AST rather than
     dot-sourcing the whole file (which would execute its main logic and demand
@@ -109,5 +111,57 @@ Describe 'ConvertFrom-Html' {
             $result = ConvertFrom-Html "<p>a</p>`n`n`n`n<p>b</p>"
             $result | Should -Not -Match "`n{3,}"
         }
+    }
+}
+
+Describe 'Batch fetch' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'MockApiHelper.ps1')
+
+        # Runs the script for work items 101 and 102 with a review state folder;
+        # returns the harness result plus the output file text and state folder
+        function Invoke-WorkItemsScript {
+            param([string]$ResponseBody)
+            $stateDir = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $stateDir | Out-Null
+            $outFile = Join-Path $stateDir 'Work_Item_Details.txt'
+            $workItemsScript = $scriptPath
+            $result = Invoke-ScriptWithMockApi -Responses @(
+                @{ Status = 200; Body = $ResponseBody }
+            ) -Environment @{ COPILOT_REVIEW_STATE_DIR = $stateDir } -BuildArgs {
+                param($baseUrl)
+                @('-File', $workItemsScript, '-Token', 'test-token', '-CollectionUri', "$baseUrl/testorg",
+                  '-Project', 'TestProject', '-WorkItemIds', '101,102', '-OutputFile', $outFile)
+            }.GetNewClosure()
+            $fileText = if (Test-Path $outFile) { Get-Content -Path $outFile -Raw } else { '' }
+            $result |
+                Add-Member -NotePropertyName FileText -NotePropertyValue $fileText -PassThru |
+                Add-Member -NotePropertyName StateDir -NotePropertyValue $stateDir -PassThru
+        }
+    }
+
+    # Azure DevOps fails the whole batch when one ID is deleted or unreadable,
+    # unless errorPolicy=omit, which returns null in that item's place
+    It 'skips an unreadable work item and names it, without a degradation marker' {
+        $run = Invoke-WorkItemsScript -ResponseBody '{"count":2,"value":[{"id":101,"fields":{"System.WorkItemType":"Bug","System.Title":"Crash on save","System.State":"New"}},null]}'
+
+        $run.ExitCode | Should -Be 0
+        $run.Requests.Count | Should -Be 1
+        $run.Requests[0].Path | Should -Match 'errorPolicy=omit'
+        $run.FileText | Should -Match '\[Work Item #101 - Bug\]'
+        $run.FileText | Should -Match 'Crash on save'
+        $run.FileText | Should -Match 'Work item\(s\) #102 could not be read'
+        $run.FileText | Should -Not -Match '\[Work Item #(102)? -'
+        Test-Path (Join-Path $run.StateDir 'context') | Should -BeFalse
+    }
+
+    It 'names every work item and writes no degradation marker when none can be read' {
+        $run = Invoke-WorkItemsScript -ResponseBody '{"count":2,"value":[null,null]}'
+
+        $run.ExitCode | Should -Be 0
+        $run.FileText | Should -Match 'Work item\(s\) #101, #102 could not be read'
+        $run.FileText | Should -Not -Match '\[Work Item #'
+        Test-Path (Join-Path $run.StateDir 'context') | Should -BeFalse
     }
 }

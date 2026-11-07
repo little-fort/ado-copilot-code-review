@@ -297,8 +297,10 @@ $idsParam = $ids -join ','
 
 Write-Host "`nRetrieving details for work item(s): $idsParam..." -ForegroundColor Cyan
 
-# Batch fetch work items
-$workItemsUrl = "$CollectionUri/$Project/_apis/wit/workitems?ids=$idsParam&`$expand=all&$apiVersion"
+# Batch fetch work items. By default one ID that does not exist or that this
+# identity cannot read fails the whole request; errorPolicy=omit returns null
+# in that item's place instead.
+$workItemsUrl = "$CollectionUri/$Project/_apis/wit/workitems?ids=$idsParam&`$expand=all&errorPolicy=omit&$apiVersion"
 $response = Invoke-AzureDevOpsApi -Uri $workItemsUrl -Headers $headers
 
 if ($null -eq $response) {
@@ -309,14 +311,18 @@ if ($null -eq $response -or $null -eq $response.value -or $response.value.Count 
     exit 0
 }
 
-Write-Host "Retrieved $($response.value.Count) work item(s)." -ForegroundColor Green
+$workItems = @($response.value | Where-Object { $null -ne $_ })
+$returnedIds = @($workItems | ForEach-Object { [long]$_.id })
+$unreadableIds = @($ids | Where-Object { [long]$_ -notin $returnedIds })
+
+Write-Host "Retrieved $($workItems.Count) work item(s)." -ForegroundColor Green
 
 # Display results
 Write-Output-Line (("=" * 80)) -ForegroundColor DarkGray
 Write-Output-Line "LINKED WORK ITEM DETAILS" -ForegroundColor Green
 Write-Output-Line ("=" * 80) -ForegroundColor DarkGray
 
-foreach ($wi in $response.value) {
+foreach ($wi in $workItems) {
     $fields = $wi.fields
     $wiType = $fields.'System.WorkItemType'
     $wiTitle = $fields.'System.Title'
@@ -353,6 +359,12 @@ foreach ($wi in $response.value) {
         }
     }
     Write-UntrustedContentMarker -Kind End
+}
+
+# Not a failed fetch (a re-run gets the same result), so no degradation marker
+if ($unreadableIds.Count -gt 0) {
+    $unreadableList = ($unreadableIds | ForEach-Object { "#$_" }) -join ', '
+    Write-Output-Line "`nWork item(s) $unreadableList could not be read (they do not exist or the task's identity has no access)." -ForegroundColor Yellow
 }
 
 Write-Output-Line ("`n" + ("=" * 80)) -ForegroundColor DarkGray

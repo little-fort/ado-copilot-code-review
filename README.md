@@ -240,6 +240,7 @@ steps:
 | `maxMinorIssues` | No | `5` | Cap on Minor-severity findings in the consolidated minor-suggestions comment per pass; `0` suppresses Minor findings. Critical/Major findings are never capped. |
 | `diffOnlyReview` | No | `false` | Restrict the review to only the PR diff (see [Diff-Only Review Mode](#diff-only-review-mode)) |
 | `skipReviewedIterations` | No | `true` | Finish immediately when this review configuration already reviewed the PR's current iteration; set `false` to force a fresh review (see [Incremental Re-Reviews](#incremental-re-reviews)) |
+| `autoVote` | No | `false` | Set the PR vote based on the completed review, including the previous vote and unresolved findings (see [Automatic PR Voting](#automatic-pr-voting)) |
 | `ignoreCustomInstructions` | No | `false` | Keep the repository's own instruction files (CLAUDE.md, AGENTS.md, `.github/copilot-instructions.md`, ...) and Copilot repository skills away from the agent (see [Security Model](#security-model)) |
 | `autoUpdateCli` | No | `false` | Run `copilot update` / `claude update` on an already-installed CLI before the review; a failed update only logs a warning |
 | `publishPromptArtifacts` | No | `false` | Publish context files and the final prompt as pipeline artifacts for debugging |
@@ -364,6 +365,37 @@ Three inputs tune how the review agent behaves across iterations. All of them ap
     useSystemAccessToken: true
     resolveThreads: 'agentOnly'
     suppressPositiveFeedback: true
+```
+
+### Automatic PR Voting
+
+Enable `autoVote: true` to let the task set a pull request vote after the review completes. The vote follows the highest severity of any remaining findings:
+
+| Highest remaining severity | Vote |
+|---|---|
+| None | Approved |
+| Minor | Approved with suggestions |
+| Major | Wait for author |
+| Critical | Rejected |
+
+The review agent considers the previous vote and checks whether earlier findings still apply. The vote can change in either direction: for example, from Rejected to Wait for author when a Critical issue is fixed, or from Approved to Wait for author when a rebase introduces a Major issue. Minor findings still count even when `maxMinorIssues` suppresses their comments. The task logs the review summary and any vote change.
+
+With this option enabled, the task always runs a fresh review, regardless of `skipReviewedIterations`. This includes rebases and changes to the target branch. The target branch's current commit must be available in the checkout. Before setting the vote, the task checks that the source branch, target branch, and previous vote have not changed during the review.
+
+The previous vote stays in place until the review completes. If the review times out, context cannot be fetched, a comment action fails, or the agent does not provide a complete result, the task fails without updating the vote. An earlier approval can therefore remain visible after a failed re-review. Configure branch policies to require a successful review pipeline as well.
+
+The task only updates the vote of the identity used for Azure DevOps authentication: the Build Service when using `System.AccessToken`, or the Azure DevOps PAT owner. Other reviewers' votes are not changed. Use a dedicated bot account to avoid replacing a personal vote. Multiple review tasks using the same account share its vote.
+
+The account needs Code (Read & write) access and **Contribute to pull requests** permission. Whether its approval counts toward required reviews depends on the branch policy settings. Setting a vote does not complete or merge the PR.
+
+This option applies to Copilot and Claude Code, with default or custom template-based prompts, including diff-only reviews. It cannot be combined with raw prompt modes (`promptRaw`/`promptFileRaw`). The PR must be active and not a draft.
+
+```yaml
+- task: CopilotCodeReview@1
+  inputs:
+    githubPat: '$(GITHUB_PAT)'
+    useSystemAccessToken: true
+    autoVote: true
 ```
 
 ### Jira Work Items

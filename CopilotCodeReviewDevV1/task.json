@@ -340,6 +340,14 @@
             "helpMarkDown": "After a review, the task records the reviewed PR iteration as a pull request property (scoped to this review configuration: agent, model, prompt, and review settings). When enabled (default), a run for an iteration that was already reviewed — for example a re-queued build or a policy re-run after the target branch moved — finishes immediately without running the agent. Disable to force a fresh review. Re-reviews of newer iterations are told what changed since the last review either way. Requires permission to update the pull request (the same 'Contribute to pull requests' permission used for posting comments)."
         },
         {
+            "name": "autoVote",
+            "type": "boolean",
+            "label": "Set Pull Request Vote",
+            "required": false,
+            "defaultValue": false,
+            "helpMarkDown": "When enabled, sets the pull request vote based on the completed review: Approved when no issues remain, Approved with suggestions for Minor findings, Wait for author for Major findings, and Rejected for Critical findings. The review includes the previous vote and any unresolved findings. Always runs a fresh review, even when 'Skip Already-Reviewed Iterations' is enabled. The previous vote is kept if the review fails or cannot be completed. Uses the Build Service identity with System.AccessToken, or the Azure DevOps PAT owner. Requires Code (Read & write) access and 'Contribute to pull requests' permission. Use a dedicated bot account to avoid replacing a personal vote. Not supported with raw prompt modes (promptRaw/promptFileRaw)."
+        },
+        {
             "name": "ignoreCustomInstructions",
             "type": "boolean",
             "label": "Ignore Repository Custom Instructions",

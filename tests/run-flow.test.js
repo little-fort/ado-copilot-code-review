@@ -33,12 +33,15 @@ function startMockAzureDevOps(routes) {
     const requests = [];
     const server = http.createServer((req, res) => {
         const route = decodeURIComponent(req.url.split('?')[0]).toLowerCase();
-        requests.push({ method: req.method, path: route });
+        const request = { method: req.method, path: route, body: '' };
+        requests.push(request);
         let body = '';
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
+            request.body = body;
             const handler = Object.entries(routes).find(([suffix]) => route.endsWith(suffix.toLowerCase()));
-            const [status, payload] = handler ? handler[1] : [404, { message: 'mock: no route' }];
+            const response = handler ? handler[1] : [404, { message: 'mock: no route' }];
+            const [status, payload] = typeof response === 'function' ? response(req, body) : response;
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(payload));
         });
@@ -69,7 +72,7 @@ function baseRoutes(overrides = {}) {
 }
 
 /** Runs the compiled task with the given inputs; resolves with its output. */
-function runTask(port, workDir, tempDir, inputs = {}) {
+function runTask(port, workDir, tempDir, inputs = {}, extraEnv = {}) {
     const env = { ...process.env };
     // Never inherit pipeline variables that would change the flow
     for (const key of Object.keys(env)) {
@@ -91,6 +94,7 @@ function runTask(port, workDir, tempDir, inputs = {}) {
     for (const [name, value] of Object.entries(inputs)) {
         env[`INPUT_${name.toUpperCase()}`] = value;
     }
+    Object.assign(env, extraEnv);
 
     return new Promise((resolve, reject) => {
         child_process.execFile(process.execPath, [compiledTask], { cwd: taskDir, env, timeout: 120000, maxBuffer: 20 * 1024 * 1024 },
@@ -197,6 +201,18 @@ describe('task run flow (issue #67)', function () {
         }
     });
 
+    it('rejects voting with a raw prompt without calling Azure DevOps', async () => {
+        const { server, requests, port } = await startMockAzureDevOps(baseRoutes());
+        try {
+            const { workDir, tempDir } = newDirs();
+            const output = await runTask(port, workDir, tempDir, { autoVote: 'true', promptRaw: 'Raw prompt.' });
+            assert.match(output, /autoVote requires a template-based prompt/);
+            assert.equal(requests.length, 0);
+        } finally {
+            server.close();
+        }
+    });
+
     it('runs the fetch steps in the new order and stops on a prompt-preparation error before the CLI install', async () => {
         const { server, requests, port } = await startMockAzureDevOps(baseRoutes({
             // Failed thread retrieval: the script still succeeds, but the task must warn
@@ -255,6 +271,160 @@ describe('task run flow (issue #67)', function () {
             const policy = JSON.parse(fs.readFileSync(path.join(tempDir, stateDirs[0], 'review-policy.json'), 'utf8'));
             assert.deepEqual(policy.destination, {
                 collectionUri: `http://127.0.0.1:${port}/testorg`, project: 'TestProject', repository: 'TestRepo', pullRequestId: 5
+            });
+
+            // Additional voting tests use a fake Copilot executable; no AI model is called.
+            describe('automatic PR voting run flow', function () {
+                this.timeout(180000);
+                const reviewerId = '11111111-2222-3333-4444-555555555555';
+                let tmpRoot;
+                let task;
+                before(() => {
+                    task = require(compiledTask);
+                    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vote-flow-'));
+                });
+                after(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
+
+                function prepareCheckout(moveTarget = false) {
+                    const workDir = fs.mkdtempSync(path.join(tmpRoot, 'work-'));
+                    const tempDir = fs.mkdtempSync(path.join(tmpRoot, 'temp-'));
+                    const git = args => child_process.execFileSync('git', args, { cwd: workDir, encoding: 'utf8' }).trim();
+                    git(['init', '--quiet']);
+                    fs.writeFileSync(path.join(workDir, 'app.txt'), 'old\n');
+                    git(['add', 'app.txt']);
+                    git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'core.hooksPath=', 'commit', '--quiet', '-m', 'Base']);
+                    const iterationTarget = git(['rev-parse', 'HEAD']);
+                    fs.writeFileSync(path.join(workDir, 'app.txt'), 'new\n');
+                    git(['add', 'app.txt']);
+                    git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'core.hooksPath=', 'commit', '--quiet', '-m', 'Change']);
+                    const source = git(['rev-parse', 'HEAD']);
+                    let target = iterationTarget;
+                    if (moveTarget) {
+                        git(['checkout', '--quiet', '--detach', iterationTarget]);
+                        fs.writeFileSync(path.join(workDir, 'target.txt'), 'Target branch change\n');
+                        git(['add', 'target.txt']);
+                        git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'core.hooksPath=', 'commit', '--quiet', '-m', 'Target change']);
+                        target = git(['rev-parse', 'HEAD']);
+                        git(['checkout', '--quiet', '--detach', source]);
+                    }
+                    return { workDir, tempDir, source, target, iterationTarget };
+                }
+
+                function fakeAgent(tempDir, mode) {
+                    const bin = path.join(tempDir, 'bin');
+                    fs.mkdirSync(bin);
+                    const code = `
+            const fs = require('node:fs');
+            const path = require('node:path');
+            if (process.argv.includes('--version')) { console.log('1.0.107'); process.exit(0); }
+            if (process.env.TEST_VOTE_MODE === 'fail') { process.exit(1); }
+            const promptIndex = process.argv.indexOf('-p');
+            const prompt = promptIndex >= 0 ? process.argv[promptIndex + 1] : fs.readFileSync(0, 'utf8');
+            const schema = JSON.parse(prompt.split(/\\r?\\n/).find(line => line.startsWith('{"runId":')));
+            schema.highestSeverity = process.env.TEST_VOTE_SEVERITY || 'major';
+            schema.summary = 'Current review assessment.';
+            schema.complete = process.env.TEST_VOTE_MODE !== 'incomplete';
+            const fileName = /JSON result to (\\S+) in the working directory/.exec(prompt)[1];
+            fs.writeFileSync(path.join(process.cwd(), fileName), JSON.stringify(schema));
+            console.log('Mock review completed.');
+            `;
+                    if (process.platform === 'win32') {
+                        fs.writeFileSync(path.join(bin, 'copilot.js'), code);
+                        fs.writeFileSync(path.join(bin, 'copilot.cmd'), `@"${process.execPath}" "%~dp0copilot.js" %*\r\n`);
+                    } else {
+                        fs.writeFileSync(path.join(bin, 'copilot'), `#!/usr/bin/env node\n${code}`, { mode: 0o755 });
+                    }
+                    return {
+                        PATH: bin + path.delimiter + process.env.PATH,
+                        COPILOT_HOME: tempDir,
+                        TEST_VOTE_MODE: mode || 'success'
+                    };
+                }
+
+                function voteRoutes(checkout, previousVote, options = {}) {
+                    const pr = '/testorg/TestProject/_apis/git/repositories/TestRepo/pullrequests/5';
+                    const refs = '/testorg/TestProject/_apis/git/repositories/TestRepo/refs';
+                    let refReads = 0;
+                    const routes = baseRoutes({
+                        [`${pr}/iterations`]: [200, { count: 1, value: [{
+                            id: 1, sourceRefCommit: { commitId: checkout.source }, targetRefCommit: { commitId: checkout.iterationTarget },
+                            commonRefCommit: { commitId: checkout.iterationTarget }
+                        }] }],
+                        '/testorg/_apis/connectiondata': [200, { authenticatedUser: { id: reviewerId } }],
+                        [refs]: req => {
+                            const source = new URL(req.url, 'http://localhost').searchParams.get('filter') === 'heads/feature';
+                            refReads++;
+                            const commit = !source && options.changeTargetDuringReview && refReads > 2 ? 'f'.repeat(40)
+                                : source ? checkout.source : checkout.target;
+                            return [200, { value: [{ name: source ? 'refs/heads/feature' : 'refs/heads/main', objectId: commit }] }];
+                        },
+                        [`${pr}/reviewers/${reviewerId}`]: (req, body) => [200, JSON.parse(body)],
+                        [`${pr}/threads`]: [200, { count: 1, value: [{
+                            id: 42, status: 'active', comments: [{
+                                id: 1, commentType: 'text', content: 'Previous concern _[Generated by GitHub Copilot]_',
+                                author: { displayName: 'Bot' }
+                            }]
+                        }] }]
+                    });
+                    routes[pr][1].reviewers = [{ id: reviewerId, vote: previousVote }, { id: 'other-reviewer', vote: 10 }];
+                    const prefix = task.computeReviewStateKeyPrefix({
+                        agent: 'copilot', model: '', reasoningEffort: '', maxTurns: '', maxBudget: '',
+                        providerType: '', providerBaseUrl: '', diffOnly: !!options.diffOnlyReview, promptMode: 'default', promptText: '',
+                        templateText: fs.readFileSync(path.join(taskDir, 'scripts', 'prompt.txt'), 'utf8'),
+                        resolveThreads: 'all', suppressPositiveFeedback: true, maxMinorIssues: options.maxMinorIssues || '5', workItemSource: 'none', autoVote: true
+                    });
+                    routes[`${pr}/properties`] = [200, { value: {
+                        [`${prefix}.Iteration.1`]: { $type: 'System.String', $value: checkout.source }
+                    } }];
+                    return routes;
+                }
+
+                for (const [previousVote, severity, expectedVote, inputs = {}] of [
+                    [-10, 'major', -5], [10, 'major', -5], [-5, 'none', 10],
+                    [10, 'minor', 5, { diffOnlyReview: 'true', maxMinorIssues: '0' }]
+                ]) {
+                    it(`updates ${previousVote} to ${expectedVote} after a complete review, even if the iteration was already reviewed`, async () => {
+                        const checkout = prepareCheckout(previousVote === 10);
+                        const { server, requests, port } = await startMockAzureDevOps(voteRoutes(checkout, previousVote, inputs));
+                        try {
+                            const output = await runTask(port, checkout.workDir, checkout.tempDir,
+                                { autoVote: 'true', suppressPositiveFeedback: 'true', ...inputs },
+                                { ...fakeAgent(checkout.tempDir), TEST_VOTE_SEVERITY: severity });
+                            assert.match(output, /result=Succeeded;/, output);
+                            assert.match(output, /Running a fresh review/);
+                            assert.doesNotMatch(output, /skipping the review/);
+                            const writes = requests.filter(request => request.method === 'PUT');
+                            assert.equal(writes.length, 1, output);
+                            assert.equal(JSON.parse(writes[0].body).vote, expectedVote);
+                            assert.equal(JSON.parse(writes[0].body).id, reviewerId);
+                            assert.equal(fs.readFileSync(path.join(checkout.workDir, 'Target_Commit.txt'), 'utf8').trim(), checkout.target);
+                            assert.equal(fs.readdirSync(checkout.workDir).some(name => name.startsWith('_copilot_vote_')), false);
+                        } finally {
+                            server.close();
+                        }
+                    });
+                }
+
+                for (const mode of ['fail', 'incomplete', 'changed-target']) {
+                    it(`preserves the previous vote after ${mode}`, async () => {
+                        const checkout = prepareCheckout();
+                        const { server, requests, port } = await startMockAzureDevOps(voteRoutes(checkout, 10,
+                            { changeTargetDuringReview: mode === 'changed-target' }));
+                        try {
+                            const output = await runTask(port, checkout.workDir, checkout.tempDir,
+                                { autoVote: 'true', suppressPositiveFeedback: 'true' }, fakeAgent(checkout.tempDir, mode));
+                            assert.match(output, /result=Failed;/, output);
+                            const reason = mode === 'fail' ? /Copilot CLI exited with code: 1/
+                                : mode === 'incomplete' ? /review result is incomplete/
+                                : /source or target branch changed during the review/;
+                            assert.match(output, reason, output);
+                            assert.equal(requests.filter(request => request.method === 'PUT').length, 0, output);
+                            assert.equal(fs.readdirSync(checkout.workDir).some(name => name.startsWith('_copilot_vote_')), false);
+                        } finally {
+                            server.close();
+                        }
+                    });
+                }
             });
             assert.equal(policy.workspaceRoot, path.resolve(workDir));
             assert.equal(policy.threadsComplete, false);

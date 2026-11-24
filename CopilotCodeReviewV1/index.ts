@@ -209,6 +209,93 @@ function buildReviewDirectives(resolveThreads: string, suppressPositiveFeedback:
         (untrustedContentId ? buildUntrustedContentDirective(untrustedContentId) : '');
 }
 
+type PullRequestVote = -10 | -5 | 0 | 5 | 10;
+
+const PULL_REQUEST_VOTE_LABELS: Record<PullRequestVote, string> = {
+    '-10': 'Rejected', '-5': 'Wait for author', '0': 'No vote',
+    '5': 'Approved with suggestions', '10': 'Approved'
+};
+
+interface VoteSnapshot {
+    reviewerId: string;
+    previousVote: PullRequestVote;
+    sourceCommit: string;
+    targetCommit: string;
+}
+
+function readVoteObject(filePath: string): Record<string, unknown> {
+    const value: unknown = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('PR voting requires a JSON object.');
+    }
+    return value as Record<string, unknown>;
+}
+
+function readVoteSnapshot(filePath: string): VoteSnapshot {
+    const value = readVoteObject(filePath);
+    const vote = value.previousVote;
+    if (typeof value.reviewerId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.reviewerId) ||
+        (vote !== -10 && vote !== -5 && vote !== 0 && vote !== 5 && vote !== 10) ||
+        typeof value.sourceCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(value.sourceCommit) ||
+        typeof value.targetCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(value.targetCommit)) {
+        throw new Error('The authenticated reviewer or PR voting snapshot is invalid.');
+    }
+    return {
+        reviewerId: value.reviewerId,
+        previousVote: vote,
+        sourceCommit: value.sourceCommit.toLowerCase(),
+        targetCommit: value.targetCommit.toLowerCase()
+    };
+}
+
+function buildVoteDirective(snapshot: VoteSnapshot, runId: string, resultFileName: string): string {
+    return '\n\n# Pull Request Vote\n\n' +
+        'Automatic PR voting is enabled by the pipeline administrator. Do NOT cast a vote yourself. ' +
+        'After completing the entire review and all comment actions, use your file creation tool to write ' +
+        `the JSON result to ${resultFileName} in the working directory.\n\n` +
+        `The review account is ${snapshot.reviewerId}. Its previous vote is ${PULL_REQUEST_VOTE_LABELS[snapshot.previousVote]} (${snapshot.previousVote}). ` +
+        'Votes are 10 Approved, 5 Approved with suggestions, 0 No vote, -5 Wait for author, -10 Rejected. ' +
+        'The previous vote is context, not a minimum or maximum: it may improve or worsen. ' +
+        'Re-evaluate the concerns behind it and ALL existing unresolved review findings in PR_Details.txt ' +
+        'against the current code and replies. Include still-valid previous findings even when they are ' +
+        'outside the incremental diff or are not posted again. Missing new comments NEVER means approval. ' +
+        'Inspect the full PR diff for the voting decision, not only changes since the last review. ' +
+        'Consider regressions and integration issues introduced by rebases and changes to the target branch. ' +
+        `The authoritative source commit is ${snapshot.sourceCommit} and current target commit is ${snapshot.targetCommit}; ` +
+        'these override older target-commit information in the iteration context. ' +
+        'Keep the existing re-review restrictions for posting duplicate comments.\n\n' +
+        'Report the highest severity of ALL remaining verified concerns: none, minor, major, or critical. ' +
+        'Include high-confidence Minor concerns even if the comment cap suppresses them. ' +
+        'Ignore Nits and speculative findings. The task maps none to Approved, minor to Approved with suggestions, ' +
+        'major to Wait for author, and critical to Rejected. Explain what changed relative to the previous vote. ' +
+        'Do not include credentials or pipeline logging commands in the summary. ' +
+        'If any review context or required action is unavailable, do not claim a complete review.\n\n' +
+        'Result schema (replace highestSeverity and summary with your actual assessment):\n\n' +
+        JSON.stringify({
+            runId, sourceCommit: snapshot.sourceCommit, targetCommit: snapshot.targetCommit,
+            complete: true, previousFindingsReviewed: true, highestSeverity: 'none',
+            summary: 'Explain the current overall assessment and any change from the previous vote.'
+        }) + '\n';
+}
+
+function readVoteResult(filePath: string, snapshot: VoteSnapshot, runId: string): { vote: PullRequestVote; summary: string } {
+    const value = readVoteObject(filePath);
+    if (value.runId !== runId || value.sourceCommit !== snapshot.sourceCommit ||
+        value.targetCommit !== snapshot.targetCommit || value.complete !== true ||
+        value.previousFindingsReviewed !== true) {
+        throw new Error('PR vote unchanged: the review result is incomplete or belongs to a different PR snapshot.');
+    }
+    const severity = value.highestSeverity;
+    if (severity !== 'none' && severity !== 'minor' && severity !== 'major' && severity !== 'critical') {
+        throw new Error('PR vote unchanged: the review result has an invalid severity.');
+    }
+    if (typeof value.summary !== 'string' || !value.summary.trim() || value.summary.length > 2000) {
+        throw new Error('PR vote unchanged: the review result needs a summary of at most 2000 characters.');
+    }
+    const votes: Record<typeof severity, PullRequestVote> = { none: 10, minor: 5, major: -5, critical: -10 };
+    return { vote: votes[severity], summary: value.summary.trim() };
+}
+
 // Untrusted-content markers (PR #65 rework). The context scripts write the
 // same lines (Write-UntrustedContentMarker in Get-AzureDevOpsPR.ps1,
 // Get-AzureDevOpsPRChanges.ps1, Get-AzureDevOpsWorkItems.ps1 and
@@ -306,6 +393,7 @@ interface ReviewConfiguration {
     workItemSource: string;
     /** Whether the repository's own instruction files are kept from the agent */
     ignoreCustomInstructions: boolean;
+    autoVote?: boolean;
 }
 
 /**
@@ -337,7 +425,8 @@ function computeReviewStateKeyPrefix(config: ReviewConfiguration): string {
         // Settings added after the first release of review state are appended
         // only when they differ from their default, so adding one does not
         // change the key (and discard the records) of existing configurations
-        ...(config.ignoreCustomInstructions ? ['ignoreCustomInstructions'] : [])
+        ...(config.ignoreCustomInstructions ? ['ignoreCustomInstructions'] : []),
+        ...(config.autoVote ? ['autoVote'] : [])
     ]);
     const hash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 16);
     return `CopilotCodeReview.v1.${hash}`;
@@ -905,6 +994,7 @@ function describePolicyRefusals(refusals: string[], limit: number = 10): string[
 }
 
 async function run(): Promise<void> {
+    let voteResultFile: string | undefined;
     try {
         // Check prerequisites first
         console.log('Checking prerequisites...');
@@ -1134,6 +1224,7 @@ async function run(): Promise<void> {
         // Update an already-installed CLI before the review. Off by default: the
         // build admin owns the tooling on self-hosted agents.
         const autoUpdateCli = tl.getBoolInput('autoUpdateCli', false);
+        const autoVote = tl.getBoolInput('autoVote', false);
 
         // Fail fast on a typo'd value — falling back silently would change
         // which PR threads the agent is allowed to resolve
@@ -1329,6 +1420,11 @@ async function run(): Promise<void> {
                 'Please use only one of: prompt, promptFile, promptRaw, or promptFileRaw.');
             return;
         }
+        if (autoVote && (promptRaw || isPromptFileRawSet)) {
+            tl.setResult(tl.TaskResult.Failed,
+                'autoVote requires a template-based prompt. Use prompt or promptFile instead of a raw prompt.');
+            return;
+        }
         if (isPromptFileRawSet && !fs.readFileSync(promptFileRaw!, 'utf8').trim()) {
             tl.setResult(tl.TaskResult.Failed, `Raw prompt file is empty: ${promptFileRaw}`);
             return;
@@ -1386,7 +1482,8 @@ async function run(): Promise<void> {
             workItemSource: !includeWorkItems ? 'none'
                 : useJiraWorkItems ? `jira:${normalizedJiraBaseUrl}|${jiraProjectKeys || ''}|${jiraCustomFields || ''}`
                 : 'azureBoards',
-            ignoreCustomInstructions
+            ignoreCustomInstructions,
+            autoVote
         });
         const reviewStateDir = fs.mkdtempSync(path.join(tl.getVariable('Agent.TempDirectory') || os.tmpdir(), 'copilot-review-'));
         const reviewStateFile = path.join(reviewStateDir, 'Review_State.json');
@@ -1452,7 +1549,7 @@ async function run(): Promise<void> {
         }
 
         const reviewState = readReviewState(reviewStateFile);
-        if (skipReviewedIterations && isIterationAlreadyReviewed(reviewState)) {
+        if (!autoVote && skipReviewedIterations && isIterationAlreadyReviewed(reviewState)) {
             const reviewedIteration = `iteration #${reviewState!.currentIteration} (${reviewState!.currentSourceCommit.substring(0, 8)})`;
             // Name the build that reviewed it, so the user can find that run (details above, from Step 1)
             const record = reviewState!.lastReviewedRecord;
@@ -1467,6 +1564,29 @@ async function run(): Promise<void> {
             tl.setResult(tl.TaskResult.Succeeded,
                 `Skipped: ${reviewedIteration} was already reviewed${reviewedIn}. Set skipReviewedIterations: false to review it again.`);
             return;
+        }
+
+        let voteSnapshot: VoteSnapshot | undefined;
+        const voteResultFileName = `_copilot_vote_${untrustedContentId}.json`;
+        voteResultFile = path.join(workingDirectory, voteResultFileName);
+        const voteScript = path.join(scriptsDir, 'Set-AzureDevOpsPRVote.ps1');
+        const voteArgs = [
+            '-Token', azureDevOpsToken, '-AuthType', azureDevOpsAuthType,
+            '-CollectionUri', resolvedCollectionUri, '-Project', project,
+            '-Repository', repository, '-Id', pullRequestId
+        ];
+        if (autoVote) {
+            console.log('Pull request voting enabled. Running a fresh review, even if this iteration was already reviewed.');
+            const snapshotFile = path.join(reviewStateDir, 'Vote_Snapshot.json');
+            await runPowerShellScript(voteScript, [...voteArgs, '-ReadState', '-OutputFile', snapshotFile]);
+            voteSnapshot = readVoteSnapshot(snapshotFile);
+            if (!reviewState || voteSnapshot.sourceCommit !== reviewState.currentSourceCommit.toLowerCase()) {
+                throw new Error('PR vote unchanged: the source branch changed while fetching the review context. Run the task again.');
+            }
+            if (!gitRevParse(workingDirectory, voteSnapshot.targetCommit)) {
+                throw new Error('PR vote unchanged: the current target commit is unavailable locally. Fetch the target branch and run the task again.');
+            }
+            fs.writeFileSync(path.join(workingDirectory, 'Target_Commit.txt'), voteSnapshot.targetCommit, 'utf8');
         }
 
         // Step 2: Fetch PR details
@@ -1488,10 +1608,9 @@ async function run(): Promise<void> {
             '-UntrustedContentId', untrustedContentId,
             '-ThreadPolicyFile', threadPolicyFile
         ];
-        // Human reviewers' threads (full text + replies) are only useful when the
-        // agent may resolve them. Raw prompts never receive the directive that
-        // explains the section, so their PR_Details.txt stays unchanged.
-        if (resolveThreads === 'all' && !promptRaw && !isPromptFileRawSet) {
+        // Voting needs the full human-thread context even when the agent may
+        // not resolve those threads. The posting policy remains unchanged.
+        if ((resolveThreads === 'all' || autoVote) && !promptRaw && !isPromptFileRawSet) {
             prDetailsArgs.push('-IncludeHumanThreads');
         }
         await runPowerShellScript(prDetailsScript, prDetailsArgs);
@@ -1785,7 +1904,8 @@ async function run(): Promise<void> {
             // Apply the Minor-findings cap to the template's posting policy
             // (see the Evaluation Protocol section in the templates)
             const promptWithDirectives = applyMinorIssueLimit(fs.readFileSync(promptFilePath, 'utf8'), maxMinorIssues)
-                + buildReviewDirectives(resolveThreads, suppressPositiveFeedback, untrustedContentId);
+                + buildReviewDirectives(resolveThreads, suppressPositiveFeedback, untrustedContentId)
+                + (voteSnapshot ? buildVoteDirective(voteSnapshot, untrustedContentId, voteResultFileName) : '');
             const directivePromptPath = path.join(workingDirectory, '_directive_prompt.txt');
             fs.writeFileSync(directivePromptPath, promptWithDirectives, 'utf8');
             promptFilePath = directivePromptPath;
@@ -2033,6 +2153,20 @@ async function run(): Promise<void> {
             contextDegradations: collectContextDegradations(reviewStateDir),
             snapshotBound
         });
+        if (voteSnapshot) {
+            if (!recordDecision.record) {
+                throw new Error(`PR vote unchanged: ${recordDecision.reason}.`);
+            }
+            const decision = readVoteResult(voteResultFile, voteSnapshot, untrustedContentId);
+            await runPowerShellScript(voteScript, [
+                ...voteArgs, '-Vote', String(decision.vote),
+                '-ExpectedReviewerId', voteSnapshot.reviewerId,
+                '-ExpectedVote', String(voteSnapshot.previousVote),
+                '-ExpectedSourceCommit', voteSnapshot.sourceCommit,
+                '-ExpectedTargetCommit', voteSnapshot.targetCommit
+            ]);
+            console.log(`Pull request review summary: ${sanitizePipelineLog(decision.summary)}`);
+        }
         if (recordDecision.record) {
             try {
                 await runPowerShellScript(path.join(scriptsDir, 'Set-AzureDevOpsPRReviewState.ps1'), [
@@ -2069,6 +2203,14 @@ async function run(): Promise<void> {
     } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         tl.setResult(tl.TaskResult.Failed, `Task failed: ${errorMessage}`);
+    } finally {
+        if (voteResultFile) {
+            try {
+                fs.rmSync(voteResultFile, { force: true });
+            } catch (err) {
+                tl.warning(`Could not remove the PR vote result file: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
     }
 }
 
@@ -2881,6 +3023,9 @@ export {
     runInstallerWithRetry,
     normalizeGitHubHost,
     buildReviewDirectives,
+    buildVoteDirective,
+    readVoteSnapshot,
+    readVoteResult,
     wrapUntrustedContent,
     applyMinorIssueLimit,
     sanitizePipelineLog,
